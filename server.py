@@ -805,8 +805,14 @@ def convert_anthropic_to_litellm(anthropic_request: MessagesRequest) -> Dict[str
                                 {"type": "text", "text": block.text}
                             )
                         elif block.type == "image":
+                            # Convert Anthropic image source → OpenAI image_url format
+                            source = block.source if isinstance(block.source, dict) else {}
+                            if source.get("type") == "base64":
+                                img_url = f"data:{source.get('media_type', 'image/png')};base64,{source.get('data', '')}"
+                            else:
+                                img_url = source.get("url", "")
                             processed_content.append(
-                                {"type": "image", "source": block.source}
+                                {"type": "image_url", "image_url": {"url": img_url}}
                             )
                         elif block.type == "tool_use":
                             # Handle tool use blocks if needed
@@ -852,12 +858,15 @@ def convert_anthropic_to_litellm(anthropic_request: MessagesRequest) -> Dict[str
 
                 messages.append({"role": msg.role, "content": processed_content})
 
-    # Cap max_tokens for OpenAI/Gemini models to their limit of 16384
+    # Cap max_tokens for OpenAI/Gemini/Copilot models
     # QClaw 链路不受此限制，会在 _qclaw_provider 中恢复原始值
     max_tokens = anthropic_request.max_tokens
-    if anthropic_request.model.startswith(
-        "openai/"
-    ) or anthropic_request.model.startswith("gemini/"):
+    if PREFERRED_PROVIDER == "copilot":
+        max_tokens = min(max_tokens, 64000)
+        logger.debug(
+            f"Capping max_tokens to 64000 for Copilot model (original value: {anthropic_request.max_tokens})"
+        )
+    elif anthropic_request.model.startswith("openai/") or anthropic_request.model.startswith("gemini/"):
         max_tokens = min(max_tokens, 16384)
         logger.debug(
             f"Capping max_tokens to 16384 for OpenAI/Gemini model (original value: {anthropic_request.max_tokens})"
@@ -883,7 +892,7 @@ def convert_anthropic_to_litellm(anthropic_request: MessagesRequest) -> Dict[str
     if anthropic_request.top_p:
         litellm_request["top_p"] = anthropic_request.top_p
 
-    if anthropic_request.top_k:
+    if anthropic_request.top_k and PREFERRED_PROVIDER in ("anthropic", "gemini", "gemini-openai"):
         litellm_request["top_k"] = anthropic_request.top_k
 
     # Convert tools to OpenAI format
