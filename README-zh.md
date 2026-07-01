@@ -180,7 +180,10 @@ tail -f /tmp/proxy.log
 | 变量 | 默认 | 说明 |
 |------|------|------|
 | `DEBUG` | `false` | `true` 启用详细日志（请求/响应/模型映射） |
-| `LOG_FILE` | 空 | 配合 `DEBUG=true`，把日志同时写入文件 |
+| `LOG_FILE` | 空 | 文件日志路径（`DEBUG=false` 也生效，会记录 warning/error） |
+| `LOG_RETENTION_DAYS` | `7` | 轮转日志保留天数，过期自动清理 |
+| `LOG_ROTATE_WHEN` | `midnight` | 日志轮转周期单位（如 `midnight`、`H`） |
+| `LOG_ROTATE_INTERVAL` | `1` | 轮转周期步长 |
 
 ---
 
@@ -216,4 +219,3 @@ Claude Code / Cline
 > **注：** `gemini-openai` 是唯一走 httpx 的 provider；其余 5 种均通过 LiteLLM 统一路由。
 
 完整配置参考 `.env.example`
-

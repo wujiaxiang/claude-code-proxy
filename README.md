@@ -225,7 +225,10 @@ Copy `.env.example` to `.env` and fill in your keys. The proxy supports **6 prov
 | `MEDIUM_MODEL` | — | provider default | Maps `sonnet`-series requests |
 | `SMALL_MODEL` | — | provider default | Maps `haiku`-series requests |
 | `DEBUG` | — | `false` | Set `true` to enable verbose request/response logs |
-| `LOG_FILE` | — | _(stdout)_ | Path to write debug logs, e.g. `/tmp/proxy.log` (requires `DEBUG=true`) |
+| `LOG_FILE` | — | _(stdout)_ | Path to write file logs, e.g. `/tmp/proxy.log` (works with `DEBUG=false`, logs warnings/errors) |
+| `LOG_RETENTION_DAYS` | — | `7` | Keep rotated log files for N days, then auto-clean |
+| `LOG_ROTATE_WHEN` | — | `midnight` | Rotation time unit for file logs (`midnight`, `H`, etc.) |
+| `LOG_ROTATE_INTERVAL` | — | `1` | Rotation interval count for `LOG_ROTATE_WHEN` |
 
 ---
 

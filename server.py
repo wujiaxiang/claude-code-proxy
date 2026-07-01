@@ -1,6 +1,7 @@
 from fastapi import FastAPI, Request, HTTPException
 import uvicorn
 import logging
+from logging.handlers import TimedRotatingFileHandler
 import json
 from pydantic import BaseModel, Field, field_validator
 from typing import List, Dict, Any, Optional, Union, Literal
@@ -13,6 +14,7 @@ import time
 from dotenv import load_dotenv
 import re
 from datetime import datetime
+from pathlib import Path
 import sys
 
 # Load environment variables from .env file
@@ -21,6 +23,9 @@ load_dotenv()
 # Debug mode
 DEBUG = os.environ.get("DEBUG", "False").lower() == "true"
 LOG_FILE = os.environ.get("LOG_FILE", "")  # 非空则同时输出到文件
+LOG_RETENTION_DAYS = int(os.environ.get("LOG_RETENTION_DAYS", "7"))
+LOG_ROTATE_WHEN = os.environ.get("LOG_ROTATE_WHEN", "midnight")
+LOG_ROTATE_INTERVAL = int(os.environ.get("LOG_ROTATE_INTERVAL", "1"))
 
 # Configure logging
 _log_level = logging.DEBUG if DEBUG else logging.WARN
@@ -28,13 +33,42 @@ _log_fmt = "%(asctime)s - %(levelname)s - %(message)s"
 logging.basicConfig(level=_log_level, format=_log_fmt)
 logger = logging.getLogger(__name__)
 
-# ── 文件日志 Handler（仅 DEBUG=true 且 LOG_FILE 非空时启用）──────────
-if DEBUG and LOG_FILE:
-    _fh = logging.FileHandler(LOG_FILE, encoding="utf-8")
-    _fh.setLevel(logging.DEBUG)
+def _cleanup_old_log_files(log_file: str, retention_days: int):
+    if not log_file or retention_days <= 0:
+        return
+    try:
+        log_path = Path(log_file).expanduser()
+        if not log_path.parent.exists():
+            return
+        cutoff_ts = time.time() - retention_days * 86400
+        for candidate in log_path.parent.glob(f"{log_path.name}*"):
+            if not candidate.is_file() or candidate == log_path:
+                continue
+            if candidate.stat().st_mtime < cutoff_ts:
+                candidate.unlink()
+    except Exception as e:
+        logging.getLogger(__name__).warning(f"Failed to cleanup old logs: {e}")
+
+
+# ── 文件日志 Handler（LOG_FILE 非空时启用，自动轮转+清理）──────────
+if LOG_FILE:
+    _log_path = Path(LOG_FILE).expanduser()
+    _log_path.parent.mkdir(parents=True, exist_ok=True)
+
+    _fh = TimedRotatingFileHandler(
+        filename=str(_log_path),
+        when=LOG_ROTATE_WHEN,
+        interval=max(1, LOG_ROTATE_INTERVAL),
+        backupCount=max(0, LOG_RETENTION_DAYS),
+        encoding="utf-8",
+    )
+    _fh.setLevel(logging.DEBUG if DEBUG else logging.WARNING)
     _fh.setFormatter(logging.Formatter(_log_fmt))
     logging.getLogger().addHandler(_fh)
-    logger.info(f"📄 Debug log → {LOG_FILE}")
+    _cleanup_old_log_files(str(_log_path), LOG_RETENTION_DAYS)
+    logger.warning(
+        f"📄 File log enabled: path={_log_path} rotate={LOG_ROTATE_WHEN}/{LOG_ROTATE_INTERVAL} retention_days={LOG_RETENTION_DAYS}"
+    )
 
 # Configure uvicorn to be quieter
 import uvicorn
@@ -245,13 +279,29 @@ def _copilot_model_name(anthropic_model: str) -> str:
     # 如果已经是 copilot 的模型名（如 claude-sonnet-4.6），直接使用
     return m
 
+
+def _is_claude_family_model(model_name: str) -> bool:
+    m = (model_name or "").lower()
+    for prefix in ("anthropic/", "openai/", "copilot/", "gemini/"):
+        if m.startswith(prefix):
+            m = m[len(prefix):]
+            break
+    return m.startswith("claude-") or "claude" in m
+
+
 def _copilot_provider(req, litellm_req, orig):
     """GitHub Copilot Enterprise — 走 LiteLLM（与 qclaw 同一路径）"""
     # 模型映射
-    litellm_req["model"] = f"openai/{_copilot_model_name(orig)}"
+    target_model = _copilot_model_name(orig)
+    litellm_req["model"] = f"openai/{target_model}"
     litellm_req["api_key"] = COPILOT_GHE_TOKEN
     litellm_req["api_base"] = COPILOT_API_BASE
     litellm_req["extra_headers"] = {"Copilot-Integration-Id": COPILOT_INTEGRATION_ID}
+
+    # 模型能力分流：Claude 家族不接受采样参数，GPT 家族保留
+    if _is_claude_family_model(target_model):
+        for k in ("temperature", "top_p", "top_k", "min_p"):
+            litellm_req.pop(k, None)
 
     # Copilot 不接受空/None 消息 content
     for msg in litellm_req.get("messages", []):
@@ -685,6 +735,108 @@ def parse_tool_result_content(content):
         return "Unparseable content"
 
 
+def _close_json_fragment(fragment: str) -> str:
+    """Best-effort close for streaming tool arguments JSON fragments."""
+    if not isinstance(fragment, str) or not fragment:
+        return ""
+    try:
+        json.loads(fragment)
+        return ""
+    except Exception:
+        pass
+
+    stack = []
+    in_string = False
+    escaped = False
+
+    for ch in fragment:
+        if in_string:
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == '"':
+                in_string = False
+            continue
+
+        if ch == '"':
+            in_string = True
+        elif ch == "{":
+            stack.append("}")
+        elif ch == "[":
+            stack.append("]")
+        elif ch in ("}", "]") and stack and ch == stack[-1]:
+            stack.pop()
+
+    suffix = ""
+    if in_string:
+        suffix += '"'
+    if stack:
+        suffix += "".join(reversed(stack))
+
+    if not suffix:
+        return ""
+    try:
+        json.loads(fragment + suffix)
+        return suffix
+    except Exception:
+        return ""
+
+
+def _sanitize_for_log(obj, max_str_len: int = 2000):
+    """Recursively sanitize objects so they can be safely logged as JSON."""
+    if isinstance(obj, dict):
+        return {str(k): _sanitize_for_log(v, max_str_len) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_sanitize_for_log(v, max_str_len) for v in obj]
+    if isinstance(obj, (str, int, float, bool)) or obj is None:
+        if isinstance(obj, str) and len(obj) > max_str_len:
+            return obj[:max_str_len] + "...(truncated)"
+        return obj
+    try:
+        s = str(obj)
+        return s[:max_str_len] + ("...(truncated)" if len(s) > max_str_len else "")
+    except Exception:
+        return "<unserializable>"
+
+
+def _request_id_from_headers(request: Optional[Request] = None) -> str:
+    if request is None:
+        return f"req_{uuid.uuid4().hex[:12]}"
+    rid = request.headers.get("x-request-id") or request.headers.get("x-correlation-id")
+    return rid or f"req_{uuid.uuid4().hex[:12]}"
+
+
+def _log_exception(event: str, exc: Exception, context: Optional[Dict[str, Any]] = None):
+    import traceback
+
+    details = {
+        "event": event,
+        "provider": PREFERRED_PROVIDER,
+        "error_type": type(exc).__name__,
+        "error_message": str(exc),
+        "traceback": traceback.format_exc(),
+        "context": context or {},
+    }
+
+    # Capture common exception attributes (LiteLLM/httpx/etc.)
+    for attr in ("status_code", "message", "llm_provider", "model", "response"):
+        if hasattr(exc, attr):
+            details[attr] = getattr(exc, attr)
+
+    if hasattr(exc, "__dict__"):
+        extra = {}
+        for k, v in exc.__dict__.items():
+            if k not in ("args", "__traceback__"):
+                extra[k] = v
+        if extra:
+            details["exception_attrs"] = extra
+
+    logger.error(
+        f"ERROR_CONTEXT {json.dumps(_sanitize_for_log(details), ensure_ascii=False)}"
+    )
+
+
 def convert_anthropic_to_litellm(anthropic_request: MessagesRequest) -> Dict[str, Any]:
     """Convert Anthropic API request format to LiteLLM format (which follows OpenAI)."""
     # LiteLLM already handles Anthropic models when using the format model="anthropic/claude-3-opus-20240229"
@@ -858,11 +1010,25 @@ def convert_anthropic_to_litellm(anthropic_request: MessagesRequest) -> Dict[str
 
                 messages.append({"role": msg.role, "content": processed_content})
 
+    copilot_target_model = ""
+    if PREFERRED_PROVIDER == "copilot":
+        source_model = anthropic_request.original_model or anthropic_request.model
+        copilot_target_model = _copilot_model_name(source_model)
+
+    copilot_thinking_enabled = bool(
+        PREFERRED_PROVIDER == "copilot"
+        and anthropic_request.thinking
+        and anthropic_request.thinking.enabled
+    )
+
     # Cap max_tokens for OpenAI/Gemini/Copilot models
     # QClaw 链路不受此限制，会在 _qclaw_provider 中恢复原始值
     max_tokens = anthropic_request.max_tokens
     if PREFERRED_PROVIDER == "copilot":
         max_tokens = min(max_tokens, 64000)
+        # Copilot + thinking 常见中途截断，给一个保底 completion budget
+        if copilot_thinking_enabled:
+            max_tokens = max(max_tokens, 8192)
         logger.debug(
             f"Capping max_tokens to 64000 for Copilot model (original value: {anthropic_request.max_tokens})"
         )
@@ -878,12 +1044,19 @@ def convert_anthropic_to_litellm(anthropic_request: MessagesRequest) -> Dict[str
         "messages": messages,
         "max_completion_tokens": max_tokens,
         "_original_max_tokens": anthropic_request.max_tokens,  # 保留原始值供 QClaw 使用
-        "temperature": anthropic_request.temperature,
         "stream": anthropic_request.stream,
     }
+    if anthropic_request.temperature is not None:
+        litellm_request["temperature"] = anthropic_request.temperature
 
     # thinking 参数仅原生 Anthropic 支持，DeepSeek Anthropic 兼容接口不认
     # 保持为空，让模型自行决定推理深度
+    if copilot_thinking_enabled:
+        # Anthropic thinking -> OpenAI compatible reasoning effort
+        litellm_request["reasoning"] = {"effort": "high"}
+        logger.debug(
+            f"Copilot thinking enabled: translated to reasoning.effort=high target_model={copilot_target_model or 'unknown'}"
+        )
 
     # Add optional parameters if present
     if anthropic_request.stop_sequences:
@@ -1075,10 +1248,20 @@ def convert_litellm_to_anthropic(
                     try:
                         arguments = json.loads(arguments)
                     except json.JSONDecodeError:
-                        logger.warning(
-                            f"Failed to parse tool arguments as JSON: {arguments}"
-                        )
-                        arguments = {"raw": arguments}
+                        fixed_suffix = _close_json_fragment(arguments)
+                        if fixed_suffix:
+                            try:
+                                arguments = json.loads(arguments + fixed_suffix)
+                            except json.JSONDecodeError:
+                                logger.warning(
+                                    f"Failed to parse tool arguments as JSON: {arguments}"
+                                )
+                                arguments = {"raw": arguments}
+                        else:
+                            logger.warning(
+                                f"Failed to parse tool arguments as JSON: {arguments}"
+                            )
+                            arguments = {"raw": arguments}
 
                 # 提取 Gemini thought_signature（兼容两种来源）
                 sig = None
@@ -1201,6 +1384,10 @@ async def _litellm_oai_stream(response_generator):
 @app.post("/v1/chat/completions")
 async def openai_chat_completions(raw_request: Request):
     """OpenAI 兼容端点：所有 provider 统一走 LiteLLM"""
+    request_id = _request_id_from_headers(raw_request)
+    req_model = "unknown"
+    mapped_model = "unknown"
+    body = {}
     try:
         body = await raw_request.json()
         default_model = COPILOT_MEDIUM_MODEL if PREFERRED_PROVIDER == "copilot" else MEDIUM_MODEL
@@ -1235,11 +1422,32 @@ async def openai_chat_completions(raw_request: Request):
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"OpenAI endpoint error: {e}")
+        _log_exception(
+            "openai_chat_completions_failed",
+            e,
+            {
+                "request_id": request_id,
+                "path": str(raw_request.url.path),
+                "request_model": req_model,
+                "mapped_model": mapped_model,
+                "stream": body.get("stream"),
+                "message_count": len(body.get("messages") or []),
+                "tool_count": len(body.get("tools") or []),
+                "has_reasoning": bool(body.get("reasoning")),
+                "has_thinking": bool(body.get("thinking")),
+                "max_tokens": body.get("max_tokens"),
+                "max_completion_tokens": body.get("max_completion_tokens"),
+            },
+        )
         raise HTTPException(status_code=500, detail=str(e))
 
 
-async def handle_streaming(response_generator, original_request: MessagesRequest, original_model_name: str = ""):
+async def handle_streaming(
+    response_generator,
+    original_request: MessagesRequest,
+    original_model_name: str = "",
+    request_id: str = "",
+):
     """Handle streaming responses from LiteLLM and convert to Anthropic format."""
     try:
         # Send message_start event
@@ -1281,6 +1489,8 @@ async def handle_streaming(response_generator, original_request: MessagesRequest
         output_tokens = 0
         has_sent_stop_reason = False
         last_tool_index = 0
+        openai_to_anthropic_tool_index: Dict[int, int] = {}
+        tool_json_buffers: Dict[int, str] = {}
 
         # Process each chunk
         async for chunk in response_generator:
@@ -1306,33 +1516,39 @@ async def handle_streaming(response_generator, original_request: MessagesRequest
                     # Check for finish_reason to know when we're done
                     finish_reason = getattr(choice, "finish_reason", None)
 
+                    # Process reasoning content first (avoid Agent context loss)
+                    reasoning_text = None
+                    if hasattr(delta, "model_extra") and isinstance(delta.model_extra, dict):
+                        reasoning_text = (
+                            delta.model_extra.get("reasoning_content")
+                            or delta.model_extra.get("reasoning_text")
+                        )
+                    if reasoning_text is None:
+                        reasoning_text = getattr(delta, "reasoning_content", None)
+                    if reasoning_text is None:
+                        reasoning_text = getattr(delta, "reasoning_text", None)
+                    if isinstance(delta, dict) and reasoning_text is None:
+                        reasoning_text = delta.get("reasoning_content") or delta.get(
+                            "reasoning_text"
+                        )
+                    if reasoning_text and tool_index is None and not text_block_closed:
+                        wrapped_reasoning = f"<thinking>{reasoning_text}</thinking>"
+                        accumulated_text += wrapped_reasoning
+                        text_sent = True
+                        yield f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta', 'index': 0, 'delta': {'type': 'text_delta', 'text': wrapped_reasoning}})}\n\n"
+
                     # Process text content
                     delta_content = None
-
-                    # Handle different formats of delta content
                     if hasattr(delta, "content"):
                         delta_content = delta.content
                     elif isinstance(delta, dict) and "content" in delta:
                         delta_content = delta["content"]
 
-                    # Accumulate text content
                     if delta_content is not None and delta_content != "":
                         accumulated_text += delta_content
-
-                        # Always emit text deltas if no tool calls started
                         if tool_index is None and not text_block_closed:
                             text_sent = True
                             yield f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta', 'index': 0, 'delta': {'type': 'text_delta', 'text': delta_content}})}\n\n"
-
-                    # 透传 reasoning_text（Copilot Claude 模型推理内容）
-                    reasoning_text = None
-                    if hasattr(delta, "model_extra") and isinstance(delta.model_extra, dict):
-                        reasoning_text = delta.model_extra.get("reasoning_text")
-                    if reasoning_text is None:
-                        reasoning_text = getattr(delta, "reasoning_text", None)
-                    if reasoning_text and tool_index is None and not text_block_closed:
-                        text_sent = True
-                        yield f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta', 'index': 0, 'delta': {'type': 'text_delta', 'text': reasoning_text}})}\n\n"
 
                     # Process tool calls
                     delta_tool_calls = None
@@ -1384,11 +1600,13 @@ async def handle_streaming(response_generator, original_request: MessagesRequest
                                 current_index = 0
 
                             # Check if this is a new tool or a continuation
-                            if tool_index is None or current_index != tool_index:
-                                # New tool call - create a new tool_use block
+                            if current_index not in openai_to_anthropic_tool_index:
                                 tool_index = current_index
                                 last_tool_index += 1
-                                anthropic_tool_index = last_tool_index
+                                openai_to_anthropic_tool_index[current_index] = (
+                                    last_tool_index
+                                )
+                                tool_json_buffers[last_tool_index] = ""
 
                                 # Extract function info
                                 if isinstance(tool_call, dict):
@@ -1414,10 +1632,16 @@ async def handle_streaming(response_generator, original_request: MessagesRequest
                                         f"toolu_{uuid.uuid4().hex[:24]}",
                                     )
 
-                                # Start a new tool_use block
+                                anthropic_tool_index = openai_to_anthropic_tool_index[
+                                    current_index
+                                ]
                                 yield f"event: content_block_start\ndata: {json.dumps({'type': 'content_block_start', 'index': anthropic_tool_index, 'content_block': {'type': 'tool_use', 'id': tool_id, 'name': name, 'input': {}}})}\n\n"
                                 current_tool_call = tool_call
                                 tool_content = ""
+                            else:
+                                anthropic_tool_index = openai_to_anthropic_tool_index[
+                                    current_index
+                                ]
 
                             # Extract function arguments
                             arguments = None
@@ -1455,6 +1679,11 @@ async def handle_streaming(response_generator, original_request: MessagesRequest
                                 tool_content += (
                                     args_json if isinstance(args_json, str) else ""
                                 )
+                                if isinstance(args_json, str):
+                                    tool_json_buffers[anthropic_tool_index] = (
+                                        tool_json_buffers.get(anthropic_tool_index, "")
+                                        + args_json
+                                    )
 
                                 # Send the update
                                 yield f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta', 'index': anthropic_tool_index, 'delta': {'type': 'input_json_delta', 'partial_json': args_json}})}\n\n"
@@ -1466,6 +1695,11 @@ async def handle_streaming(response_generator, original_request: MessagesRequest
                         # Close any open tool call blocks
                         if tool_index is not None:
                             for i in range(1, last_tool_index + 1):
+                                fix_suffix = _close_json_fragment(
+                                    tool_json_buffers.get(i, "")
+                                )
+                                if fix_suffix:
+                                    yield f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta', 'index': i, 'delta': {'type': 'input_json_delta', 'partial_json': fix_suffix}})}\n\n"
                                 yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': i})}\n\n"
 
                         # If we accumulated text but never sent or closed text block, do it now
@@ -1498,7 +1732,18 @@ async def handle_streaming(response_generator, original_request: MessagesRequest
                         return
             except Exception as e:
                 # Log error but continue processing other chunks
-                logger.error(f"Error processing chunk: {str(e)}")
+                _log_exception(
+                    "anthropic_stream_chunk_failed",
+                    e,
+                    {
+                        "request_id": request_id or "unknown",
+                        "model": original_model_name
+                        or original_request.original_model
+                        or original_request.model,
+                        "stream_phase": "chunk_processing",
+                        "has_tool_calls": tool_index is not None,
+                    },
+                )
                 continue
 
         # If we didn't get a finish reason, close any open blocks
@@ -1506,6 +1751,9 @@ async def handle_streaming(response_generator, original_request: MessagesRequest
             # Close any open tool call blocks
             if tool_index is not None:
                 for i in range(1, last_tool_index + 1):
+                    fix_suffix = _close_json_fragment(tool_json_buffers.get(i, ""))
+                    if fix_suffix:
+                        yield f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta', 'index': i, 'delta': {'type': 'input_json_delta', 'partial_json': fix_suffix}})}\n\n"
                     yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': i})}\n\n"
 
             # Close the text content block
@@ -1523,13 +1771,18 @@ async def handle_streaming(response_generator, original_request: MessagesRequest
             yield "data: [DONE]\n\n"
 
     except Exception as e:
-        import traceback
-
-        error_traceback = traceback.format_exc()
-        error_message = (
-            f"Error in streaming: {str(e)}\n\nFull traceback:\n{error_traceback}"
+        _log_exception(
+            "anthropic_stream_failed",
+            e,
+            {
+                "request_id": request_id or "unknown",
+                "model": original_model_name
+                or original_request.original_model
+                or original_request.model,
+                "stream_phase": "outer_handler",
+                "output_tokens": output_tokens if "output_tokens" in locals() else 0,
+            },
         )
-        logger.error(error_message)
 
         # Send error message_delta
         yield f"event: message_delta\ndata: {json.dumps({'type': 'message_delta', 'delta': {'stop_reason': 'error', 'stop_sequence': None}, 'usage': {'output_tokens': 0}})}\n\n"
@@ -1595,6 +1848,9 @@ async def handle_qclaw_streaming(qclaw_response, display_model: str):
 
 @app.post("/v1/messages")
 async def create_message(request: MessagesRequest, raw_request: Request):
+    request_id = _request_id_from_headers(raw_request)
+    original_model = request.model if hasattr(request, "model") else "unknown"
+    litellm_request = {}
     try:
         # print the body here
         body = await raw_request.body()
@@ -1843,7 +2099,7 @@ async def create_message(request: MessagesRequest, raw_request: Request):
             response_generator = await litellm.acompletion(**litellm_request)
 
             return StreamingResponse(
-                handle_streaming(response_generator, request, original_model),
+                handle_streaming(response_generator, request, original_model, request_id),
                 media_type="text/event-stream",
             )
         else:
@@ -1875,60 +2131,28 @@ async def create_message(request: MessagesRequest, raw_request: Request):
             return anthropic_response
 
     except Exception as e:
-        import traceback
-
-        error_traceback = traceback.format_exc()
-
-        # Capture as much info as possible about the error
-        error_details = {
-            "error": str(e),
-            "type": type(e).__name__,
-            "traceback": error_traceback,
-        }
-
-        # Check for LiteLLM-specific attributes
-        for attr in ["message", "status_code", "response", "llm_provider", "model"]:
-            if hasattr(e, attr):
-                error_details[attr] = getattr(e, attr)
-
-        # Check for additional exception details in dictionaries
-        if hasattr(e, "__dict__"):
-            for key, value in e.__dict__.items():
-                if key not in error_details and key not in ["args", "__traceback__"]:
-                    error_details[key] = str(value)
-
-        # Helper function to safely serialize objects for JSON
-        def sanitize_for_json(obj):
-            """递归地清理对象使其可以JSON序列化"""
-            if isinstance(obj, dict):
-                return {k: sanitize_for_json(v) for k, v in obj.items()}
-            elif isinstance(obj, list):
-                return [sanitize_for_json(item) for item in obj]
-            elif hasattr(obj, "__dict__"):
-                return sanitize_for_json(obj.__dict__)
-            elif hasattr(obj, "text"):
-                return str(obj.text)
-                try:
-                    json.dumps(obj)
-                    return obj
-                except (TypeError, ValueError):
-                    return str(obj)
-
-        # Log all error details with safe serialization
-        sanitized_details = sanitize_for_json(error_details)
-        logger.error(
-            f"Error processing request: {json.dumps(sanitized_details, indent=2)}"
+        _log_exception(
+            "anthropic_messages_failed",
+            e,
+            {
+                "request_id": request_id,
+                "path": str(raw_request.url.path),
+                "original_model": original_model,
+                "mapped_model": litellm_request.get("model"),
+                "stream": bool(getattr(request, "stream", False)),
+                "message_count": len(getattr(request, "messages", []) or []),
+                "tool_count": len(getattr(request, "tools", []) or []),
+                "has_thinking": bool(getattr(request, "thinking", None)),
+                "max_tokens": getattr(request, "max_tokens", None),
+                "max_completion_tokens": litellm_request.get("max_completion_tokens"),
+            },
         )
 
         # Format error for response
         error_message = f"Error: {str(e)}"
-        if "message" in error_details and error_details["message"]:
-            error_message += f"\nMessage: {error_details['message']}"
-        if "response" in error_details and error_details["response"]:
-            error_message += f"\nResponse: {error_details['response']}"
 
         # Return detailed error
-        status_code = error_details.get("status_code", 500)
+        status_code = getattr(e, "status_code", 500)
         raise HTTPException(status_code=status_code, detail=error_message)
 
 
