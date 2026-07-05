@@ -209,14 +209,20 @@ The proxy exposes **two endpoints**, both available for all providers:
 |----------|---------------|----------------------|
 | `anthropic` | LiteLLM 翻译 | LiteLLM 翻译 |
 | `gemini` | LiteLLM 翻译 | LiteLLM 翻译 |
-| `gemini-openai` | LiteLLM 翻译 | LiteLLM 翻译 |
-| `openai` | LiteLLM 翻译 | LiteLLM 翻译 |
-| `copilot` | LiteLLM 翻译 | LiteLLM 翻译 |
-| **`qclaw`** | LiteLLM 翻译 | **直接透传（无翻译）** |
+| **`openai`** | LiteLLM 翻译 | **直接透传** |
+| **`gemini-openai`** | LiteLLM 翻译 | **直接透传** |
+| **`copilot`** | LiteLLM 翻译 | **直接透传** |
+| **`qclaw`** | LiteLLM 翻译 | **直接透传** |
 
-> **QClaw 透传模式**：当 `PREFERRED_PROVIDER=qclaw` 时，`/v1/chat/completions` 会将请求体原样转发给 QClaw 网关，不做模型映射或协议转换。自动处理：去掉 `qclaw/` 前缀、补全 system message、连接错误/5xx 自动重试 3 次、全局 httpx 连接池复用。
+> **透传模式**：`openai`、`gemini-openai`、`copilot`、`qclaw` 四个 provider 在 `/v1/chat/completions` 上直接转发请求体给后端，不做格式翻译或模型映射。各 provider 仅注入必要的认证 header 和请求体预处理：
+> - **qclaw**：去掉 `qclaw/` 前缀，自动补 system message，注入网关认证 header
+> - **openai**：去掉 `openai/` 前缀，注入 `Authorization: Bearer`
+> - **copilot**：模型映射（haiku/sonnet/opus → COPILOT_*_MODEL），注入 `Copilot-Integration-Id`，清理空 content 和无效 tool_choice
+> - **gemini-openai**：去掉 `gemini/` 前缀，注入 `Authorization: Bearer`
 >
-> 其他所有 provider 在两个端点上均通过 LiteLLM 进行格式翻译和模型映射。
+> 所有透传 provider 共享全局 httpx 连接池，连接错误/5xx 自动重试 3 次。
+>
+> `anthropic` 和 `gemini`（原生 API）后端不是 OpenAI 兼容格式，`/v1/chat/completions` 上仍通过 LiteLLM 进行格式翻译。
 
 ## How It Works 🧩
 

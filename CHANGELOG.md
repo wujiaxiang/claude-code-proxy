@@ -1,5 +1,29 @@
 # Changelog
 
+## 2026-07-06 — 全 provider 透传扩展
+
+### 概述
+
+将 `/v1/chat/completions` 的透传模式从仅 qclaw 扩展到 `openai`、`gemini-openai`、`copilot` 四个 provider。
+这些 provider 的后端本身即为 OpenAI 兼容格式，无需经过 LiteLLM 翻译。
+
+### 改动
+
+- **透传 provider 列表扩展**：`qclaw` → `qclaw / openai / copilot / gemini-openai`
+- **openai 透传**：去掉 `openai/` 前缀，注入 `Authorization: Bearer`，转发到 `OPENAI_BASE_URL`
+- **copilot 透传**：模型映射（haiku/sonnet/opus → COPILOT_*_MODEL），注入 `Copilot-Integration-Id`，清理空 content 和无效 tool_choice
+- **gemini-openai 透传**：去掉 `gemini/` 前缀，注入 `Authorization: Bearer`，转发到 `GEMINI_BASE_URL`
+- **保留翻译模式**：`anthropic` 和 `gemini`（原生 API）仍走 LiteLLM 翻译
+- 通用：所有透传 provider 共享全局 httpx 连接池 + 3 次重试
+
+### 文件变更
+
+| 文件 | 变更 |
+|------|------|
+| `server.py` | +64 / -30 |
+
+---
+
 ## 2026-07-06 — QClaw 透传 + 连接池 + 模型注册扩展
 
 ### 概述

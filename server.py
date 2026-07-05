@@ -1431,8 +1431,8 @@ async def _litellm_oai_stream(response_generator):
 async def openai_chat_completions(raw_request: Request):
     """OpenAI 兼容端点
 
-    qclaw 模式：直接透传请求体给 QClaw 网关，不做模型映射和协议转换。
-    其他 provider：走 LiteLLM 统一处理。
+    透传模式（qclaw / openai / copilot / gemini-openai）：直接转发请求体给后端，不做模型映射或协议转换。
+    翻译模式（anthropic / gemini）：通过 LiteLLM 进行格式翻译和模型映射。
     """
     request_id = _request_id_from_headers(raw_request)
     req_model = "unknown"
@@ -1444,44 +1444,78 @@ async def openai_chat_completions(raw_request: Request):
         req_model = body.get("model", default_model)
         is_stream = body.get("stream", False)
 
-        # ── qclaw 模式：直接透传，不走 litellm ──
-        if PREFERRED_PROVIDER == "qclaw":
-            # 去掉 qclaw/ 前缀（如果有），直接用原始模型名
+        # ── 透传模式：qclaw / openai / copilot / gemini-openai ──
+        _PASSTHROUGH_PROVIDERS = ("qclaw", "openai", "copilot", "gemini-openai")
+        if PREFERRED_PROVIDER in _PASSTHROUGH_PROVIDERS:
             passthrough_model = req_model
-            if passthrough_model.startswith("qclaw/"):
-                passthrough_model = passthrough_model[len("qclaw/"):]
-            body["model"] = passthrough_model
+            # 去掉 provider 前缀（如果有）
+            for pfx in ("qclaw/", "openai/", "copilot/", "gemini/"):
+                if passthrough_model.startswith(pfx):
+                    passthrough_model = passthrough_model[len(pfx):]
+                    break
 
-            # QClaw 网关要求必须有 system message
-            msgs = body.get("messages", [])
-            if not any(m.get("role") == "system" for m in msgs):
-                msgs.insert(0, {"role": "system", "content": "You are Claude, a helpful AI assistant."})
-                body["messages"] = msgs
+            # ── provider 特殊处理 ──
+            headers = {"Content-Type": "application/json"}
+            url = ""
+
+            if PREFERRED_PROVIDER == "qclaw":
+                body["model"] = passthrough_model
+                # QClaw 网关要求必须有 system message
+                msgs = body.get("messages", [])
+                if not any(m.get("role") == "system" for m in msgs):
+                    msgs.insert(0, {"role": "system", "content": "You are Claude, a helpful AI assistant."})
+                    body["messages"] = msgs
+                headers["Authorization"] = "Bearer __QCLAW_AUTH_GATEWAY_MANAGED__"
+                headers["User-Agent"] = "OpenAI/JS 6.39.1"
+                headers["x-agent-id"] = "main"
+                url = f"{QCLAW_BASE_URL}/chat/completions"
+
+            elif PREFERRED_PROVIDER == "openai":
+                body["model"] = passthrough_model
+                headers["Authorization"] = f"Bearer {OPENAI_API_KEY}"
+                base = OPENAI_BASE_URL or "https://api.openai.com/v1"
+                url = f"{base}/chat/completions"
+
+            elif PREFERRED_PROVIDER == "copilot":
+                # copilot 模型映射：haiku/sonnet/opus → COPILOT_*_MODEL
+                body["model"] = _copilot_model_name(passthrough_model)
+                headers["Authorization"] = f"Bearer {COPILOT_GHE_TOKEN}"
+                headers["Copilot-Integration-Id"] = COPILOT_INTEGRATION_ID
+                # Copilot 不接受空/None 消息 content
+                for msg in body.get("messages", []):
+                    c = msg.get("content")
+                    if c is None or (isinstance(c, str) and not c.strip()):
+                        msg["content"] = "."
+                # Copilot 不接受没有 tools 时的 tool_choice
+                if body.get("tool_choice") and not body.get("tools"):
+                    body.pop("tool_choice")
+                url = f"{COPILOT_API_BASE}/chat/completions"
+
+            elif PREFERRED_PROVIDER == "gemini-openai":
+                body["model"] = passthrough_model
+                headers["Authorization"] = f"Bearer {os.environ.get('GEMINI_API_KEY', '')}"
+                gemini_base = os.environ.get(
+                    "GEMINI_BASE_URL",
+                    "https://generativelanguage.googleapis.com/v1beta/openai",
+                )
+                url = f"{gemini_base}/chat/completions"
 
             log_request_beautifully(
-                "POST", "/v1/chat/completions", req_model, passthrough_model,
+                "POST", "/v1/chat/completions", req_model, body["model"],
                 len(body.get("messages", [])), len(body.get("tools") or []), 200
             )
 
-            headers = {
-                "Content-Type": "application/json",
-                "Authorization": "Bearer __QCLAW_AUTH_GATEWAY_MANAGED__",
-                "User-Agent": "OpenAI/JS 6.39.1",
-                "x-agent-id": "main",
-            }
-            url = f"{QCLAW_BASE_URL}/chat/completions"
-
             if is_stream:
-                async def qclaw_stream():
+                async def passthrough_stream():
                     client = await get_http_client()
                     last_err = None
                     for attempt in range(3):
                         try:
                             async with client.stream("POST", url, json=body, headers=headers) as resp:
                                 if resp.status_code >= 500:
-                                    # 网关 5xx，重试
+                                    # 后端 5xx，重试
                                     await resp.aread()
-                                    last_err = f"gateway {resp.status_code}"
+                                    last_err = f"upstream {resp.status_code}"
                                     continue
                                 async for chunk in resp.aiter_bytes():
                                     yield chunk
@@ -1491,8 +1525,8 @@ async def openai_chat_completions(raw_request: Request):
                             last_err = str(e)
                             continue
                     # 所有重试失败
-                    yield json.dumps({"error": {"type": "proxy_error", "message": f"qclaw gateway unavailable after retries: {last_err}"}}).encode()
-                return StreamingResponse(qclaw_stream(), media_type="text/event-stream")
+                    yield json.dumps({"error": {"type": "proxy_error", "message": f"{PREFERRED_PROVIDER} upstream unavailable after retries: {last_err}"}}).encode()
+                return StreamingResponse(passthrough_stream(), media_type="text/event-stream")
             else:
                 client = await get_http_client()
                 last_err = None
@@ -1500,18 +1534,18 @@ async def openai_chat_completions(raw_request: Request):
                     try:
                         resp = await client.post(url, json=body, headers=headers)
                         if resp.status_code >= 500 and attempt < 2:
-                            last_err = f"gateway {resp.status_code}"
+                            last_err = f"upstream {resp.status_code}"
                             continue
                         return JSONResponse(content=resp.json(), status_code=resp.status_code)
                     except (httpx.ConnectError, httpx.ReadError, httpx.RemoteProtocolError) as e:
                         last_err = str(e)
                         continue
                 return JSONResponse(
-                    content={"error": {"type": "proxy_error", "message": f"qclaw gateway unavailable after retries: {last_err}"}},
+                    content={"error": {"type": "proxy_error", "message": f"{PREFERRED_PROVIDER} upstream unavailable after retries: {last_err}"}},
                     status_code=502,
                 )
 
-        # ── 其他 provider：走 LiteLLM ──
+        # ── 翻译模式：anthropic / gemini — 走 LiteLLM ──
         mapped_model = _map_model_name(req_model)
         litellm_req = dict(body)
         litellm_req["model"] = mapped_model
