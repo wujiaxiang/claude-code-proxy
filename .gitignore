@@ -1,0 +1,51 @@
+# Environment variables (含密钥，不入库)
+.env
+.env.example
+
+# Python virtual environment
+.venv/
+venv/
+env/
+ENV/
+
+# Claude Code 本地配置 (含本地权限，不入库)
+.claude/
+
+# Trae IDE 本地配置
+.trae/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual environments
+venv/
+env/
+ENV/
+
+# Logs
+*.log
+
+# IDE specific files
+.idea/
+.vscode/
+*.swp
+*.swo
