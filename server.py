@@ -128,7 +128,35 @@ for handler in logger.handlers:
             ColorizedFormatter("%(asctime)s - %(levelname)s - %(message)s")
         )
 
-app = FastAPI()
+from contextlib import asynccontextmanager
+
+# ─── 全局 httpx 连接池（复用连接，避免端口/连接泄漏）───
+_http_client: Optional[httpx.AsyncClient] = None
+
+async def get_http_client() -> httpx.AsyncClient:
+    """获取全局共享的 httpx 异步客户端，复用连接池。"""
+    global _http_client
+    if _http_client is None or _http_client.is_closed:
+        _http_client = httpx.AsyncClient(
+            timeout=httpx.Timeout(300.0, connect=10.0),
+            limits=httpx.Limits(
+                max_connections=50,
+                max_keepalive_connections=20,
+                keepalive_expiry=30.0,
+            ),
+        )
+    return _http_client
+
+@asynccontextmanager
+async def lifespan(app):
+    yield
+    # 清理连接池
+    global _http_client
+    if _http_client and not _http_client.is_closed:
+        await _http_client.aclose()
+        _http_client = None
+
+app = FastAPI(lifespan=lifespan)
 
 # Get API keys from environment
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
@@ -172,20 +200,26 @@ print(f"🚀 Preferred provider: {PREFERRED_PROVIDER}")
 
 # 注册 QClaw 模型到 LiteLLM，避免 "model isn't mapped" 错误
 if PREFERRED_PROVIDER == "qclaw":
-    litellm.register_model({
-        "pool-deepseek-v4-pro": {
+    _qclaw_all_models = {
+        m: {
             "max_tokens": 16384, "input_cost_per_token": 0, "output_cost_per_token": 0,
             "litellm_provider": "openai", "mode": "chat",
-        },
-        "pool-deepseek-v4-flash": {
-            "max_tokens": 16384, "input_cost_per_token": 0, "output_cost_per_token": 0,
-            "litellm_provider": "openai", "mode": "chat",
-        },
-        "modelroute": {
-            "max_tokens": 16384, "input_cost_per_token": 0, "output_cost_per_token": 0,
-            "litellm_provider": "openai", "mode": "chat",
-        },
-    })
+        }
+        for m in [
+            "modelroute",
+            "pool-hy3-preview",
+            "pool-deepseek-v4-pro",
+            "pool-deepseek-v4-flash",
+            "pool-glm-5.2",
+            "pool-glm-5.2-night",
+            "pool-glm-5.1",
+            "pool-kimi-k2.7-code-highspeed",
+            "pool-kimi-k2.6",
+            "pool-minimax-m3",
+            "pool-minimax-m2.7",
+        ]
+    }
+    litellm.register_model(_qclaw_all_models)
     print("🐙 QClaw models registered in LiteLLM")
 
 # 注册 Copilot 模型到 LiteLLM，避免 "model isn't mapped" 错误
@@ -509,6 +543,8 @@ class MessagesRequest(BaseModel):
         elif "haiku" in clean_v.lower():
             if PREFERRED_PROVIDER in ("gemini", "gemini-openai"):
                 new_model = f"gemini/{SMALL_MODEL}"
+            elif PREFERRED_PROVIDER in ("qclaw", "copilot"):
+                new_model = SMALL_MODEL
             else:
                 new_model = f"openai/{SMALL_MODEL}"
             mapped = True
@@ -517,6 +553,8 @@ class MessagesRequest(BaseModel):
         elif "sonnet" in clean_v.lower():
             if PREFERRED_PROVIDER in ("gemini", "gemini-openai"):
                 new_model = f"gemini/{MEDIUM_MODEL}"
+            elif PREFERRED_PROVIDER in ("qclaw", "copilot"):
+                new_model = MEDIUM_MODEL
             else:
                 new_model = f"openai/{MEDIUM_MODEL}"
             mapped = True
@@ -525,6 +563,8 @@ class MessagesRequest(BaseModel):
         elif "opus" in clean_v.lower():
             if PREFERRED_PROVIDER in ("gemini", "gemini-openai"):
                 new_model = f"gemini/{BIG_MODEL}"
+            elif PREFERRED_PROVIDER in ("qclaw", "copilot"):
+                new_model = BIG_MODEL
             else:
                 new_model = f"openai/{BIG_MODEL}"
             mapped = True
@@ -606,6 +646,8 @@ class TokenCountRequest(BaseModel):
         elif "haiku" in clean_v.lower():
             if PREFERRED_PROVIDER in ("gemini", "gemini-openai"):
                 new_model = f"gemini/{SMALL_MODEL}"
+            elif PREFERRED_PROVIDER in ("qclaw", "copilot"):
+                new_model = SMALL_MODEL
             else:
                 new_model = f"openai/{SMALL_MODEL}"
             mapped = True
@@ -614,6 +656,8 @@ class TokenCountRequest(BaseModel):
         elif "opus" in clean_v.lower():
             if PREFERRED_PROVIDER in ("gemini", "gemini-openai"):
                 new_model = f"gemini/{BIG_MODEL}"
+            elif PREFERRED_PROVIDER in ("qclaw", "copilot"):
+                new_model = BIG_MODEL
             else:
                 new_model = f"openai/{BIG_MODEL}"
             mapped = True
@@ -622,6 +666,8 @@ class TokenCountRequest(BaseModel):
         elif not mapped:
             if PREFERRED_PROVIDER in ("gemini", "gemini-openai"):
                 new_model = f"gemini/{MEDIUM_MODEL}"
+            elif PREFERRED_PROVIDER in ("qclaw", "copilot"):
+                new_model = MEDIUM_MODEL
             else:
                 new_model = f"openai/{MEDIUM_MODEL}"
             mapped = True
@@ -1383,7 +1429,11 @@ async def _litellm_oai_stream(response_generator):
 
 @app.post("/v1/chat/completions")
 async def openai_chat_completions(raw_request: Request):
-    """OpenAI 兼容端点：所有 provider 统一走 LiteLLM"""
+    """OpenAI 兼容端点
+
+    qclaw 模式：直接透传请求体给 QClaw 网关，不做模型映射和协议转换。
+    其他 provider：走 LiteLLM 统一处理。
+    """
     request_id = _request_id_from_headers(raw_request)
     req_model = "unknown"
     mapped_model = "unknown"
@@ -1394,6 +1444,74 @@ async def openai_chat_completions(raw_request: Request):
         req_model = body.get("model", default_model)
         is_stream = body.get("stream", False)
 
+        # ── qclaw 模式：直接透传，不走 litellm ──
+        if PREFERRED_PROVIDER == "qclaw":
+            # 去掉 qclaw/ 前缀（如果有），直接用原始模型名
+            passthrough_model = req_model
+            if passthrough_model.startswith("qclaw/"):
+                passthrough_model = passthrough_model[len("qclaw/"):]
+            body["model"] = passthrough_model
+
+            # QClaw 网关要求必须有 system message
+            msgs = body.get("messages", [])
+            if not any(m.get("role") == "system" for m in msgs):
+                msgs.insert(0, {"role": "system", "content": "You are Claude, a helpful AI assistant."})
+                body["messages"] = msgs
+
+            log_request_beautifully(
+                "POST", "/v1/chat/completions", req_model, passthrough_model,
+                len(body.get("messages", [])), len(body.get("tools") or []), 200
+            )
+
+            headers = {
+                "Content-Type": "application/json",
+                "Authorization": "Bearer __QCLAW_AUTH_GATEWAY_MANAGED__",
+                "User-Agent": "OpenAI/JS 6.39.1",
+                "x-agent-id": "main",
+            }
+            url = f"{QCLAW_BASE_URL}/chat/completions"
+
+            if is_stream:
+                async def qclaw_stream():
+                    client = await get_http_client()
+                    last_err = None
+                    for attempt in range(3):
+                        try:
+                            async with client.stream("POST", url, json=body, headers=headers) as resp:
+                                if resp.status_code >= 500:
+                                    # 网关 5xx，重试
+                                    await resp.aread()
+                                    last_err = f"gateway {resp.status_code}"
+                                    continue
+                                async for chunk in resp.aiter_bytes():
+                                    yield chunk
+                                return
+                            break
+                        except (httpx.ConnectError, httpx.ReadError, httpx.RemoteProtocolError) as e:
+                            last_err = str(e)
+                            continue
+                    # 所有重试失败
+                    yield json.dumps({"error": {"type": "proxy_error", "message": f"qclaw gateway unavailable after retries: {last_err}"}}).encode()
+                return StreamingResponse(qclaw_stream(), media_type="text/event-stream")
+            else:
+                client = await get_http_client()
+                last_err = None
+                for attempt in range(3):
+                    try:
+                        resp = await client.post(url, json=body, headers=headers)
+                        if resp.status_code >= 500 and attempt < 2:
+                            last_err = f"gateway {resp.status_code}"
+                            continue
+                        return JSONResponse(content=resp.json(), status_code=resp.status_code)
+                    except (httpx.ConnectError, httpx.ReadError, httpx.RemoteProtocolError) as e:
+                        last_err = str(e)
+                        continue
+                return JSONResponse(
+                    content={"error": {"type": "proxy_error", "message": f"qclaw gateway unavailable after retries: {last_err}"}},
+                    status_code=502,
+                )
+
+        # ── 其他 provider：走 LiteLLM ──
         mapped_model = _map_model_name(req_model)
         litellm_req = dict(body)
         litellm_req["model"] = mapped_model
