@@ -194,13 +194,37 @@ BIG_MODEL="gpt-4o" # Example specific model
 SMALL_MODEL="gpt-4o-mini" # Example specific model
 ```
 
+## API Endpoints 🔌
+
+The proxy exposes **two endpoints**, both available for all providers:
+
+| Endpoint | Format | Description |
+|----------|--------|-------------|
+| `/v1/messages` | Anthropic | For Claude Code and Anthropic SDK clients — translates between Anthropic and OpenAI formats via LiteLLM |
+| `/v1/chat/completions` | OpenAI | For OpenAI-compatible clients (agents, tools, SDKs) |
+
+### Per-Provider Behavior
+
+| Provider | `/v1/messages` | `/v1/chat/completions` |
+|----------|---------------|----------------------|
+| `anthropic` | LiteLLM 翻译 | LiteLLM 翻译 |
+| `gemini` | LiteLLM 翻译 | LiteLLM 翻译 |
+| `gemini-openai` | LiteLLM 翻译 | LiteLLM 翻译 |
+| `openai` | LiteLLM 翻译 | LiteLLM 翻译 |
+| `copilot` | LiteLLM 翻译 | LiteLLM 翻译 |
+| **`qclaw`** | LiteLLM 翻译 | **直接透传（无翻译）** |
+
+> **QClaw 透传模式**：当 `PREFERRED_PROVIDER=qclaw` 时，`/v1/chat/completions` 会将请求体原样转发给 QClaw 网关，不做模型映射或协议转换。自动处理：去掉 `qclaw/` 前缀、补全 system message、连接错误/5xx 自动重试 3 次、全局 httpx 连接池复用。
+>
+> 其他所有 provider 在两个端点上均通过 LiteLLM 进行格式翻译和模型映射。
+
 ## How It Works 🧩
 
 This proxy works by:
 
 1. **Receiving requests** in Anthropic's API format 📥
 2. **Translating** the requests to OpenAI format via LiteLLM 🔄
-3. **Sending** the translated request to OpenAI 📤
+3. **Sending** the translated request to the configured backend 📤
 4. **Converting** the response back to Anthropic format 🔄
 5. **Returning** the formatted response to the client ✅
 
@@ -294,6 +318,10 @@ SMALL_MODEL=gpt-4.1-mini
 ### Provider 5 — QClaw Local Gateway
 
 For use with the QClaw desktop gateway (local routing).
+
+**双端点行为**：`/v1/messages` 走 LiteLLM 翻译（Claude→QClaw 三级模型映射）；`/v1/chat/completions` **直接透传**（无翻译，原样转发给 QClaw 网关，支持自动重试和连接池复用）。
+
+**已注册模型**（11 个）：`modelroute`、`pool-hy3-preview`、`pool-deepseek-v4-pro`、`pool-deepseek-v4-flash`、`pool-glm-5.2`、`pool-glm-5.2-night`、`pool-glm-5.1`、`pool-kimi-k2.7-code-highspeed`、`pool-kimi-k2.6`、`pool-minimax-m3`、`pool-minimax-m2.7`
 
 ```ini
 PREFERRED_PROVIDER=qclaw
