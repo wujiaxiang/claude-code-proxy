@@ -1,6 +1,7 @@
 from fastapi import FastAPI, Request, HTTPException
 import uvicorn
 import logging
+from logging.handlers import TimedRotatingFileHandler
 import json
 from pydantic import BaseModel, Field, field_validator
 from typing import List, Dict, Any, Optional, Union, Literal
@@ -13,17 +14,61 @@ import time
 from dotenv import load_dotenv
 import re
 from datetime import datetime
+from pathlib import Path
 import sys
 
 # Load environment variables from .env file
 load_dotenv()
 
+# Debug mode
+DEBUG = os.environ.get("DEBUG", "False").lower() == "true"
+LOG_FILE = os.environ.get("LOG_FILE", "")  # 非空则同时输出到文件
+LOG_RETENTION_DAYS = int(os.environ.get("LOG_RETENTION_DAYS", "7"))
+LOG_ROTATE_WHEN = os.environ.get("LOG_ROTATE_WHEN", "midnight")
+LOG_ROTATE_INTERVAL = int(os.environ.get("LOG_ROTATE_INTERVAL", "1"))
+
 # Configure logging
-logging.basicConfig(
-    level=logging.WARN,  # Change to INFO level to show more details
-    format="%(asctime)s - %(levelname)s - %(message)s",
-)
+_log_level = logging.DEBUG if DEBUG else logging.WARN
+_log_fmt = "%(asctime)s - %(levelname)s - %(message)s"
+logging.basicConfig(level=_log_level, format=_log_fmt)
 logger = logging.getLogger(__name__)
+
+def _cleanup_old_log_files(log_file: str, retention_days: int):
+    if not log_file or retention_days <= 0:
+        return
+    try:
+        log_path = Path(log_file).expanduser()
+        if not log_path.parent.exists():
+            return
+        cutoff_ts = time.time() - retention_days * 86400
+        for candidate in log_path.parent.glob(f"{log_path.name}*"):
+            if not candidate.is_file() or candidate == log_path:
+                continue
+            if candidate.stat().st_mtime < cutoff_ts:
+                candidate.unlink()
+    except Exception as e:
+        logging.getLogger(__name__).warning(f"Failed to cleanup old logs: {e}")
+
+
+# ── 文件日志 Handler（LOG_FILE 非空时启用，自动轮转+清理）──────────
+if LOG_FILE:
+    _log_path = Path(LOG_FILE).expanduser()
+    _log_path.parent.mkdir(parents=True, exist_ok=True)
+
+    _fh = TimedRotatingFileHandler(
+        filename=str(_log_path),
+        when=LOG_ROTATE_WHEN,
+        interval=max(1, LOG_ROTATE_INTERVAL),
+        backupCount=max(0, LOG_RETENTION_DAYS),
+        encoding="utf-8",
+    )
+    _fh.setLevel(logging.DEBUG if DEBUG else logging.WARNING)
+    _fh.setFormatter(logging.Formatter(_log_fmt))
+    logging.getLogger().addHandler(_fh)
+    _cleanup_old_log_files(str(_log_path), LOG_RETENTION_DAYS)
+    logger.warning(
+        f"📄 File log enabled: path={_log_path} rotate={LOG_ROTATE_WHEN}/{LOG_ROTATE_INTERVAL} retention_days={LOG_RETENTION_DAYS}"
+    )
 
 # Configure uvicorn to be quieter
 import uvicorn
@@ -83,30 +128,263 @@ for handler in logger.handlers:
             ColorizedFormatter("%(asctime)s - %(levelname)s - %(message)s")
         )
 
-app = FastAPI()
+from contextlib import asynccontextmanager
+
+# ─── 全局 httpx 连接池（复用连接，避免端口/连接泄漏）───
+_http_client: Optional[httpx.AsyncClient] = None
+
+async def get_http_client() -> httpx.AsyncClient:
+    """获取全局共享的 httpx 异步客户端，复用连接池。"""
+    global _http_client
+    if _http_client is None or _http_client.is_closed:
+        _http_client = httpx.AsyncClient(
+            timeout=httpx.Timeout(300.0, connect=10.0),
+            limits=httpx.Limits(
+                max_connections=50,
+                max_keepalive_connections=20,
+                keepalive_expiry=30.0,
+            ),
+        )
+    return _http_client
+
+@asynccontextmanager
+async def lifespan(app):
+    yield
+    # 清理连接池
+    global _http_client
+    if _http_client and not _http_client.is_closed:
+        await _http_client.aclose()
+        _http_client = None
+
+app = FastAPI(lifespan=lifespan)
 
 # Get API keys from environment
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 
-# Get Vertex AI project and location from environment (if set)
+# Get custom base URLs from environment
+OPENAI_BASE_URL = os.environ.get("OPENAI_BASE_URL")
+ANTHROPIC_BASE_URL = os.environ.get("ANTHROPIC_BASE_URL")
+
+# Gemini thought_signature 存储：tool_use_id → signature
+_thought_signatures: Dict[str, str] = {}
+
+# Vertex AI (Google Cloud)
 VERTEX_PROJECT = os.environ.get("VERTEX_PROJECT", "unset")
 VERTEX_LOCATION = os.environ.get("VERTEX_LOCATION", "unset")
-
-# Option to use Gemini API key instead of ADC for Vertex AI
 USE_VERTEX_AUTH = os.environ.get("USE_VERTEX_AUTH", "False").lower() == "true"
 
-# Get OpenAI base URL from environment (if set)
-OPENAI_BASE_URL = os.environ.get("OPENAI_BASE_URL")
+# Get QClaw base URL from environment (if set)
+QCLAW_BASE_URL = os.environ.get("QCLAW_BASE_URL", "http://127.0.0.1:19000/proxy/llm")
 
-# Get preferred provider (default to openai)
+# ─── GitHub Copilot Enterprise 配置 ───
+COPILOT_GHE_TOKEN = os.environ.get("COPILOT_GHE_TOKEN", "")
+COPILOT_GHE_HOST = os.environ.get("COPILOT_GHE_HOST", "copilot-api.bmw.ghe.com")
+COPILOT_INTEGRATION_ID = os.environ.get("COPILOT_INTEGRATION_ID", "copilot-developer-cli")
+# api_base for LiteLLM（不含路径，LiteLLM 会追加 /chat/completions）
+COPILOT_API_BASE = f"https://{COPILOT_GHE_HOST}"
+# Copilot 模型映射（opus→big, sonnet→medium, haiku→small）
+COPILOT_BIG_MODEL    = os.environ.get("COPILOT_BIG_MODEL",    "claude-sonnet-4.6")
+COPILOT_MEDIUM_MODEL = os.environ.get("COPILOT_MEDIUM_MODEL", "claude-sonnet-4.6")
+COPILOT_SMALL_MODEL  = os.environ.get("COPILOT_SMALL_MODEL",  "claude-haiku-4.5")
+
+# Get preferred provider
 PREFERRED_PROVIDER = os.environ.get("PREFERRED_PROVIDER", "openai").lower()
+valid_providers = ("openai", "anthropic", "qclaw", "gemini", "gemini-openai", "copilot")
+if PREFERRED_PROVIDER not in valid_providers:
+    print(f"Warning: Unknown PREFERRED_PROVIDER '{PREFERRED_PROVIDER}', falling back to 'openai'")
+    PREFERRED_PROVIDER = "openai"
+
+print(f"🚀 Preferred provider: {PREFERRED_PROVIDER}")
+
+# 注册 QClaw 模型到 LiteLLM，避免 "model isn't mapped" 错误
+if PREFERRED_PROVIDER == "qclaw":
+    _qclaw_all_models = {
+        m: {
+            "max_tokens": 16384, "input_cost_per_token": 0, "output_cost_per_token": 0,
+            "litellm_provider": "openai", "mode": "chat",
+        }
+        for m in [
+            "modelroute",
+            "pool-hy3-preview",
+            "pool-deepseek-v4-pro",
+            "pool-deepseek-v4-flash",
+            "pool-glm-5.2",
+            "pool-glm-5.2-night",
+            "pool-glm-5.1",
+            "pool-kimi-k2.7-code-highspeed",
+            "pool-kimi-k2.6",
+            "pool-minimax-m3",
+            "pool-minimax-m2.7",
+        ]
+    }
+    litellm.register_model(_qclaw_all_models)
+    print("🐙 QClaw models registered in LiteLLM")
+
+# 注册 Copilot 模型到 LiteLLM，避免 "model isn't mapped" 错误
+if PREFERRED_PROVIDER == "copilot":
+    _copilot_models = {
+        m: {"max_tokens": 64000, "input_cost_per_token": 0, "output_cost_per_token": 0,
+            "litellm_provider": "openai", "mode": "chat"}
+        for m in [
+            COPILOT_BIG_MODEL, COPILOT_MEDIUM_MODEL, COPILOT_SMALL_MODEL,
+            # 全量可用模型（来自 /models API，2026-06）
+            "claude-haiku-4.5", "claude-sonnet-4.5", "claude-sonnet-4.6",
+            "claude-opus-4.5", "claude-opus-4.6", "claude-opus-4.8",
+            "gpt-5.5", "gpt-5.4", "gpt-5.3-codex", "gpt-5-mini",
+            "gpt-4.1", "gpt-4.1-2025-04-14",
+            "gpt-4o-mini", "gpt-4o-mini-2024-07-18",
+            "gpt-3.5-turbo", "gpt-3.5-turbo-0613",
+            "gemini-2.5-pro",
+        ]
+    }
+    litellm.register_model(_copilot_models)
+    print("🤖 Copilot models registered in LiteLLM")
 
 # Get model mapping configuration from environment
 # Default to latest OpenAI models if not set
 BIG_MODEL = os.environ.get("BIG_MODEL", "gpt-4.1")
+MEDIUM_MODEL = os.environ.get("MEDIUM_MODEL", os.environ.get("BIG_MODEL", "gpt-4.1"))
 SMALL_MODEL = os.environ.get("SMALL_MODEL", "gpt-4.1-mini")
+# ─── Provider 策略（开闭原则：新增 provider 只需在此注册） ───
+
+def _default_provider(req, litellm_req, _orig):
+    """标准 OpenAI"""
+    litellm_req["api_key"] = OPENAI_API_KEY
+    if OPENAI_BASE_URL:
+        litellm_req["api_base"] = OPENAI_BASE_URL
+        logger.debug(f"OpenAI: base={OPENAI_BASE_URL}")
+    else:
+        logger.debug(f"OpenAI: default")
+    return None  # 继续走 LiteLLM
+
+def _qclaw_provider(req, litellm_req, orig):
+    """QClaw 本地网关"""
+    litellm_req["api_key"] = "__QCLAW_AUTH_GATEWAY_MANAGED__"
+    litellm_req["api_base"] = QCLAW_BASE_URL
+    litellm_req["extra_headers"] = {"User-Agent": "OpenAI/JS 6.39.1", "x-agent-id": "main"}
+    litellm_req.pop("stop", None); litellm_req.pop("top_k", None); litellm_req.pop("metadata", None)
+    msgs = litellm_req.get("messages", [])
+    if not any(m.get("role") == "system" for m in msgs):
+        msgs.insert(0, {"role": "system", "content": "You are Claude, a helpful AI assistant."})
+    # 恢复上游原始 max_tokens（此值可能在 convert 阶段被 OpenAI/Gemini 截断）
+    original_max = litellm_req.pop("_original_max_tokens", None)
+    if original_max is not None and original_max != litellm_req.get("max_completion_tokens"):
+        litellm_req["max_completion_tokens"] = original_max
+        logger.debug(f"🐙 QClaw: restored max_tokens {litellm_req['max_completion_tokens']} -> {original_max}")
+
+    req.model = orig
+    max_tok = litellm_req.get("max_completion_tokens", "N/A")
+    logger.debug(f"🐙 QClaw: {req.model} max_tokens={max_tok} stream={litellm_req.get('stream')} extra_body=(not set)")
+    return None  # 继续走 LiteLLM
+
+def _anthropic_provider(req, litellm_req, _orig):
+    """Anthropic / 自定义 Anthropic API"""
+    litellm_req["api_key"] = ANTHROPIC_API_KEY
+    if ANTHROPIC_BASE_URL:
+        litellm_req["api_base"] = ANTHROPIC_BASE_URL
+        logger.debug(f"Anthropic: base={ANTHROPIC_BASE_URL}")
+    else:
+        logger.debug(f"Anthropic: default")
+    return None  # 继续走 LiteLLM
+
+def _gemini_provider(req, litellm_req, orig):
+    """Gemini 原生 API — 走 LiteLLM（gemini/ 前缀），框架内置 thoughtSignature 处理"""
+    litellm_req["api_key"] = os.environ.get("GEMINI_API_KEY", "")
+    # 不修改 req.model，让 LiteLLM 的 gemini/ 前缀路由正常工作
+    # 模型名在非流式响应中由 convert_litellm_to_anthropic 后的 original_model 还原
+    logger.debug(f"☀️ Gemini via LiteLLM: → {litellm_req.get('model')}")
+    return None  # LiteLLM 处理剩余流程
+
+def _copilot_model_name(anthropic_model: str) -> str:
+    """把 Anthropic 模型名映射到 Copilot 企业可用模型名"""
+    m = anthropic_model.lower()
+    # 去掉 provider 前缀
+    for prefix in ("anthropic/", "openai/", "copilot/"):
+        if m.startswith(prefix):
+            m = m[len(prefix):]
+    if "opus" in m:
+        return COPILOT_BIG_MODEL
+    if "sonnet" in m:
+        return COPILOT_MEDIUM_MODEL
+    if "haiku" in m:
+        return COPILOT_SMALL_MODEL
+    # 如果已经是 copilot 的模型名（如 claude-sonnet-4.6），直接使用
+    return m
+
+
+def _is_claude_family_model(model_name: str) -> bool:
+    m = (model_name or "").lower()
+    for prefix in ("anthropic/", "openai/", "copilot/", "gemini/"):
+        if m.startswith(prefix):
+            m = m[len(prefix):]
+            break
+    return m.startswith("claude-") or "claude" in m
+
+
+def _copilot_provider(req, litellm_req, orig):
+    """GitHub Copilot Enterprise — 走 LiteLLM（与 qclaw 同一路径）"""
+    # 模型映射
+    target_model = _copilot_model_name(orig)
+    litellm_req["model"] = f"openai/{target_model}"
+    litellm_req["api_key"] = COPILOT_GHE_TOKEN
+    litellm_req["api_base"] = COPILOT_API_BASE
+    litellm_req["extra_headers"] = {"Copilot-Integration-Id": COPILOT_INTEGRATION_ID}
+
+    # 模型能力分流：Claude 家族不接受采样参数，GPT 家族保留
+    if _is_claude_family_model(target_model):
+        for k in ("temperature", "top_p", "top_k", "min_p"):
+            litellm_req.pop(k, None)
+
+    # Copilot 不接受空/None 消息 content
+    for msg in litellm_req.get("messages", []):
+        c = msg.get("content")
+        if c is None or (isinstance(c, str) and not c.strip()):
+            msg["content"] = "."
+
+    # Copilot 不接受没有 tools 时的 tool_choice
+    if litellm_req.get("tool_choice") and not litellm_req.get("tools"):
+        litellm_req.pop("tool_choice")
+
+    logger.debug(f"🤖 Copilot via LiteLLM: → {litellm_req['model']}")
+    return None  # 继续走 LiteLLM
+
+_PROVIDER_STRATEGIES = {
+    "openai": _default_provider,
+    "qclaw": _qclaw_provider,
+    "anthropic": _anthropic_provider,
+    "gemini": _gemini_provider,
+    "gemini-openai": _gemini_provider,
+    "copilot": _copilot_provider,
+}
+
+def _map_model_name(model: str) -> str:
+    """把任意模型名按当前 PREFERRED_PROVIDER 映射到 LiteLLM 可用的带前缀名称。
+    copilot provider 请用 _copilot_model_name() 代替。"""
+    clean = model
+    for prefix in ("anthropic/", "openai/", "gemini/", "qclaw/", "copilot/"):
+        if clean.startswith(prefix):
+            clean = clean[len(prefix):]
+            break
+    c = clean.lower()
+    if "opus" in c:
+        target = BIG_MODEL
+    elif "sonnet" in c:
+        target = MEDIUM_MODEL
+    elif "haiku" in c:
+        target = SMALL_MODEL
+    else:
+        target = clean  # 已经是目标 provider 的模型名，直接用
+    # 加 provider 前缀
+    if PREFERRED_PROVIDER == "anthropic":
+        return f"anthropic/{target}"
+    elif PREFERRED_PROVIDER in ("gemini", "gemini-openai"):
+        return f"gemini/{target}"
+    elif PREFERRED_PROVIDER in ("qclaw", "copilot"):
+        return target  # qclaw/copilot 靠 api_base 路由，不需要前缀（model 在 provider 策略里覆盖）
+    else:  # openai / default
+        return f"openai/{target}"
 
 # List of OpenAI models
 OPENAI_MODELS = [
@@ -186,7 +464,7 @@ class SystemContent(BaseModel):
 
 
 class Message(BaseModel):
-    role: Literal["user", "assistant"]
+    role: Literal["user", "assistant", "system"]
     content: Union[
         str,
         List[
@@ -211,6 +489,7 @@ class ThinkingConfig(BaseModel):
 
 
 class MessagesRequest(BaseModel):
+    model_config = {"extra": "allow"}  # Allow extra fields from Claude Code
     model: str
     max_tokens: int
     messages: List[Message]
@@ -243,40 +522,61 @@ class MessagesRequest(BaseModel):
             clean_v = clean_v[7:]
         elif clean_v.startswith("gemini/"):
             clean_v = clean_v[7:]
+        elif clean_v.startswith("qclaw/"):
+            clean_v = clean_v[6:]
 
         # --- Mapping Logic --- START ---
         mapped = False
         if PREFERRED_PROVIDER == "anthropic":
-            # Don't remap to big/small models, just add the prefix
-            new_model = f"anthropic/{clean_v}"
-            mapped = True
+            # 也走模型映射：sonnet/haiku → BIG/SMALL_MODEL
+            if "haiku" in clean_v.lower():
+                new_model = f"anthropic/{SMALL_MODEL}"
+                mapped = True
+            elif "sonnet" in clean_v.lower():
+                new_model = f"anthropic/{MEDIUM_MODEL}"
+                mapped = True
+            else:
+                new_model = f"anthropic/{clean_v}"
+                mapped = True
 
         # Map Haiku to SMALL_MODEL based on provider preference
         elif "haiku" in clean_v.lower():
-            if PREFERRED_PROVIDER == "google" and SMALL_MODEL in GEMINI_MODELS:
+            if PREFERRED_PROVIDER in ("gemini", "gemini-openai"):
                 new_model = f"gemini/{SMALL_MODEL}"
-                mapped = True
+            elif PREFERRED_PROVIDER in ("qclaw", "copilot"):
+                new_model = SMALL_MODEL
             else:
                 new_model = f"openai/{SMALL_MODEL}"
-                mapped = True
+            mapped = True
 
-        # Map Sonnet to BIG_MODEL based on provider preference
+        # Map Sonnet to MEDIUM_MODEL (3-tier: Opus>Sonnet>Haiku)
         elif "sonnet" in clean_v.lower():
-            if PREFERRED_PROVIDER == "google" and BIG_MODEL in GEMINI_MODELS:
+            if PREFERRED_PROVIDER in ("gemini", "gemini-openai"):
+                new_model = f"gemini/{MEDIUM_MODEL}"
+            elif PREFERRED_PROVIDER in ("qclaw", "copilot"):
+                new_model = MEDIUM_MODEL
+            else:
+                new_model = f"openai/{MEDIUM_MODEL}"
+            mapped = True
+
+        # Map Opus to BIG_MODEL
+        elif "opus" in clean_v.lower():
+            if PREFERRED_PROVIDER in ("gemini", "gemini-openai"):
                 new_model = f"gemini/{BIG_MODEL}"
-                mapped = True
+            elif PREFERRED_PROVIDER in ("qclaw", "copilot"):
+                new_model = BIG_MODEL
             else:
                 new_model = f"openai/{BIG_MODEL}"
-                mapped = True
+            mapped = True
 
         # Add prefixes to non-mapped models if they match known lists
         elif not mapped:
             if clean_v in GEMINI_MODELS and not v.startswith("gemini/"):
                 new_model = f"gemini/{clean_v}"
-                mapped = True  # Technically mapped to add prefix
+                mapped = True
             elif clean_v in OPENAI_MODELS and not v.startswith("openai/"):
                 new_model = f"openai/{clean_v}"
-                mapped = True  # Technically mapped to add prefix
+                mapped = True
         # --- Mapping Logic --- END ---
 
         if mapped:
@@ -326,35 +626,51 @@ class TokenCountRequest(BaseModel):
             clean_v = clean_v[7:]
         elif clean_v.startswith("gemini/"):
             clean_v = clean_v[7:]
+        elif clean_v.startswith("qclaw/"):
+            clean_v = clean_v[6:]
 
         # --- Mapping Logic --- START ---
         mapped = False
-        # Map Haiku to SMALL_MODEL based on provider preference
-        if "haiku" in clean_v.lower():
-            if PREFERRED_PROVIDER == "google" and SMALL_MODEL in GEMINI_MODELS:
-                new_model = f"gemini/{SMALL_MODEL}"
+        if PREFERRED_PROVIDER == "anthropic":
+            if "haiku" in clean_v.lower():
+                new_model = f"anthropic/{SMALL_MODEL}"
                 mapped = True
+            elif "sonnet" in clean_v.lower():
+                new_model = f"anthropic/{BIG_MODEL}"
+                mapped = True
+            else:
+                new_model = f"anthropic/{clean_v}"
+                mapped = True
+
+        # Map Haiku to SMALL_MODEL based on provider preference
+        elif "haiku" in clean_v.lower():
+            if PREFERRED_PROVIDER in ("gemini", "gemini-openai"):
+                new_model = f"gemini/{SMALL_MODEL}"
+            elif PREFERRED_PROVIDER in ("qclaw", "copilot"):
+                new_model = SMALL_MODEL
             else:
                 new_model = f"openai/{SMALL_MODEL}"
-                mapped = True
+            mapped = True
 
-        # Map Sonnet to BIG_MODEL based on provider preference
-        elif "sonnet" in clean_v.lower():
-            if PREFERRED_PROVIDER == "google" and BIG_MODEL in GEMINI_MODELS:
+        # Map Opus to BIG_MODEL
+        elif "opus" in clean_v.lower():
+            if PREFERRED_PROVIDER in ("gemini", "gemini-openai"):
                 new_model = f"gemini/{BIG_MODEL}"
-                mapped = True
+            elif PREFERRED_PROVIDER in ("qclaw", "copilot"):
+                new_model = BIG_MODEL
             else:
                 new_model = f"openai/{BIG_MODEL}"
-                mapped = True
+            mapped = True
 
-        # Add prefixes to non-mapped models if they match known lists
+        # Default: map everything else (Sonnet, unknown) to MEDIUM_MODEL
         elif not mapped:
-            if clean_v in GEMINI_MODELS and not v.startswith("gemini/"):
-                new_model = f"gemini/{clean_v}"
-                mapped = True  # Technically mapped to add prefix
-            elif clean_v in OPENAI_MODELS and not v.startswith("openai/"):
-                new_model = f"openai/{clean_v}"
-                mapped = True  # Technically mapped to add prefix
+            if PREFERRED_PROVIDER in ("gemini", "gemini-openai"):
+                new_model = f"gemini/{MEDIUM_MODEL}"
+            elif PREFERRED_PROVIDER in ("qclaw", "copilot"):
+                new_model = MEDIUM_MODEL
+            else:
+                new_model = f"openai/{MEDIUM_MODEL}"
+            mapped = True
         # --- Mapping Logic --- END ---
 
         if mapped:
@@ -400,15 +716,20 @@ class MessagesResponse(BaseModel):
 
 @app.middleware("http")
 async def log_requests(request: Request, call_next):
-    # Get request details
+    start = time.time()
     method = request.method
     path = request.url.path
 
-    # Log only basic request details at debug level
-    logger.debug(f"Request: {method} {path}")
+    if DEBUG:
+        logger.debug(f"⬇️ REQUEST: {method} {path}")
 
-    # Process the request and get the response
     response = await call_next(request)
+
+    if DEBUG:
+        elapsed = time.time() - start
+        logger.debug(f"⬆️ RESPONSE: {method} {path} HTTP {response.status_code} ⏱️{elapsed:.1f}s")
+
+    return response
 
     return response
 
@@ -439,7 +760,6 @@ def parse_tool_result_content(content):
                         result += json.dumps(item) + "\n"
                     except:
                         result += str(item) + "\n"
-            else:
                 try:
                     result += str(item) + "\n"
                 except:
@@ -459,6 +779,108 @@ def parse_tool_result_content(content):
         return str(content)
     except:
         return "Unparseable content"
+
+
+def _close_json_fragment(fragment: str) -> str:
+    """Best-effort close for streaming tool arguments JSON fragments."""
+    if not isinstance(fragment, str) or not fragment:
+        return ""
+    try:
+        json.loads(fragment)
+        return ""
+    except Exception:
+        pass
+
+    stack = []
+    in_string = False
+    escaped = False
+
+    for ch in fragment:
+        if in_string:
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == '"':
+                in_string = False
+            continue
+
+        if ch == '"':
+            in_string = True
+        elif ch == "{":
+            stack.append("}")
+        elif ch == "[":
+            stack.append("]")
+        elif ch in ("}", "]") and stack and ch == stack[-1]:
+            stack.pop()
+
+    suffix = ""
+    if in_string:
+        suffix += '"'
+    if stack:
+        suffix += "".join(reversed(stack))
+
+    if not suffix:
+        return ""
+    try:
+        json.loads(fragment + suffix)
+        return suffix
+    except Exception:
+        return ""
+
+
+def _sanitize_for_log(obj, max_str_len: int = 2000):
+    """Recursively sanitize objects so they can be safely logged as JSON."""
+    if isinstance(obj, dict):
+        return {str(k): _sanitize_for_log(v, max_str_len) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_sanitize_for_log(v, max_str_len) for v in obj]
+    if isinstance(obj, (str, int, float, bool)) or obj is None:
+        if isinstance(obj, str) and len(obj) > max_str_len:
+            return obj[:max_str_len] + "...(truncated)"
+        return obj
+    try:
+        s = str(obj)
+        return s[:max_str_len] + ("...(truncated)" if len(s) > max_str_len else "")
+    except Exception:
+        return "<unserializable>"
+
+
+def _request_id_from_headers(request: Optional[Request] = None) -> str:
+    if request is None:
+        return f"req_{uuid.uuid4().hex[:12]}"
+    rid = request.headers.get("x-request-id") or request.headers.get("x-correlation-id")
+    return rid or f"req_{uuid.uuid4().hex[:12]}"
+
+
+def _log_exception(event: str, exc: Exception, context: Optional[Dict[str, Any]] = None):
+    import traceback
+
+    details = {
+        "event": event,
+        "provider": PREFERRED_PROVIDER,
+        "error_type": type(exc).__name__,
+        "error_message": str(exc),
+        "traceback": traceback.format_exc(),
+        "context": context or {},
+    }
+
+    # Capture common exception attributes (LiteLLM/httpx/etc.)
+    for attr in ("status_code", "message", "llm_provider", "model", "response"):
+        if hasattr(exc, attr):
+            details[attr] = getattr(exc, attr)
+
+    if hasattr(exc, "__dict__"):
+        extra = {}
+        for k, v in exc.__dict__.items():
+            if k not in ("args", "__traceback__"):
+                extra[k] = v
+        if extra:
+            details["exception_attrs"] = extra
+
+    logger.error(
+        f"ERROR_CONTEXT {json.dumps(_sanitize_for_log(details), ensure_ascii=False)}"
+    )
 
 
 def convert_anthropic_to_litellm(anthropic_request: MessagesRequest) -> Dict[str, Any]:
@@ -493,89 +915,86 @@ def convert_anthropic_to_litellm(anthropic_request: MessagesRequest) -> Dict[str
             messages.append({"role": msg.role, "content": content})
         else:
             # Special handling for tool_result in user messages
-            # OpenAI/LiteLLM format expects the assistant to call the tool,
-            # and the user's next message to include the result as plain text
+            # OpenAI format: each tool_result → {"role": "tool", "tool_call_id": "xxx", "content": "yyy"}
             if msg.role == "user" and any(
                 block.type == "tool_result"
                 for block in content
                 if hasattr(block, "type")
             ):
-                # For user messages with tool_result, split into separate messages
-                text_content = ""
-
-                # Extract all text parts and concatenate them
+                text_parts = []
                 for block in content:
                     if hasattr(block, "type"):
                         if block.type == "text":
-                            text_content += block.text + "\n"
+                            text_parts.append(block.text)
                         elif block.type == "tool_result":
-                            # Add tool result as a message by itself - simulate the normal flow
                             tool_id = (
                                 block.tool_use_id
                                 if hasattr(block, "tool_use_id")
                                 else ""
                             )
-
-                            # Handle different formats of tool result content
                             result_content = ""
                             if hasattr(block, "content"):
                                 if isinstance(block.content, str):
                                     result_content = block.content
                                 elif isinstance(block.content, list):
-                                    # If content is a list of blocks, extract text from each
-                                    for content_block in block.content:
-                                        if (
-                                            hasattr(content_block, "type")
-                                            and content_block.type == "text"
-                                        ):
-                                            result_content += content_block.text + "\n"
-                                        elif (
-                                            isinstance(content_block, dict)
-                                            and content_block.get("type") == "text"
-                                        ):
-                                            result_content += (
-                                                content_block.get("text", "") + "\n"
-                                            )
-                                        elif isinstance(content_block, dict):
-                                            # Handle any dict by trying to extract text or convert to JSON
-                                            if "text" in content_block:
-                                                result_content += (
-                                                    content_block.get("text", "") + "\n"
-                                                )
-                                            else:
-                                                try:
-                                                    result_content += (
-                                                        json.dumps(content_block) + "\n"
-                                                    )
-                                                except:
-                                                    result_content += (
-                                                        str(content_block) + "\n"
-                                                    )
-                                elif isinstance(block.content, dict):
-                                    # Handle dictionary content
-                                    if block.content.get("type") == "text":
-                                        result_content = block.content.get("text", "")
-                                    else:
-                                        try:
-                                            result_content = json.dumps(block.content)
-                                        except:
-                                            result_content = str(block.content)
+                                    for cb in block.content:
+                                        if isinstance(cb, dict) and cb.get("type") == "text":
+                                            result_content += cb.get("text", "") + "\n"
+                                        elif hasattr(cb, "type") and cb.type == "text":
+                                            result_content += cb.text + "\n"
+                                        else:
+                                            result_content += str(cb) + "\n"
                                 else:
-                                    # Handle any other type by converting to string
-                                    try:
-                                        result_content = str(block.content)
-                                    except:
-                                        result_content = "Unparseable content"
-
-                            # In OpenAI format, tool results come from the user (rather than being content blocks)
-                            text_content += (
-                                f"Tool result for {tool_id}:\n{result_content}\n"
-                            )
-
-                # Add as a single user message with all the content
-                messages.append({"role": "user", "content": text_content.strip()})
+                                    result_content = str(block.content)
+                            # OpenAI standard: tool role message
+                            messages.append({
+                                "role": "tool",
+                                "tool_call_id": tool_id,
+                                "content": result_content.strip() or "Tool executed successfully",
+                            })
+                # Any remaining text goes as a separate user message
+                if text_parts:
+                    messages.append({"role": "user", "content": "\n".join(text_parts)})
+            # Regular handling for other message types（与 tool_result 处理同级）
+            elif msg.role == "assistant" and any(
+                hasattr(b, "type") and b.type == "tool_use"
+                for b in content
+            ):
+                # Assistant with tool_use — convert to OpenAI tool_calls format
+                tool_calls = []
+                text_content = ""
+                sigs_for_provider = []  # LiteLLM Gemini 需要消息级别的 thought_signatures
+                for block in content:
+                    if hasattr(block, "type"):
+                        if block.type == "text":
+                            text_content += block.text
+                        elif block.type == "tool_use":
+                            tc = {
+                                "id": block.id,
+                                "type": "function",
+                                "function": {
+                                    "name": block.name,
+                                    "arguments": json.dumps(block.input) if block.input else "{}"
+                                }
+                            }
+                            # 注入签名到 tool_call 本身（备用兼容）
+                            sig = _thought_signatures.get(block.id)
+                            if sig:
+                                tc["function"]["provider_specific_fields"] = {"thought_signature": sig}
+                                sigs_for_provider.append(sig)
+                            tool_calls.append(tc)
+                msg_entry = {"role": "assistant"}
+                if text_content:
+                    msg_entry["content"] = text_content
+                else:
+                    msg_entry["content"] = None
+                if tool_calls:
+                    msg_entry["tool_calls"] = tool_calls
+                # LiteLLM Gemini handler 从消息级别 provider_specific_fields 读取签名
+                if sigs_for_provider:
+                    msg_entry["provider_specific_fields"] = {"thought_signatures": sigs_for_provider}
+                messages.append(msg_entry)
             else:
-                # Regular handling for other message types
                 processed_content = []
                 for block in content:
                     if hasattr(block, "type"):
@@ -584,8 +1003,14 @@ def convert_anthropic_to_litellm(anthropic_request: MessagesRequest) -> Dict[str
                                 {"type": "text", "text": block.text}
                             )
                         elif block.type == "image":
+                            # Convert Anthropic image source → OpenAI image_url format
+                            source = block.source if isinstance(block.source, dict) else {}
+                            if source.get("type") == "base64":
+                                img_url = f"data:{source.get('media_type', 'image/png')};base64,{source.get('data', '')}"
+                            else:
+                                img_url = source.get("url", "")
                             processed_content.append(
-                                {"type": "image", "source": block.source}
+                                {"type": "image_url", "image_url": {"url": img_url}}
                             )
                         elif block.type == "tool_use":
                             # Handle tool use blocks if needed
@@ -597,45 +1022,63 @@ def convert_anthropic_to_litellm(anthropic_request: MessagesRequest) -> Dict[str
                                     "input": block.input,
                                 }
                             )
-                        elif block.type == "tool_result":
-                            # Handle different formats of tool result content
-                            processed_content_block = {
-                                "type": "tool_result",
-                                "tool_use_id": block.tool_use_id
-                                if hasattr(block, "tool_use_id")
-                                else "",
-                            }
+                    elif block.type == "tool_result":
+                        # Handle different formats of tool result content
+                        processed_content_block = {
+                            "type": "tool_result",
+                            "tool_use_id": block.tool_use_id
+                            if hasattr(block, "tool_use_id")
+                            else "",
+                        }
 
-                            # Process the content field properly
-                            if hasattr(block, "content"):
-                                if isinstance(block.content, str):
-                                    # If it's a simple string, create a text block for it
-                                    processed_content_block["content"] = [
-                                        {"type": "text", "text": block.content}
-                                    ]
-                                elif isinstance(block.content, list):
-                                    # If it's already a list of blocks, keep it
-                                    processed_content_block["content"] = block.content
-                                else:
-                                    # Default fallback
-                                    processed_content_block["content"] = [
-                                        {"type": "text", "text": str(block.content)}
-                                    ]
-                            else:
-                                # Default empty content
+                        # Process the content field properly
+                        if hasattr(block, "content"):
+                            if isinstance(block.content, str):
+                                # If it's a simple string, create a text block for it
                                 processed_content_block["content"] = [
-                                    {"type": "text", "text": ""}
+                                    {"type": "text", "text": block.content}
                                 ]
+                            elif isinstance(block.content, list):
+                                # If it's already a list of blocks, keep it
+                                processed_content_block["content"] = block.content
+                            else:
+                                # Default fallback
+                                processed_content_block["content"] = [
+                                    {"type": "text", "text": str(block.content)}
+                                ]
+                        else:
+                            # Default empty content
+                            processed_content_block["content"] = [
+                                {"type": "text", "text": ""}
+                            ]
 
-                            processed_content.append(processed_content_block)
+                        processed_content.append(processed_content_block)
 
                 messages.append({"role": msg.role, "content": processed_content})
 
-    # Cap max_tokens for OpenAI models to their limit of 16384
+    copilot_target_model = ""
+    if PREFERRED_PROVIDER == "copilot":
+        source_model = anthropic_request.original_model or anthropic_request.model
+        copilot_target_model = _copilot_model_name(source_model)
+
+    copilot_thinking_enabled = bool(
+        PREFERRED_PROVIDER == "copilot"
+        and anthropic_request.thinking
+        and anthropic_request.thinking.enabled
+    )
+
+    # Cap max_tokens for OpenAI/Gemini/Copilot models
+    # QClaw 链路不受此限制，会在 _qclaw_provider 中恢复原始值
     max_tokens = anthropic_request.max_tokens
-    if anthropic_request.model.startswith(
-        "openai/"
-    ) or anthropic_request.model.startswith("gemini/"):
+    if PREFERRED_PROVIDER == "copilot":
+        max_tokens = min(max_tokens, 64000)
+        # Copilot + thinking 常见中途截断，给一个保底 completion budget
+        if copilot_thinking_enabled:
+            max_tokens = max(max_tokens, 8192)
+        logger.debug(
+            f"Capping max_tokens to 64000 for Copilot model (original value: {anthropic_request.max_tokens})"
+        )
+    elif anthropic_request.model.startswith("openai/") or anthropic_request.model.startswith("gemini/"):
         max_tokens = min(max_tokens, 16384)
         logger.debug(
             f"Capping max_tokens to 16384 for OpenAI/Gemini model (original value: {anthropic_request.max_tokens})"
@@ -646,13 +1089,20 @@ def convert_anthropic_to_litellm(anthropic_request: MessagesRequest) -> Dict[str
         "model": anthropic_request.model,  # it understands "anthropic/claude-x" format
         "messages": messages,
         "max_completion_tokens": max_tokens,
-        "temperature": anthropic_request.temperature,
+        "_original_max_tokens": anthropic_request.max_tokens,  # 保留原始值供 QClaw 使用
         "stream": anthropic_request.stream,
     }
+    if anthropic_request.temperature is not None:
+        litellm_request["temperature"] = anthropic_request.temperature
 
-    # Only include thinking field for Anthropic models
-    if anthropic_request.thinking and anthropic_request.model.startswith("anthropic/"):
-        litellm_request["thinking"] = anthropic_request.thinking
+    # thinking 参数仅原生 Anthropic 支持，DeepSeek Anthropic 兼容接口不认
+    # 保持为空，让模型自行决定推理深度
+    if copilot_thinking_enabled:
+        # Anthropic thinking -> OpenAI compatible reasoning effort
+        litellm_request["reasoning"] = {"effort": "high"}
+        logger.debug(
+            f"Copilot thinking enabled: translated to reasoning.effort=high target_model={copilot_target_model or 'unknown'}"
+        )
 
     # Add optional parameters if present
     if anthropic_request.stop_sequences:
@@ -661,7 +1111,7 @@ def convert_anthropic_to_litellm(anthropic_request: MessagesRequest) -> Dict[str
     if anthropic_request.top_p:
         litellm_request["top_p"] = anthropic_request.top_p
 
-    if anthropic_request.top_k:
+    if anthropic_request.top_k and PREFERRED_PROVIDER in ("anthropic", "gemini", "gemini-openai"):
         litellm_request["top_k"] = anthropic_request.top_k
 
     # Convert tools to OpenAI format
@@ -673,7 +1123,6 @@ def convert_anthropic_to_litellm(anthropic_request: MessagesRequest) -> Dict[str
             # Convert to dict if it's a pydantic model
             if hasattr(tool, "dict"):
                 tool_dict = tool.dict()
-            else:
                 # Ensure tool_dict is a dictionary, handle potential errors if 'tool' isn't dict-like
                 try:
                     tool_dict = dict(tool) if not isinstance(tool, dict) else tool
@@ -747,8 +1196,13 @@ def convert_litellm_to_anthropic(
         # Handle ModelResponse object from LiteLLM
         if hasattr(litellm_response, "choices") and hasattr(litellm_response, "usage"):
             # Extract data from ModelResponse object directly
-            choices = litellm_response.choices
-            message = choices[0].message if choices and len(choices) > 0 else None
+            choices = litellm_response.choices or []
+            # 防护：Copilot 在 max_tokens 过小时可能返回 choices:[]
+            if not choices:
+                choices = []
+                message = None
+            else:
+                message = choices[0].message if len(choices) > 0 else None
             content_text = (
                 message.content if message and hasattr(message, "content") else ""
             )
@@ -840,10 +1294,50 @@ def convert_litellm_to_anthropic(
                     try:
                         arguments = json.loads(arguments)
                     except json.JSONDecodeError:
-                        logger.warning(
-                            f"Failed to parse tool arguments as JSON: {arguments}"
-                        )
-                        arguments = {"raw": arguments}
+                        fixed_suffix = _close_json_fragment(arguments)
+                        if fixed_suffix:
+                            try:
+                                arguments = json.loads(arguments + fixed_suffix)
+                            except json.JSONDecodeError:
+                                logger.warning(
+                                    f"Failed to parse tool arguments as JSON: {arguments}"
+                                )
+                                arguments = {"raw": arguments}
+                        else:
+                            logger.warning(
+                                f"Failed to parse tool arguments as JSON: {arguments}"
+                            )
+                            arguments = {"raw": arguments}
+
+                # 提取 Gemini thought_signature（兼容两种来源）
+                sig = None
+                # 来源1：OpenAI 兼容端点 extra_content.google.thought_signature
+                if isinstance(tool_call, dict):
+                    extra = tool_call.get("extra_content", {})
+                    if isinstance(extra, dict):
+                        sig = extra.get("google", {}).get("thought_signature")
+                else:
+                    extra = getattr(tool_call, "extra_content", None)
+                    if isinstance(extra, dict):
+                        sig = extra.get("google", {}).get("thought_signature")
+                # 来源2：LiteLLM Gemini handler 的 provider_specific_fields
+                if not sig and function:
+                    if isinstance(function, dict):
+                        psf = function.get("provider_specific_fields", {})
+                    else:
+                        psf = getattr(function, "provider_specific_fields", {})
+                    if isinstance(psf, dict):
+                        sig = psf.get("thought_signature")
+                # 来源3：消息级别的 provider_specific_fields.thought_signatures
+                if not sig and hasattr(message, "provider_specific_fields"):
+                    psf = getattr(message, "provider_specific_fields", {})
+                    if isinstance(psf, dict):
+                        sig_list = psf.get("thought_signatures", [])
+                        if isinstance(sig_list, list) and idx < len(sig_list):
+                            sig = sig_list[idx]
+                if sig:
+                    _thought_signatures[tool_id] = sig
+                    logger.debug(f"💭 Saved thought_signature for tool {tool_id}")
 
                 logger.debug(
                     f"Adding tool_use block: id={tool_id}, name={name}, input={arguments}"
@@ -919,7 +1413,159 @@ def convert_litellm_to_anthropic(
         )
 
 
-async def handle_streaming(response_generator, original_request: MessagesRequest):
+# ══════════════════════════════════════════════════════════════════════════════
+# OpenAI 兼容端点：/v1/chat/completions  → 统一走 LiteLLM
+# ══════════════════════════════════════════════════════════════════════════════
+
+async def _litellm_oai_stream(response_generator):
+    """把 LiteLLM 流式输出转成 OpenAI SSE 格式（bytes）"""
+    async for chunk in response_generator:
+        try:
+            yield f"data: {json.dumps(chunk.model_dump())}\n\n".encode()
+        except Exception:
+            pass
+    yield b"data: [DONE]\n\n"
+
+
+@app.post("/v1/chat/completions")
+async def openai_chat_completions(raw_request: Request):
+    """OpenAI 兼容端点
+
+    qclaw 模式：直接透传请求体给 QClaw 网关，不做模型映射和协议转换。
+    其他 provider：走 LiteLLM 统一处理。
+    """
+    request_id = _request_id_from_headers(raw_request)
+    req_model = "unknown"
+    mapped_model = "unknown"
+    body = {}
+    try:
+        body = await raw_request.json()
+        default_model = COPILOT_MEDIUM_MODEL if PREFERRED_PROVIDER == "copilot" else MEDIUM_MODEL
+        req_model = body.get("model", default_model)
+        is_stream = body.get("stream", False)
+
+        # ── qclaw 模式：直接透传，不走 litellm ──
+        if PREFERRED_PROVIDER == "qclaw":
+            # 去掉 qclaw/ 前缀（如果有），直接用原始模型名
+            passthrough_model = req_model
+            if passthrough_model.startswith("qclaw/"):
+                passthrough_model = passthrough_model[len("qclaw/"):]
+            body["model"] = passthrough_model
+
+            # QClaw 网关要求必须有 system message
+            msgs = body.get("messages", [])
+            if not any(m.get("role") == "system" for m in msgs):
+                msgs.insert(0, {"role": "system", "content": "You are Claude, a helpful AI assistant."})
+                body["messages"] = msgs
+
+            log_request_beautifully(
+                "POST", "/v1/chat/completions", req_model, passthrough_model,
+                len(body.get("messages", [])), len(body.get("tools") or []), 200
+            )
+
+            headers = {
+                "Content-Type": "application/json",
+                "Authorization": "Bearer __QCLAW_AUTH_GATEWAY_MANAGED__",
+                "User-Agent": "OpenAI/JS 6.39.1",
+                "x-agent-id": "main",
+            }
+            url = f"{QCLAW_BASE_URL}/chat/completions"
+
+            if is_stream:
+                async def qclaw_stream():
+                    client = await get_http_client()
+                    last_err = None
+                    for attempt in range(3):
+                        try:
+                            async with client.stream("POST", url, json=body, headers=headers) as resp:
+                                if resp.status_code >= 500:
+                                    # 网关 5xx，重试
+                                    await resp.aread()
+                                    last_err = f"gateway {resp.status_code}"
+                                    continue
+                                async for chunk in resp.aiter_bytes():
+                                    yield chunk
+                                return
+                            break
+                        except (httpx.ConnectError, httpx.ReadError, httpx.RemoteProtocolError) as e:
+                            last_err = str(e)
+                            continue
+                    # 所有重试失败
+                    yield json.dumps({"error": {"type": "proxy_error", "message": f"qclaw gateway unavailable after retries: {last_err}"}}).encode()
+                return StreamingResponse(qclaw_stream(), media_type="text/event-stream")
+            else:
+                client = await get_http_client()
+                last_err = None
+                for attempt in range(3):
+                    try:
+                        resp = await client.post(url, json=body, headers=headers)
+                        if resp.status_code >= 500 and attempt < 2:
+                            last_err = f"gateway {resp.status_code}"
+                            continue
+                        return JSONResponse(content=resp.json(), status_code=resp.status_code)
+                    except (httpx.ConnectError, httpx.ReadError, httpx.RemoteProtocolError) as e:
+                        last_err = str(e)
+                        continue
+                return JSONResponse(
+                    content={"error": {"type": "proxy_error", "message": f"qclaw gateway unavailable after retries: {last_err}"}},
+                    status_code=502,
+                )
+
+        # ── 其他 provider：走 LiteLLM ──
+        mapped_model = _map_model_name(req_model)
+        litellm_req = dict(body)
+        litellm_req["model"] = mapped_model
+
+        # 应用 provider 策略（注入 api_key / api_base / extra_headers 等）
+        class _R:
+            model = req_model
+        strategy = _PROVIDER_STRATEGIES.get(PREFERRED_PROVIDER, _default_provider)
+        strategy(_R(), litellm_req, req_model)
+
+        log_request_beautifully(
+            "POST", "/v1/chat/completions", req_model, litellm_req["model"],
+            len(litellm_req.get("messages", [])), len(litellm_req.get("tools") or []), 200
+        )
+
+        if is_stream:
+            litellm_req["stream"] = True
+            response_generator = await litellm.acompletion(**litellm_req)
+            return StreamingResponse(_litellm_oai_stream(response_generator),
+                                     media_type="text/event-stream")
+        else:
+            litellm_req.pop("stream", None)
+            resp = await litellm.acompletion(**litellm_req)
+            return JSONResponse(content=resp.model_dump())
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        _log_exception(
+            "openai_chat_completions_failed",
+            e,
+            {
+                "request_id": request_id,
+                "path": str(raw_request.url.path),
+                "request_model": req_model,
+                "mapped_model": mapped_model,
+                "stream": body.get("stream"),
+                "message_count": len(body.get("messages") or []),
+                "tool_count": len(body.get("tools") or []),
+                "has_reasoning": bool(body.get("reasoning")),
+                "has_thinking": bool(body.get("thinking")),
+                "max_tokens": body.get("max_tokens"),
+                "max_completion_tokens": body.get("max_completion_tokens"),
+            },
+        )
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+async def handle_streaming(
+    response_generator,
+    original_request: MessagesRequest,
+    original_model_name: str = "",
+    request_id: str = "",
+):
     """Handle streaming responses from LiteLLM and convert to Anthropic format."""
     try:
         # Send message_start event
@@ -931,7 +1577,7 @@ async def handle_streaming(response_generator, original_request: MessagesRequest
                 "id": message_id,
                 "type": "message",
                 "role": "assistant",
-                "model": original_request.model,
+                "model": original_model_name or original_request.original_model or original_request.model,
                 "content": [],
                 "stop_reason": None,
                 "stop_sequence": None,
@@ -961,6 +1607,8 @@ async def handle_streaming(response_generator, original_request: MessagesRequest
         output_tokens = 0
         has_sent_stop_reason = False
         last_tool_index = 0
+        openai_to_anthropic_tool_index: Dict[int, int] = {}
+        tool_json_buffers: Dict[int, str] = {}
 
         # Process each chunk
         async for chunk in response_generator:
@@ -986,20 +1634,36 @@ async def handle_streaming(response_generator, original_request: MessagesRequest
                     # Check for finish_reason to know when we're done
                     finish_reason = getattr(choice, "finish_reason", None)
 
+                    # Process reasoning content first (avoid Agent context loss)
+                    reasoning_text = None
+                    if hasattr(delta, "model_extra") and isinstance(delta.model_extra, dict):
+                        reasoning_text = (
+                            delta.model_extra.get("reasoning_content")
+                            or delta.model_extra.get("reasoning_text")
+                        )
+                    if reasoning_text is None:
+                        reasoning_text = getattr(delta, "reasoning_content", None)
+                    if reasoning_text is None:
+                        reasoning_text = getattr(delta, "reasoning_text", None)
+                    if isinstance(delta, dict) and reasoning_text is None:
+                        reasoning_text = delta.get("reasoning_content") or delta.get(
+                            "reasoning_text"
+                        )
+                    if reasoning_text and tool_index is None and not text_block_closed:
+                        wrapped_reasoning = f"<thinking>{reasoning_text}</thinking>"
+                        accumulated_text += wrapped_reasoning
+                        text_sent = True
+                        yield f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta', 'index': 0, 'delta': {'type': 'text_delta', 'text': wrapped_reasoning}})}\n\n"
+
                     # Process text content
                     delta_content = None
-
-                    # Handle different formats of delta content
                     if hasattr(delta, "content"):
                         delta_content = delta.content
                     elif isinstance(delta, dict) and "content" in delta:
                         delta_content = delta["content"]
 
-                    # Accumulate text content
                     if delta_content is not None and delta_content != "":
                         accumulated_text += delta_content
-
-                        # Always emit text deltas if no tool calls started
                         if tool_index is None and not text_block_closed:
                             text_sent = True
                             yield f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta', 'index': 0, 'delta': {'type': 'text_delta', 'text': delta_content}})}\n\n"
@@ -1054,11 +1718,13 @@ async def handle_streaming(response_generator, original_request: MessagesRequest
                                 current_index = 0
 
                             # Check if this is a new tool or a continuation
-                            if tool_index is None or current_index != tool_index:
-                                # New tool call - create a new tool_use block
+                            if current_index not in openai_to_anthropic_tool_index:
                                 tool_index = current_index
                                 last_tool_index += 1
-                                anthropic_tool_index = last_tool_index
+                                openai_to_anthropic_tool_index[current_index] = (
+                                    last_tool_index
+                                )
+                                tool_json_buffers[last_tool_index] = ""
 
                                 # Extract function info
                                 if isinstance(tool_call, dict):
@@ -1084,10 +1750,16 @@ async def handle_streaming(response_generator, original_request: MessagesRequest
                                         f"toolu_{uuid.uuid4().hex[:24]}",
                                     )
 
-                                # Start a new tool_use block
+                                anthropic_tool_index = openai_to_anthropic_tool_index[
+                                    current_index
+                                ]
                                 yield f"event: content_block_start\ndata: {json.dumps({'type': 'content_block_start', 'index': anthropic_tool_index, 'content_block': {'type': 'tool_use', 'id': tool_id, 'name': name, 'input': {}}})}\n\n"
                                 current_tool_call = tool_call
                                 tool_content = ""
+                            else:
+                                anthropic_tool_index = openai_to_anthropic_tool_index[
+                                    current_index
+                                ]
 
                             # Extract function arguments
                             arguments = None
@@ -1125,6 +1797,11 @@ async def handle_streaming(response_generator, original_request: MessagesRequest
                                 tool_content += (
                                     args_json if isinstance(args_json, str) else ""
                                 )
+                                if isinstance(args_json, str):
+                                    tool_json_buffers[anthropic_tool_index] = (
+                                        tool_json_buffers.get(anthropic_tool_index, "")
+                                        + args_json
+                                    )
 
                                 # Send the update
                                 yield f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta', 'index': anthropic_tool_index, 'delta': {'type': 'input_json_delta', 'partial_json': args_json}})}\n\n"
@@ -1136,6 +1813,11 @@ async def handle_streaming(response_generator, original_request: MessagesRequest
                         # Close any open tool call blocks
                         if tool_index is not None:
                             for i in range(1, last_tool_index + 1):
+                                fix_suffix = _close_json_fragment(
+                                    tool_json_buffers.get(i, "")
+                                )
+                                if fix_suffix:
+                                    yield f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta', 'index': i, 'delta': {'type': 'input_json_delta', 'partial_json': fix_suffix}})}\n\n"
                                 yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': i})}\n\n"
 
                         # If we accumulated text but never sent or closed text block, do it now
@@ -1168,7 +1850,18 @@ async def handle_streaming(response_generator, original_request: MessagesRequest
                         return
             except Exception as e:
                 # Log error but continue processing other chunks
-                logger.error(f"Error processing chunk: {str(e)}")
+                _log_exception(
+                    "anthropic_stream_chunk_failed",
+                    e,
+                    {
+                        "request_id": request_id or "unknown",
+                        "model": original_model_name
+                        or original_request.original_model
+                        or original_request.model,
+                        "stream_phase": "chunk_processing",
+                        "has_tool_calls": tool_index is not None,
+                    },
+                )
                 continue
 
         # If we didn't get a finish reason, close any open blocks
@@ -1176,6 +1869,9 @@ async def handle_streaming(response_generator, original_request: MessagesRequest
             # Close any open tool call blocks
             if tool_index is not None:
                 for i in range(1, last_tool_index + 1):
+                    fix_suffix = _close_json_fragment(tool_json_buffers.get(i, ""))
+                    if fix_suffix:
+                        yield f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta', 'index': i, 'delta': {'type': 'input_json_delta', 'partial_json': fix_suffix}})}\n\n"
                     yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': i})}\n\n"
 
             # Close the text content block
@@ -1193,13 +1889,18 @@ async def handle_streaming(response_generator, original_request: MessagesRequest
             yield "data: [DONE]\n\n"
 
     except Exception as e:
-        import traceback
-
-        error_traceback = traceback.format_exc()
-        error_message = (
-            f"Error in streaming: {str(e)}\n\nFull traceback:\n{error_traceback}"
+        _log_exception(
+            "anthropic_stream_failed",
+            e,
+            {
+                "request_id": request_id or "unknown",
+                "model": original_model_name
+                or original_request.original_model
+                or original_request.model,
+                "stream_phase": "outer_handler",
+                "output_tokens": output_tokens if "output_tokens" in locals() else 0,
+            },
         )
-        logger.error(error_message)
 
         # Send error message_delta
         yield f"event: message_delta\ndata: {json.dumps({'type': 'message_delta', 'delta': {'stop_reason': 'error', 'stop_sequence': None}, 'usage': {'output_tokens': 0}})}\n\n"
@@ -1211,8 +1912,63 @@ async def handle_streaming(response_generator, original_request: MessagesRequest
         yield "data: [DONE]\n\n"
 
 
+async def handle_qclaw_streaming(qclaw_response, display_model: str):
+    """QClaw OpenAI SSE 流 → Anthropic SSE 流 格式转换"""
+    import uuid as _uuid
+    msg_id = f"msg_{_uuid.uuid4().hex[:24]}"
+
+    # message_start — 使用原始模型名让 Claude Code 识别
+    yield f"event: message_start\ndata: {json.dumps({'type': 'message_start', 'message': {'id': msg_id, 'type': 'message', 'role': 'assistant', 'model': display_model, 'content': [], 'stop_reason': None, 'stop_sequence': None, 'usage': {'input_tokens': 0, 'cache_creation_input_tokens': 0, 'cache_read_input_tokens': 0, 'output_tokens': 0}}})}\n\n".encode()
+
+    # content_block_start (text)
+    yield f"event: content_block_start\ndata: {json.dumps({'type': 'content_block_start', 'index': 0, 'content_block': {'type': 'text', 'text': ''}})}\n\n".encode()
+
+    accumulated = ""
+    buffer = b""
+    async for chunk in qclaw_response.aiter_bytes():
+        buffer += chunk
+        while b"\n" in buffer:
+            line, buffer = buffer.split(b"\n", 1)
+            line = line.strip()
+            if not line:
+                continue
+            decoded = line.decode("utf-8", errors="replace")
+            if decoded.startswith("data: [DONE]"):
+                break
+            if not decoded.startswith("data: "):
+                continue
+            try:
+                data = json.loads(decoded[6:])
+                delta = data.get("choices", [{}])[0].get("delta", {})
+                content = delta.get("content", "")
+                finish = data.get("choices", [{}])[0].get("finish_reason")
+
+                if content:
+                    accumulated += content
+                    yield f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta', 'index': 0, 'delta': {'type': 'text_delta', 'text': content}})}\n\n".encode()
+
+                if finish:
+                    break
+            except:
+                continue
+
+    # content_block_stop
+    yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': 0})}\n\n".encode()
+
+    # message_delta
+    stop_reason = "end_turn"
+    usage = {"output_tokens": len(accumulated.split())}
+    yield f"event: message_delta\ndata: {json.dumps({'type': 'message_delta', 'delta': {'stop_reason': stop_reason, 'stop_sequence': None}, 'usage': usage})}\n\n".encode()
+
+    # message_stop
+    yield f"event: message_stop\ndata: {json.dumps({'type': 'message_stop'})}\n\n".encode()
+
+
 @app.post("/v1/messages")
 async def create_message(request: MessagesRequest, raw_request: Request):
+    request_id = _request_id_from_headers(raw_request)
+    original_model = request.model if hasattr(request, "model") else "unknown"
+    litellm_request = {}
     try:
         # print the body here
         body = await raw_request.body()
@@ -1233,38 +1989,21 @@ async def create_message(request: MessagesRequest, raw_request: Request):
         elif clean_model.startswith("openai/"):
             clean_model = clean_model[len("openai/") :]
 
+        # Dump 上游原始请求关键字段，方便排查
+        upstream_thinking = body_json.get("thinking", {})
+        upstream_max_tokens = body_json.get("max_tokens", "N/A")
         logger.debug(
-            f"📊 PROCESSING REQUEST: Model={request.model}, Stream={request.stream}"
+            f"📊 UPSTREAM REQUEST: model={original_model} stream={body_json.get('stream')} max_tokens={upstream_max_tokens} thinking={upstream_thinking}"
         )
 
         # Convert Anthropic request to LiteLLM format
         litellm_request = convert_anthropic_to_litellm(request)
 
-        # Determine which API key to use based on the model
-        if request.model.startswith("openai/"):
-            litellm_request["api_key"] = OPENAI_API_KEY
-            # Use custom OpenAI base URL if configured
-            if OPENAI_BASE_URL:
-                litellm_request["api_base"] = OPENAI_BASE_URL
-                logger.debug(
-                    f"Using OpenAI API key and custom base URL {OPENAI_BASE_URL} for model: {request.model}"
-                )
-            else:
-                logger.debug(f"Using OpenAI API key for model: {request.model}")
-        elif request.model.startswith("gemini/"):
-            if USE_VERTEX_AUTH:
-                litellm_request["vertex_project"] = VERTEX_PROJECT
-                litellm_request["vertex_location"] = VERTEX_LOCATION
-                litellm_request["custom_llm_provider"] = "vertex_ai"
-                logger.debug(
-                    f"Using Gemini ADC with project={VERTEX_PROJECT}, location={VERTEX_LOCATION} and model: {request.model}"
-                )
-            else:
-                litellm_request["api_key"] = GEMINI_API_KEY
-                logger.debug(f"Using Gemini API key for model: {request.model}")
-        else:
-            litellm_request["api_key"] = ANTHROPIC_API_KEY
-            logger.debug(f"Using Anthropic API key for model: {request.model}")
+        # Apply provider strategy（各策略自行设置 api_key/api_base/headers）
+        provider_strategy = _PROVIDER_STRATEGIES.get(PREFERRED_PROVIDER, _default_provider)
+        result = provider_strategy(request, litellm_request, original_model)
+        if result is not None:
+            return result
 
         # For OpenAI models - modify request format to work with limitations
         if "openai" in litellm_request["model"] and "messages" in litellm_request:
@@ -1478,7 +2217,7 @@ async def create_message(request: MessagesRequest, raw_request: Request):
             response_generator = await litellm.acompletion(**litellm_request)
 
             return StreamingResponse(
-                handle_streaming(response_generator, request),
+                handle_streaming(response_generator, request, original_model, request_id),
                 media_type="text/event-stream",
             )
         else:
@@ -1503,64 +2242,35 @@ async def create_message(request: MessagesRequest, raw_request: Request):
             # Convert LiteLLM response to Anthropic format
             anthropic_response = convert_litellm_to_anthropic(litellm_response, request)
 
+            # 还原 Claude Code 原始模型名
+            if original_model and hasattr(anthropic_response, "model"):
+                anthropic_response.model = original_model
+
             return anthropic_response
 
     except Exception as e:
-        import traceback
-
-        error_traceback = traceback.format_exc()
-
-        # Capture as much info as possible about the error
-        error_details = {
-            "error": str(e),
-            "type": type(e).__name__,
-            "traceback": error_traceback,
-        }
-
-        # Check for LiteLLM-specific attributes
-        for attr in ["message", "status_code", "response", "llm_provider", "model"]:
-            if hasattr(e, attr):
-                error_details[attr] = getattr(e, attr)
-
-        # Check for additional exception details in dictionaries
-        if hasattr(e, "__dict__"):
-            for key, value in e.__dict__.items():
-                if key not in error_details and key not in ["args", "__traceback__"]:
-                    error_details[key] = str(value)
-
-        # Helper function to safely serialize objects for JSON
-        def sanitize_for_json(obj):
-            """递归地清理对象使其可以JSON序列化"""
-            if isinstance(obj, dict):
-                return {k: sanitize_for_json(v) for k, v in obj.items()}
-            elif isinstance(obj, list):
-                return [sanitize_for_json(item) for item in obj]
-            elif hasattr(obj, "__dict__"):
-                return sanitize_for_json(obj.__dict__)
-            elif hasattr(obj, "text"):
-                return str(obj.text)
-            else:
-                try:
-                    json.dumps(obj)
-                    return obj
-                except (TypeError, ValueError):
-                    return str(obj)
-
-        # Log all error details with safe serialization
-        sanitized_details = sanitize_for_json(error_details)
-        logger.error(
-            f"Error processing request: {json.dumps(sanitized_details, indent=2)}"
+        _log_exception(
+            "anthropic_messages_failed",
+            e,
+            {
+                "request_id": request_id,
+                "path": str(raw_request.url.path),
+                "original_model": original_model,
+                "mapped_model": litellm_request.get("model"),
+                "stream": bool(getattr(request, "stream", False)),
+                "message_count": len(getattr(request, "messages", []) or []),
+                "tool_count": len(getattr(request, "tools", []) or []),
+                "has_thinking": bool(getattr(request, "thinking", None)),
+                "max_tokens": getattr(request, "max_tokens", None),
+                "max_completion_tokens": litellm_request.get("max_completion_tokens"),
+            },
         )
 
         # Format error for response
         error_message = f"Error: {str(e)}"
-        if "message" in error_details and error_details["message"]:
-            error_message += f"\nMessage: {error_details['message']}"
-        if "response" in error_details and error_details["response"]:
-            error_message += f"\nResponse: {error_details['response']}"
 
         # Return detailed error
-        status_code = error_details.get("status_code", 500)
+        status_code = getattr(e, "status_code", 500)
         raise HTTPException(status_code=status_code, detail=error_message)
 
 
@@ -1642,9 +2352,63 @@ async def count_tokens(request: TokenCountRequest, raw_request: Request):
         raise HTTPException(status_code=500, detail=f"Error counting tokens: {str(e)}")
 
 
+@app.get("/v1/models")
+async def list_models():
+    """返回模型列表，Claude Code 需要这个端点来初始化"""
+    return {
+        "data": [
+            {
+                "id": "claude-sonnet-4-20250514",
+                "object": "model",
+                "created": 1700000000,
+                "owned_by": "anthropic",
+                "type": "model",
+            },
+            {
+                "id": "claude-haiku-4-20250514",
+                "object": "model",
+                "created": 1700000000,
+                "owned_by": "anthropic",
+                "type": "model",
+            },
+            {
+                "id": "claude-opus-4-20250514",
+                "object": "model",
+                "created": 1700000000,
+                "owned_by": "anthropic",
+                "type": "model",
+            },
+        ],
+        "object": "list",
+        "has_more": False,
+    }
+
+
 @app.get("/")
 async def root():
     return {"message": "Anthropic Proxy for LiteLLM"}
+
+
+# Catch-all route to handle OAuth and other unexpected endpoints
+# Note: FastAPI will NOT match "/" to this because root is defined above as exact match
+@app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS", "HEAD"])
+async def catch_all(request: Request, path: str):
+    """Catch-all for any unhandled endpoints (OAuth, health checks, etc.)"""
+    # Skip root path — handled by root() above
+    if path == "" or path == "/":
+        return {"message": "Anthropic Proxy for LiteLLM"}
+    body = None
+    try:
+        body = await request.body()
+        if body:
+            body = body.decode("utf-8", errors="replace")[:500]
+    except:
+        pass
+    logger.warning(f"⚠️ UNHANDLED: {request.method} /{path} body={body}")
+    return JSONResponse(
+        content={"error": f"Endpoint /{path} not implemented by this proxy"},
+        status_code=404,
+    )
 
 
 # Define ANSI color codes for terminal output
@@ -1704,8 +2468,26 @@ if __name__ == "__main__":
     import sys
 
     if len(sys.argv) > 1 and sys.argv[1] == "--help":
-        print("Run with: uvicorn server:app --reload --host 0.0.0.0 --port 8082")
+        print("Run with: python server.py [--port 8082]")
+        print("")
+        print("Set PREFERRED_PROVIDER environment variable to choose backend:")
+        print("  openai       OpenAI compatible API (default)")
+        print("  anthropic    Anthropic Claude API")
+        print("  google       Google Gemini API")
+        print("  qclaw        QClaw local proxy (http://127.0.0.1:19000/proxy/llm)")
+        print("")
+        print("Example: PREFERRED_PROVIDER=qclaw python server.py")
         sys.exit(0)
 
+    port = 8082
+    if "--port" in sys.argv:
+        idx = sys.argv.index("--port")
+        if idx + 1 < len(sys.argv):
+            port = int(sys.argv[idx + 1])
+    if "-p" in sys.argv:
+        idx = sys.argv.index("-p")
+        if idx + 1 < len(sys.argv):
+            port = int(sys.argv[idx + 1])
+
     # Configure uvicorn to run with minimal logs
-    uvicorn.run(app, host="0.0.0.0", port=8082, log_level="error")
+    uvicorn.run(app, host="0.0.0.0", port=port, log_level="error")
