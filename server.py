@@ -3,7 +3,7 @@ import uvicorn
 import logging
 from logging.handlers import TimedRotatingFileHandler
 import json
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 from typing import List, Dict, Any, Optional, Union, Literal
 import httpx
 import os
@@ -157,6 +157,26 @@ async def lifespan(app):
         _http_client = None
 
 app = FastAPI(lifespan=lifespan)
+
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse
+
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request: Request, exc: RequestValidationError):
+    body = await request.body() if request.method == "POST" else b""
+    try:
+        body_json = json.loads(body.decode("utf-8")) if body else {}
+    except Exception:
+        body_json = {"raw": body.decode("utf-8", errors="replace")[:2000]}
+    logger.error(
+        f"❌ VALIDATION ERROR: {exc.errors()}\n"
+        f"📋 PATH: {request.url.path}\n"
+        f"📋 MODEL: {body_json.get('model', 'N/A')}\n"
+        f"📋 THINKING: {body_json.get('thinking', 'N/A')}\n"
+        f"📋 KEYS: {list(body_json.keys())}\n"
+        f"📋 BODY PREVIEW: {json.dumps(body_json, ensure_ascii=False)[:2000]}"
+    )
+    return JSONResponse(status_code=422, content={"detail": exc.errors(), "body": body_json})
 
 # Get API keys from environment
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
@@ -441,8 +461,10 @@ class ContentBlockText(BaseModel):
 
 
 class ContentBlockThinking(BaseModel):
+    model_config = {"extra": "allow"}
     type: Literal["thinking"]
     thinking: str
+    signature: Optional[str] = None
 
 
 class ContentBlockImage(BaseModel):
@@ -475,6 +497,7 @@ class Message(BaseModel):
         List[
             Union[
                 ContentBlockText,
+                ContentBlockThinking,
                 ContentBlockImage,
                 ContentBlockToolUse,
                 ContentBlockToolResult,
@@ -490,7 +513,22 @@ class Tool(BaseModel):
 
 
 class ThinkingConfig(BaseModel):
+    model_config = {"extra": "allow"}
     enabled: bool = True
+    type: Optional[str] = None
+    budget_tokens: Optional[int] = None
+
+    @model_validator(mode="after")
+    def normalize_thinking_config(cls, m):
+        # 客户端可能发 {"type": "adaptive"} 或 {"type": "enabled", "budget_tokens": N}
+        # 统一转成 enabled bool
+        if m.type == "adaptive":
+            m.enabled = True
+        elif m.type == "enabled":
+            m.enabled = True
+        elif m.type == "disabled":
+            m.enabled = False
+        return m
 
 
 class MessagesRequest(BaseModel):
