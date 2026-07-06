@@ -1259,9 +1259,32 @@ def convert_litellm_to_anthropic(
         # Create content list for Anthropic format
         content = []
 
+        # ── 处理 reasoning_content（DeepSeek 等模型的思考过程）──
+        # DeepSeek 返回的 reasoning_content 是独立字段，需要转为 Anthropic 的 thinking block
+        reasoning_text = None
+        if hasattr(message, "model_extra") and isinstance(message.model_extra, dict):
+            reasoning_text = message.model_extra.get("reasoning_content") or message.model_extra.get("reasoning_text")
+        if reasoning_text is None:
+            reasoning_text = getattr(message, "reasoning_content", None) or getattr(message, "reasoning_text", None)
+        if reasoning_text is None and isinstance(message, dict):
+            reasoning_text = message.get("reasoning_content") or message.get("reasoning_text")
+
+        # 如果请求开启了 thinking，将 reasoning_content 放入 thinking block
+        upstream_thinking = getattr(original_request, "thinking", None)
+        if reasoning_text and upstream_thinking and getattr(upstream_thinking, "enabled", False):
+            content.append({"type": "thinking", "thinking": reasoning_text})
+        elif reasoning_text:
+            # 请求未开启 thinking，但也不要丢弃——作为文本保留
+            content.append({"type": "text", "text": f"<thinking>{reasoning_text}</thinking>"})
+
         # Add text content block if present (text might be None or empty for pure tool call responses)
+        # 过滤掉已经被 reasoning 处理的重复内容
         if content_text is not None and content_text != "":
-            content.append({"type": "text", "text": content_text})
+            # 如果 text 内容和 reasoning 完全相同（有些模型会重复），跳过
+            if reasoning_text and content_text.strip() == reasoning_text.strip():
+                pass
+            else:
+                content.append({"type": "text", "text": content_text})
 
         # Add tool calls if present (tool_use in Anthropic format)
         # For ALL models, not just Claude models - convert tool_calls to tool_use blocks
@@ -1625,8 +1648,19 @@ async def handle_streaming(
         }
         yield f"event: message_start\ndata: {json.dumps(message_data)}\n\n"
 
-        # Content block index for the first text block
-        yield f"event: content_block_start\ndata: {json.dumps({'type': 'content_block_start', 'index': 0, 'content_block': {'type': 'text', 'text': ''}})}\n\n"
+        # 根据请求是否开启 thinking 决定初始 content block 类型
+        upstream_thinking = getattr(original_request, "thinking", None)
+        thinking_enabled = upstream_thinking and getattr(upstream_thinking, "enabled", False)
+        if thinking_enabled:
+            # 先开 thinking block (index 0)
+            yield f"event: content_block_start\ndata: {json.dumps({'type': 'content_block_start', 'index': 0, 'content_block': {'type': 'thinking', 'thinking': ''}})}\n\n"
+            thinking_block_started = True
+            thinking_block_closed = False
+        else:
+            # 先开 text block (index 0)
+            yield f"event: content_block_start\ndata: {json.dumps({'type': 'content_block_start', 'index': 0, 'content_block': {'type': 'text', 'text': ''}})}\n\n"
+            thinking_block_started = False
+            thinking_block_closed = True  # 没开 thinking block，标记为已关闭
 
         # Send a ping to keep the connection alive (Anthropic does this)
         yield f"event: ping\ndata: {json.dumps({'type': 'ping'})}\n\n"
@@ -1637,6 +1671,10 @@ async def handle_streaming(
         accumulated_text = ""  # Track accumulated text content
         text_sent = False  # Track if we've sent any text content
         text_block_closed = False  # Track if text block is closed
+        thinking_block_started = False  # Track if thinking content block has been started
+        thinking_block_closed = True  # Track if thinking block is closed (default True when no thinking)
+        accumulated_reasoning = ""  # Track accumulated reasoning content
+        text_block_index = 0  # Track current text block index (0 if no thinking, 1 if after thinking)
         input_tokens = 0
         output_tokens = 0
         has_sent_stop_reason = False
@@ -1683,11 +1721,20 @@ async def handle_streaming(
                         reasoning_text = delta.get("reasoning_content") or delta.get(
                             "reasoning_text"
                         )
-                    if reasoning_text and tool_index is None and not text_block_closed:
-                        wrapped_reasoning = f"<thinking>{reasoning_text}</thinking>"
-                        accumulated_text += wrapped_reasoning
-                        text_sent = True
-                        yield f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta', 'index': 0, 'delta': {'type': 'text_delta', 'text': wrapped_reasoning}})}\n\n"
+                    if reasoning_text and tool_index is None:
+                        # 检查请求是否开启了 thinking
+                        if thinking_enabled:
+                            # thinking block 已在外面初始化，直接发 delta
+                            if not thinking_block_closed:
+                                yield f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta', 'index': 0, 'delta': {'type': 'thinking_delta', 'thinking': reasoning_text}})}\n\n"
+                                accumulated_reasoning += reasoning_text
+                        else:
+                            # 请求未开启 thinking，作为 text 保留但加上标签
+                            wrapped_reasoning = f"<thinking>{reasoning_text}</thinking>"
+                            accumulated_text += wrapped_reasoning
+                            if not text_block_closed:
+                                text_sent = True
+                                yield f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta', 'index': text_block_index, 'delta': {'type': 'text_delta', 'text': wrapped_reasoning}})}\n\n"
 
                     # Process text content
                     delta_content = None
@@ -1698,9 +1745,24 @@ async def handle_streaming(
 
                     if delta_content is not None and delta_content != "":
                         accumulated_text += delta_content
-                        if tool_index is None and not text_block_closed:
+                        if tool_index is None:
+                            if thinking_enabled and not thinking_block_closed:
+                                # thinking block 还开着，先关闭它再开 text block
+                                yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': 0})}\n\n"
+                                thinking_block_closed = True
+                                text_block_index = 1
+                                yield f"event: content_block_start\ndata: {json.dumps({'type': 'content_block_start', 'index': 1, 'content_block': {'type': 'text', 'text': ''}})}\n\n"
+                            elif thinking_enabled and thinking_block_closed:
+                                # thinking block 已关闭，确保 text block index = 1 且已开
+                                if text_block_index == 0:
+                                    text_block_index = 1
+                                    yield f"event: content_block_start\ndata: {json.dumps({'type': 'content_block_start', 'index': 1, 'content_block': {'type': 'text', 'text': ''}})}\n\n"
+                            else:
+                                # 没开启 thinking，用 index 0 的 text block（已在外面初始化）
+                                text_block_index = 0
+                            
                             text_sent = True
-                            yield f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta', 'index': 0, 'delta': {'type': 'text_delta', 'text': delta_content}})}\n\n"
+                            yield f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta', 'index': text_block_index, 'delta': {'type': 'text_delta', 'text': delta_content}})}\n\n"
 
                     # Process tool calls
                     delta_tool_calls = None
@@ -1909,7 +1971,15 @@ async def handle_streaming(
                     yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': i})}\n\n"
 
             # Close the text content block
-            yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': 0})}\n\n"
+            # 如果 thinking 开启，先关 thinking block (index 0)，再关 text block (text_block_index)
+            if thinking_enabled:
+                if not thinking_block_closed:
+                    yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': 0})}\n\n"
+                    thinking_block_closed = True
+                # 关闭 text block
+                yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': text_block_index})}\n\n"
+            else:
+                yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': 0})}\n\n"
 
             # Send final message_delta with usage
             usage = {"output_tokens": output_tokens}
