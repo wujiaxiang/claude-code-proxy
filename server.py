@@ -440,6 +440,11 @@ class ContentBlockText(BaseModel):
     text: str
 
 
+class ContentBlockThinking(BaseModel):
+    type: Literal["thinking"]
+    thinking: str
+
+
 class ContentBlockImage(BaseModel):
     type: Literal["image"]
     source: Dict[str, Any]
@@ -705,7 +710,7 @@ class MessagesResponse(BaseModel):
     id: str
     model: str
     role: Literal["assistant"] = "assistant"
-    content: List[Union[ContentBlockText, ContentBlockToolUse]]
+    content: List[Union[ContentBlockText, ContentBlockToolUse, ContentBlockThinking]]
     type: Literal["message"] = "message"
     stop_reason: Optional[
         Literal["end_turn", "max_tokens", "stop_sequence", "tool_use"]
@@ -1672,7 +1677,6 @@ async def handle_streaming(
         text_sent = False  # Track if we've sent any text content
         text_block_closed = False  # Track if text block is closed
         thinking_block_started = False  # Track if thinking content block has been started
-        thinking_block_closed = True  # Track if thinking block is closed (default True when no thinking)
         accumulated_reasoning = ""  # Track accumulated reasoning content
         text_block_index = 0  # Track current text block index (0 if no thinking, 1 if after thinking)
         input_tokens = 0
@@ -1920,9 +1924,14 @@ async def handle_streaming(
                         if not text_block_closed:
                             if accumulated_text and not text_sent:
                                 # Send the accumulated text
-                                yield f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta', 'index': 0, 'delta': {'type': 'text_delta', 'text': accumulated_text}})}\n\n"
+                                yield f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta', 'index': text_block_index, 'delta': {'type': 'text_delta', 'text': accumulated_text}})}\n\n"
                             # Close the text block
+                            yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': text_block_index})}\n\n"
+
+                        # 如果 thinking block 还没关闭，关闭它
+                        if thinking_enabled and not thinking_block_closed:
                             yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': 0})}\n\n"
+                            thinking_block_closed = True
 
                         # Map OpenAI finish_reason to Anthropic stop_reason
                         stop_reason = "end_turn"
