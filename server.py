@@ -1423,8 +1423,35 @@ def convert_litellm_to_anthropic(
             prompt_tokens = usage_info.get("prompt_tokens", 0)
             completion_tokens = usage_info.get("completion_tokens", 0)
         else:
-            prompt_tokens = getattr(usage_info, "prompt_tokens", 0)
-            completion_tokens = getattr(usage_info, "completion_tokens", 0)
+            prompt_tokens = getattr(usage_info, "prompt_tokens", 0) or 0
+            completion_tokens = getattr(usage_info, "completion_tokens", 0) or 0
+
+        # QClaw 网关不返回 usage，用 litellm.token_counter 估算
+        if prompt_tokens == 0 and completion_tokens == 0:
+            try:
+                import litellm as _litellm
+                # 估算 input tokens（从原始请求的 messages + system）
+                _est_msgs = []
+                if original_request.system:
+                    _sys_text = original_request.system if isinstance(original_request.system, str) else "\n".join(
+                        b.text if hasattr(b, "text") else b.get("text", "") for b in original_request.system
+                    )
+                    _est_msgs.append({"role": "system", "content": _sys_text})
+                for m in original_request.messages:
+                    _c = m.content if isinstance(m.content, str) else json.dumps(m.content, ensure_ascii=False, default=str)
+                    _est_msgs.append({"role": m.role, "content": _c})
+                prompt_tokens = _litellm.token_counter(model=original_request.model, messages=_est_msgs)
+                # 估算 output tokens（从返回的 content）
+                _out_text = " ".join(
+                    b.get("text", "") if isinstance(b, dict) else getattr(b, "text", "")
+                    for b in content
+                )
+                completion_tokens = _litellm.token_counter(model=original_request.model, text=_out_text)
+                logger.debug(f"📊 Estimated usage: input={prompt_tokens} output={completion_tokens}")
+            except Exception as _e:
+                logger.debug(f"Token estimation failed: {_e}")
+                prompt_tokens = 0
+                completion_tokens = 0
 
         # Map OpenAI finish_reason to Anthropic stop_reason
         stop_reason = None
