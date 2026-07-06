@@ -1781,27 +1781,28 @@ async def handle_streaming(
                     if delta_tool_calls:
                         # First tool call we've seen - need to handle text properly
                         if tool_index is None:
-                            # If we've been streaming text, close that text block
+                            # 先关闭 thinking block（如果还开着）
+                            if thinking_enabled and not thinking_block_closed:
+                                yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': 0})}\n\n"
+                                thinking_block_closed = True
+                                if text_block_index == 0:
+                                    text_block_index = 1
+                            # 关闭 text block（仅当它确实被打开过时）
                             if text_sent and not text_block_closed:
                                 text_block_closed = True
-                                yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': 0})}\n\n"
-                            # If we've accumulated text but not sent it, we need to emit it now
-                            # This handles the case where the first delta has both text and a tool call
+                                yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': text_block_index})}\n\n"
                             elif (
                                 accumulated_text
                                 and not text_sent
                                 and not text_block_closed
                             ):
-                                # Send the accumulated text
+                                # 发送积累的 text 再关闭
                                 text_sent = True
-                                yield f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta', 'index': 0, 'delta': {'type': 'text_delta', 'text': accumulated_text}})}\n\n"
-                                # Close the text block
+                                yield f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta', 'index': text_block_index, 'delta': {'type': 'text_delta', 'text': accumulated_text}})}\n\n"
                                 text_block_closed = True
-                                yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': 0})}\n\n"
-                            # Close text block even if we haven't sent anything - models sometimes emit empty text blocks
-                            elif not text_block_closed:
-                                text_block_closed = True
-                                yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': 0})}\n\n"
+                                yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': text_block_index})}\n\n"
+                            # 如果 text block 从未打开过（无 text 内容），不需要关闭
+                            text_block_closed = True  # 无论如何标记为已关闭
 
                         # Convert to list if it's not already
                         if not isinstance(delta_tool_calls, list):
@@ -1921,12 +1922,16 @@ async def handle_streaming(
                                 yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': i})}\n\n"
 
                         # If we accumulated text but never sent or closed text block, do it now
-                        if not text_block_closed:
-                            if accumulated_text and not text_sent:
-                                # Send the accumulated text
-                                yield f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta', 'index': text_block_index, 'delta': {'type': 'text_delta', 'text': accumulated_text}})}\n\n"
-                            # Close the text block
+                        if not text_block_closed and text_sent:
+                            # text block 被打开过，关闭它
                             yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': text_block_index})}\n\n"
+                            text_block_closed = True
+                        elif not text_block_closed and accumulated_text and not text_sent:
+                            # 有积累的 text 但没发过，先发再关
+                            text_sent = True
+                            yield f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta', 'index': text_block_index, 'delta': {'type': 'text_delta', 'text': accumulated_text}})}\n\n"
+                            yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': text_block_index})}\n\n"
+                            text_block_closed = True
 
                         # 如果 thinking block 还没关闭，关闭它
                         if thinking_enabled and not thinking_block_closed:
@@ -1985,10 +1990,17 @@ async def handle_streaming(
                 if not thinking_block_closed:
                     yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': 0})}\n\n"
                     thinking_block_closed = True
-                # 关闭 text block
-                yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': text_block_index})}\n\n"
+                # 关闭 text block（仅当被打开过）
+                if text_sent and not text_block_closed:
+                    yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': text_block_index})}\n\n"
+                    text_block_closed = True
             else:
-                yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': 0})}\n\n"
+                if text_sent and not text_block_closed:
+                    yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': 0})}\n\n"
+                    text_block_closed = True
+                elif not text_sent and not text_block_closed:
+                    # text block 从未被打开，不需要关闭
+                    pass
 
             # Send final message_delta with usage
             usage = {"output_tokens": output_tokens}
