@@ -147,6 +147,32 @@ async def get_http_client() -> httpx.AsyncClient:
         )
     return _http_client
 
+async def _reset_litellm_clients():
+    """清除 litellm 内部缓存的 HTTP 客户端，强制重新创建连接。
+    当 QClaw 网关 upstream auth 过期返回 9002 时调用。"""
+    import litellm as _llm
+    try:
+        await _llm.close_litellm_async_clients()
+        logger.info("🔄 litellm async clients reset")
+    except Exception as _e:
+        logger.warning(f"Failed to reset litellm async clients: {_e}")
+    # 同步客户端也要清
+    try:
+        if hasattr(_llm, "in_memory_llm_clients_cache"):
+            cache = _llm.in_memory_llm_clients_cache
+            if hasattr(cache, "cache_dict"):
+                cache.cache_dict.clear()
+                logger.info("🔄 litellm in-memory client cache cleared")
+    except Exception as _e:
+        logger.warning(f"Failed to clear litellm cache dict: {_e}")
+
+
+def _is_auth_expired_error(exc: Exception) -> bool:
+    """判断是否为 QClaw 网关 upstream auth 过期 (9002)。"""
+    msg = str(exc).lower()
+    return "9002" in msg or "该功能暂不可用" in msg
+
+
 @asynccontextmanager
 async def lifespan(app):
     yield
@@ -1627,19 +1653,32 @@ async def openai_chat_completions(raw_request: Request):
             len(litellm_req.get("messages", [])), len(litellm_req.get("tools") or []), 200
         )
 
-        if is_stream:
-            litellm_req["stream"] = True
-            response_generator = await litellm.acompletion(**litellm_req)
-            return StreamingResponse(_litellm_oai_stream(response_generator),
-                                     media_type="text/event-stream")
-        else:
-            litellm_req.pop("stream", None)
-            resp = await litellm.acompletion(**litellm_req)
-            return JSONResponse(content=resp.model_dump())
+        async def _do_litellm_call():
+            if is_stream:
+                litellm_req["stream"] = True
+                gen = await litellm.acompletion(**litellm_req)
+                return StreamingResponse(_litellm_oai_stream(gen), media_type="text/event-stream")
+            else:
+                litellm_req.pop("stream", None)
+                resp = await litellm.acompletion(**litellm_req)
+                return JSONResponse(content=resp.model_dump())
+
+        return await _do_litellm_call()
 
     except HTTPException:
         raise
     except Exception as e:
+        # 检测 QClaw 网关 upstream auth 过期 (9002)，清除 litellm 客户端缓存后重试
+        if _is_auth_expired_error(e) and PREFERRED_PROVIDER == "qclaw":
+            await _reset_litellm_clients()
+            try:
+                logger.info("🔄 Retrying /v1/chat/completions after litellm client reset...")
+                return await _do_litellm_call()
+            except Exception as retry_e:
+                _log_exception("openai_chat_completions_retry_failed", retry_e, {"original_error": str(e)})
+                raise HTTPException(status_code=getattr(retry_e, "status_code", 500),
+                                     detail=f"Error (after retry): {str(retry_e)}")
+
         _log_exception(
             "openai_chat_completions_failed",
             e,
@@ -2428,6 +2467,28 @@ async def create_message(request: MessagesRequest, raw_request: Request):
                 "max_completion_tokens": litellm_request.get("max_completion_tokens"),
             },
         )
+
+        # 检测 QClaw 网关 upstream auth 过期 (9002)，清除 litellm 客户端缓存后重试
+        if _is_auth_expired_error(e) and PREFERRED_PROVIDER == "qclaw":
+            await _reset_litellm_clients()
+            try:
+                logger.info("🔄 Retrying after litellm client reset...")
+                if request.stream:
+                    response_generator = await litellm.acompletion(**litellm_request)
+                    return StreamingResponse(
+                        handle_streaming(response_generator, request, original_model, request_id),
+                        media_type="text/event-stream",
+                    )
+                else:
+                    litellm_response = litellm.completion(**litellm_request)
+                    anthropic_response = convert_litellm_to_anthropic(litellm_response, request)
+                    if original_model and hasattr(anthropic_response, "model"):
+                        anthropic_response.model = original_model
+                    return anthropic_response
+            except Exception as retry_e:
+                _log_exception("anthropic_messages_retry_failed", retry_e, {"original_error": str(e)})
+                status_code = getattr(retry_e, "status_code", 500)
+                raise HTTPException(status_code=status_code, detail=f"Error (after retry): {str(retry_e)}")
 
         # Format error for response
         error_message = f"Error: {str(e)}"
