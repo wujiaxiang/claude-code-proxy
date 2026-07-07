@@ -28,7 +28,7 @@ LOG_ROTATE_WHEN = os.environ.get("LOG_ROTATE_WHEN", "midnight")
 LOG_ROTATE_INTERVAL = int(os.environ.get("LOG_ROTATE_INTERVAL", "1"))
 
 # Configure logging
-_log_level = logging.DEBUG if DEBUG else logging.WARN
+_log_level = logging.DEBUG if DEBUG else logging.INFO
 _log_fmt = "%(asctime)s - %(levelname)s - %(message)s"
 logging.basicConfig(level=_log_level, format=_log_fmt)
 logger = logging.getLogger(__name__)
@@ -62,7 +62,7 @@ if LOG_FILE:
         backupCount=max(0, LOG_RETENTION_DAYS),
         encoding="utf-8",
     )
-    _fh.setLevel(logging.DEBUG if DEBUG else logging.WARNING)
+    _fh.setLevel(logging.DEBUG if DEBUG else logging.INFO)
     _fh.setFormatter(logging.Formatter(_log_fmt))
     logging.getLogger().addHandler(_fh)
     _cleanup_old_log_files(str(_log_path), LOG_RETENTION_DAYS)
@@ -804,16 +804,13 @@ async def log_requests(request: Request, call_next):
     method = request.method
     path = request.url.path
 
-    if DEBUG:
-        logger.debug(f"⬇️ REQUEST: {method} {path}")
-
     response = await call_next(request)
 
-    if DEBUG:
+    if response.status_code >= 400:
         elapsed = time.time() - start
-        logger.debug(f"⬆️ RESPONSE: {method} {path} HTTP {response.status_code} ⏱️{elapsed:.1f}s")
-
-    return response
+        logger.warning(
+            f"⬆️ {method} {path} HTTP {response.status_code} ⏱️{elapsed:.1f}s"
+        )
 
     return response
 
@@ -2697,10 +2694,8 @@ def log_request_beautifully(
     log_line = f"{Colors.BOLD}{method} {endpoint}{Colors.RESET} {status_str}"
     model_line = f"{claude_display} → {openai_display} {tools_str} {messages_str}"
 
-    # Print to console
-    print(log_line)
-    print(model_line)
-    sys.stdout.flush()
+    logger.info(log_line)
+    logger.info(model_line)
 
 
 if __name__ == "__main__":
