@@ -148,15 +148,22 @@ async def get_http_client() -> httpx.AsyncClient:
     return _http_client
 
 async def _reset_litellm_clients():
-    """清除 litellm 内部缓存的 HTTP 客户端，强制重新创建连接。
+    """清除 litellm 内部缓存的 HTTP 客户端 + 代理自身连接池，强制重新创建连接。
     当 QClaw 网关 upstream auth 过期返回 9002 时调用。"""
     import litellm as _llm
+    # 1) 关闭代理自己的 httpx 连接池（透传路径用）
+    global _http_client
+    if _http_client and not _http_client.is_closed:
+        await _http_client.aclose()
+        _http_client = None
+        logger.info("🔄 proxy http client reset")
+    # 2) 清除 litellm 异步客户端
     try:
         await _llm.close_litellm_async_clients()
         logger.info("🔄 litellm async clients reset")
     except Exception as _e:
         logger.warning(f"Failed to reset litellm async clients: {_e}")
-    # 同步客户端也要清
+    # 3) 清除 litellm 同步客户端缓存
     try:
         if hasattr(_llm, "in_memory_llm_clients_cache"):
             cache = _llm.in_memory_llm_clients_cache
@@ -165,6 +172,14 @@ async def _reset_litellm_clients():
                 logger.info("🔄 litellm in-memory client cache cleared")
     except Exception as _e:
         logger.warning(f"Failed to clear litellm cache dict: {_e}")
+    # 4) 用 importlib 重载 litellm 的 openai adapter 模块，强制重建 client
+    try:
+        import litellm.llms.openai.openai as oai_mod
+        import importlib
+        importlib.reload(oai_mod)
+        logger.info("🔄 litellm openai adapter reloaded")
+    except Exception as _e:
+        logger.warning(f"Failed to reload openai adapter: {_e}")
 
 
 def _is_auth_expired_error(exc: Exception) -> bool:
