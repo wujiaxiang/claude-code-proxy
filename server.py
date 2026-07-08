@@ -188,6 +188,28 @@ def _is_auth_expired_error(exc: Exception) -> bool:
     return "9002" in msg or "该功能暂不可用" in msg
 
 
+# QClaw 网关只接受标准 OpenAI chat completion 字段，非标准字段会导致 9002
+_QCLAW_ALLOWED_KEYS = {
+    "model", "messages", "max_tokens", "max_completion_tokens",
+    "stream", "temperature", "top_p", "stop", "tools", "tool_choice",
+    "frequency_penalty", "presence_penalty", "n", "user", "seed",
+    "logprobs", "top_logprobs", "response_format", "logit_bias",
+}
+
+def _clean_qclaw_body(body: dict) -> dict:
+    """清理 body 中 QClaw 网关不认识的字段，避免非标准参数导致 9002。"""
+    cleaned = {}
+    removed = []
+    for k, v in body.items():
+        if k in _QCLAW_ALLOWED_KEYS:
+            cleaned[k] = v
+        else:
+            removed.append(k)
+    if removed:
+        logger.info(f"🧹 QClaw body cleaned: removed keys={removed}")
+    return cleaned
+
+
 async def _passthrough_to_qclaw(
     litellm_req: dict,
     request,  # type: ignore - MessagesRequest defined later
@@ -445,7 +467,11 @@ def _qclaw_provider(req, litellm_req, orig):
     litellm_req["api_key"] = "__QCLAW_AUTH_GATEWAY_MANAGED__"
     litellm_req["api_base"] = QCLAW_BASE_URL
     litellm_req["extra_headers"] = {"User-Agent": "OpenAI/JS 6.39.1", "x-agent-id": "main"}
-    litellm_req.pop("stop", None); litellm_req.pop("top_k", None); litellm_req.pop("metadata", None)
+    # 清理 litellm 内部字段和 Anthropic 专属字段，防止泄漏到网关导致 9002
+    for k in ("stop", "top_k", "metadata", "thinking", "reasoning",
+              "reasoning_effort", "extra_body", "provider_specific_fields",
+              "custom_llm_provider", "model_info"):
+        litellm_req.pop(k, None)
     msgs = litellm_req.get("messages", [])
     if not any(m.get("role") == "system" for m in msgs):
         msgs.insert(0, {"role": "system", "content": "You are Claude, a helpful AI assistant."})
@@ -1691,6 +1717,9 @@ async def openai_chat_completions(raw_request: Request):
                 if not any(m.get("role") == "system" for m in msgs):
                     msgs.insert(0, {"role": "system", "content": "You are Claude, a helpful AI assistant."})
                     body["messages"] = msgs
+                # 清理非标准字段，避免客户端透传的 Anthropic 专属参数导致 9002
+                body = _clean_qclaw_body(body)
+                logger.debug(f"🐙 QClaw passthrough: body keys={list(body.keys())} model={body.get('model')}")
                 headers["Authorization"] = "Bearer __QCLAW_AUTH_GATEWAY_MANAGED__"
                 headers["User-Agent"] = "OpenAI/JS 6.39.1"
                 headers["x-agent-id"] = "main"
@@ -1827,8 +1856,21 @@ async def openai_chat_completions(raw_request: Request):
         if _is_auth_expired_error(e) and PREFERRED_PROVIDER == "qclaw":
             try:
                 logger.info("🔄 /v1/chat/completions 9002 → fallback httpx 直连...")
-                oai_resp = await _qclaw_fallback_chat_completion(litellm_req)
-                return JSONResponse(content=oai_resp)
+                await asyncio.sleep(0.5)
+                async with httpx.AsyncClient(timeout=httpx.Timeout(60.0, connect=5.0)) as client:
+                    resp = await client.post(
+                        f"{QCLAW_BASE_URL}/chat/completions",
+                        json=_clean_qclaw_body(litellm_req),
+                        headers={
+                            "Authorization": f"Bearer {QCLAW_API_KEY}",
+                            "x-agent-id": "main",
+                            "User-Agent": "OpenAI/JS 6.39.1",
+                            "Connection": "close",
+                        },
+                    )
+                    if resp.status_code != 200:
+                        raise HTTPException(status_code=502, detail=f"QClaw fallback failed: {resp.status_code}")
+                    return JSONResponse(content=resp.json())
             except Exception as retry_e:
                 _log_exception("openai_chat_completions_fallback_failed", retry_e, {"original_error": str(e)})
                 raise HTTPException(status_code=getattr(retry_e, "status_code", 502),

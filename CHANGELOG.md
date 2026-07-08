@@ -1,5 +1,27 @@
 # Changelog
 
+## 2026-07-08 (v2) — QClaw body 字段清理 + 死代码修复
+
+### 概述
+
+排查发现 QClaw 网关非常稳定，问题出在代理把客户端请求的 body 原封不动透传给网关，非标准字段（如 `thinking`、`reasoning_effort`、`metadata` 等 Anthropic 专属参数）导致网关返回 9002。
+
+### 修复
+
+- **新增 `_clean_qclaw_body()` 函数**：白名单过滤，只保留标准 OpenAI chat completion 字段
+- **qclaw 透传路径**：发送前调用 `_clean_qclaw_body()` 清理 body（line 1721）
+- **`_qclaw_provider`**：加强 litellm 请求清理，移除 `thinking`/`reasoning`/`reasoning_effort`/`extra_body`/`provider_specific_fields`/`custom_llm_provider`/`model_info`（lines 470-474）
+- **修复死代码**：`/v1/chat/completions` 9002 fallback 路径中不再引用已删除的 `_qclaw_fallback_chat_completion`，改用直连 httpx（lines 1854-1872）
+- **调试日志**：透传前打印 body keys 方便排查（line 1722）
+
+### 文件变更
+
+| 文件 | 变更 |
+|------|------|
+| `server.py` | +30 / -6 |
+
+---
+
 ## 2026-07-08 — QClaw 透传 9002 修复
 
 ### 概述
