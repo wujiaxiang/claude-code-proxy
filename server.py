@@ -188,6 +188,113 @@ def _is_auth_expired_error(exc: Exception) -> bool:
     return "9002" in msg or "该功能暂不可用" in msg
 
 
+async def _passthrough_to_qclaw(
+    litellm_req: dict,
+    request: MessagesRequest,
+    original_model: str,
+    request_id: str,
+):
+    """绕过 litellm，直接用 httpx 打 QClaw 网关的 /chat/completions。
+    用于 9002 重试——litellm 内部缓存状态重置不彻底，只能绕过去。
+    """
+    mapped_model = litellm_req["model"]
+    if "/" in mapped_model:
+        mapped_model = mapped_model.split("/", 1)[1]  # openai/xxx -> xxx
+
+    body = {
+        "model": mapped_model,
+        "messages": litellm_req["messages"],
+        "max_tokens": litellm_req.get("max_tokens") or litellm_req.get("max_completion_tokens", 4096),
+    }
+    if litellm_req.get("temperature") is not None:
+        body["temperature"] = litellm_req["temperature"]
+    if litellm_req.get("top_p") is not None:
+        body["top_p"] = litellm_req["top_p"]
+    if litellm_req.get("tools"):
+        body["tools"] = litellm_req["tools"]
+
+    headers = {
+        "Authorization": f"Bearer {QCLAW_API_KEY}",
+        "x-agent-id": "main",
+        "Content-Type": "application/json",
+    }
+
+    client = await get_http_client()
+    url = QCLAW_BASE_URL.rstrip("/") + "/chat/completions"
+
+    if getattr(request, "stream", False):
+        body["stream"] = True
+        async def _stream():
+            async with client.stream("POST", url, json=body, headers=headers) as resp:
+                if resp.status_code >= 400:
+                    error_text = await resp.aread()
+                    yield f"data: {{\"error\":\"upstream {resp.status_code}: {error_text.decode('utf-8', errors='replace')[:200]}\"}}\n\n".encode()
+                    yield b"data: [DONE]\n\n"
+                    return
+                async for chunk in resp.aiter_bytes():
+                    yield chunk
+        return StreamingResponse(_stream(), media_type="text/event-stream")
+    else:
+        resp = await client.post(url, json=body, headers=headers, timeout=300.0)
+        if resp.status_code >= 400:
+            raise HTTPException(status_code=resp.status_code, detail=f"upstream: {resp.text[:500]}")
+        data = resp.json()
+        # 转换为 Anthropic 格式
+        from litellm import completion_cost
+        return _convert_oai_to_anthropic(data, request, original_model)
+
+
+def _convert_oai_to_anthropic(oai_data: dict, request: MessagesRequest, original_model: str):
+    """将 OpenAI chat completion 响应转换为 Anthropic messages 格式. 简化版."""
+    choice = oai_data.get("choices", [{}])[0]
+    msg = choice.get("message", {})
+    content_blocks = []
+
+    # reasoning_content -> thinking block
+    if msg.get("reasoning_content"):
+        content_blocks.append({
+            "type": "thinking",
+            "thinking": msg["reasoning_content"],
+        })
+
+    # content -> text block
+    if msg.get("content"):
+        content_blocks.append({
+            "type": "text",
+            "text": msg["content"],
+        })
+
+    # tool_calls -> tool_use blocks
+    for tc in msg.get("tool_calls", []):
+        func = tc.get("function", {})
+        try:
+            inp = json.loads(func.get("arguments", "{}"))
+        except (json.JSONDecodeError, TypeError):
+            inp = {}
+        content_blocks.append({
+            "type": "tool_use",
+            "id": tc.get("id", f"toolu_{uuid.uuid4().hex[:12]}"),
+            "name": func.get("name", ""),
+            "input": inp,
+        })
+
+    # usage
+    usage = oai_data.get("usage", {})
+    return MessagesResponse(
+        id=f"msg_{uuid.uuid4().hex[:12]}",
+        type="message",
+        role="assistant",
+        model=original_model,
+        content=content_blocks or [{"type": "text", "text": ""}],
+        stop_reason=choice.get("finish_reason") or "stop",
+        stop_sequence=None,
+        usage=Usage(
+            input_tokens=usage.get("prompt_tokens", 0),
+            output_tokens=usage.get("completion_tokens", 0),
+        ),
+    )
+
+
 @asynccontextmanager
 async def lifespan(app):
     yield
@@ -2482,23 +2589,13 @@ async def create_message(request: MessagesRequest, raw_request: Request):
             },
         )
 
-        # 检测 QClaw 网关 upstream auth 过期 (9002)，清除 litellm 客户端缓存后重试
+        # 检测 QClaw 网关 upstream auth 过期 (9002)
+        # litellm 内部缓存的状态重置不彻底，绕过 litellm 直接用 httpx 重试
         if _is_auth_expired_error(e) and PREFERRED_PROVIDER == "qclaw":
             await _reset_litellm_clients()
+            logger.info("🔄 Retrying via httpx passthrough (bypass litellm)...")
             try:
-                logger.info("🔄 Retrying after litellm client reset...")
-                if request.stream:
-                    response_generator = await litellm.acompletion(**litellm_request)
-                    return StreamingResponse(
-                        handle_streaming(response_generator, request, original_model, request_id),
-                        media_type="text/event-stream",
-                    )
-                else:
-                    litellm_response = litellm.completion(**litellm_request)
-                    anthropic_response = convert_litellm_to_anthropic(litellm_response, request)
-                    if original_model and hasattr(anthropic_response, "model"):
-                        anthropic_response.model = original_model
-                    return anthropic_response
+                return await _passthrough_to_qclaw(litellm_request, request, original_model, request_id)
             except Exception as retry_e:
                 _log_exception("anthropic_messages_retry_failed", retry_e, {"original_error": str(e)})
                 status_code = getattr(retry_e, "status_code", 500)
