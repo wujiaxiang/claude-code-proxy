@@ -190,7 +190,7 @@ def _is_auth_expired_error(exc: Exception) -> bool:
 
 async def _passthrough_to_qclaw(
     litellm_req: dict,
-    request: MessagesRequest,
+    request,  # type: ignore - MessagesRequest defined later
     original_model: str,
     request_id: str,
 ):
@@ -244,7 +244,7 @@ async def _passthrough_to_qclaw(
         return _convert_oai_to_anthropic(data, request, original_model)
 
 
-def _convert_oai_to_anthropic(oai_data: dict, request: MessagesRequest, original_model: str):
+def _convert_oai_to_anthropic(oai_data: dict, request, original_model: str):  # type: ignore
     """将 OpenAI chat completion 响应转换为 Anthropic messages 格式. 简化版."""
     choice = oai_data.get("choices", [{}])[0]
     msg = choice.get("message", {})
