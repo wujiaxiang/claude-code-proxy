@@ -7,6 +7,7 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 from typing import List, Dict, Any, Optional, Union, Literal
 import httpx
 import os
+import asyncio
 from fastapi.responses import JSONResponse, StreamingResponse
 import litellm
 import uuid
@@ -141,8 +142,7 @@ async def get_http_client() -> httpx.AsyncClient:
             timeout=httpx.Timeout(300.0, connect=10.0),
             limits=httpx.Limits(
                 max_connections=50,
-                max_keepalive_connections=20,
-                keepalive_expiry=30.0,
+                max_keepalive_connections=0,  # 不用 keepalive，避免网关 auth 过期 9002
             ),
         )
     return _http_client
@@ -217,6 +217,7 @@ async def _passthrough_to_qclaw(
         "Authorization": f"Bearer {QCLAW_API_KEY}",
         "x-agent-id": "main",
         "Content-Type": "application/json",
+        "Connection": "close",  # 避免 keep-alive 导致网关缓存 9002
     }
 
     client = await get_http_client()
@@ -240,7 +241,6 @@ async def _passthrough_to_qclaw(
             raise HTTPException(status_code=resp.status_code, detail=f"upstream: {resp.text[:500]}")
         data = resp.json()
         # 转换为 Anthropic 格式
-        from litellm import completion_cost
         return _convert_oai_to_anthropic(data, request, original_model)
 
 
@@ -297,6 +297,18 @@ def _convert_oai_to_anthropic(oai_data: dict, request, original_model: str):  # 
 
 @asynccontextmanager
 async def lifespan(app):
+    # 启动诊断：验证直连 QClaw 网关是否正常
+    import httpx as _httpx
+    try:
+        async with _httpx.AsyncClient(timeout=_httpx.Timeout(10.0)) as _diag:
+            _r = await _diag.post(
+                f"{QCLAW_BASE_URL}/chat/completions",
+                json={"model": "pool-deepseek-v4-flash", "messages": [{"role": "system", "content": "hi"}, {"role": "user", "content": "hi"}], "max_tokens": 5},
+                headers={"Authorization": "Bearer __QCLAW_AUTH_GATEWAY_MANAGED__", "x-agent-id": "main", "User-Agent": "OpenAI/JS 6.39.1", "Connection": "close"},
+            )
+            logger.info(f"startup diag: QClaw gateway = {_r.status_code}")
+    except Exception as _e:
+        logger.warning(f"startup diag: QClaw gateway unreachable: {_e}")
     yield
     # 清理连接池
     global _http_client
@@ -345,6 +357,7 @@ USE_VERTEX_AUTH = os.environ.get("USE_VERTEX_AUTH", "False").lower() == "true"
 
 # Get QClaw base URL from environment (if set)
 QCLAW_BASE_URL = os.environ.get("QCLAW_BASE_URL", "http://127.0.0.1:19000/proxy/llm")
+QCLAW_API_KEY = os.environ.get("QCLAW_API_KEY", "__QCLAW_AUTH_GATEWAY_MANAGED__")
 
 # ─── GitHub Copilot Enterprise 配置 ───
 COPILOT_GHE_TOKEN = os.environ.get("COPILOT_GHE_TOKEN", "")
@@ -1681,6 +1694,7 @@ async def openai_chat_completions(raw_request: Request):
                 headers["Authorization"] = "Bearer __QCLAW_AUTH_GATEWAY_MANAGED__"
                 headers["User-Agent"] = "OpenAI/JS 6.39.1"
                 headers["x-agent-id"] = "main"
+                headers["Connection"] = "close"  # 避免 keep-alive 导致网关缓存 9002
                 url = f"{QCLAW_BASE_URL}/chat/completions"
 
             elif PREFERRED_PROVIDER == "openai":
@@ -1720,36 +1734,56 @@ async def openai_chat_completions(raw_request: Request):
 
             if is_stream:
                 async def passthrough_stream():
-                    client = await get_http_client()
                     last_err = None
                     for attempt in range(3):
+                        if attempt > 0:
+                            await asyncio.sleep(0.5)  # 让网关缓存过期
+                        # 每次重试新建 client，避免 keep-alive 复用被污染的连接
+                        client = httpx.AsyncClient(timeout=httpx.Timeout(300.0, connect=10.0))
                         try:
                             async with client.stream("POST", url, json=body, headers=headers) as resp:
                                 if resp.status_code >= 500:
-                                    # 后端 5xx，重试
                                     await resp.aread()
                                     last_err = f"upstream {resp.status_code}"
+                                    continue
+                                if resp.status_code == 403:
+                                    # 9002 auth 过期，也重试
+                                    await resp.aread()
+                                    last_err = "auth 403"
                                     continue
                                 async for chunk in resp.aiter_bytes():
                                     yield chunk
                                 return
-                            break
                         except (httpx.ConnectError, httpx.ReadError, httpx.RemoteProtocolError) as e:
                             last_err = str(e)
                             continue
+                        finally:
+                            await client.aclose()
                     # 所有重试失败
                     yield json.dumps({"error": {"type": "proxy_error", "message": f"{PREFERRED_PROVIDER} upstream unavailable after retries: {last_err}"}}).encode()
                 return StreamingResponse(passthrough_stream(), media_type="text/event-stream")
             else:
-                client = await get_http_client()
+                # 每次重试新建 client + Connection: close，避免 keep-alive 导致网关缓存 9002
                 last_err = None
                 for attempt in range(3):
+                    if attempt > 0:
+                        await asyncio.sleep(0.5)  # 让网关缓存过期
                     try:
-                        resp = await client.post(url, json=body, headers=headers)
-                        if resp.status_code >= 500 and attempt < 2:
-                            last_err = f"upstream {resp.status_code}"
-                            continue
-                        return JSONResponse(content=resp.json(), status_code=resp.status_code)
+                        async with httpx.AsyncClient(timeout=httpx.Timeout(300.0, connect=10.0)) as client:
+                            resp = await client.post(url, json=body, headers=headers)
+                            if resp.status_code >= 500 and attempt < 2:
+                                last_err = f"upstream {resp.status_code}"
+                                continue
+                            # 9002 也重试（新连接可能恢复）
+                            if resp.status_code == 403 and attempt < 2:
+                                try:
+                                    err_body = resp.json()
+                                    if "9002" in str(err_body) or "error_code" in str(err_body):
+                                        last_err = "auth 9002"
+                                        continue
+                                except Exception:
+                                    pass
+                            return JSONResponse(content=resp.json(), status_code=resp.status_code)
                     except (httpx.ConnectError, httpx.ReadError, httpx.RemoteProtocolError) as e:
                         last_err = str(e)
                         continue
@@ -1789,16 +1823,16 @@ async def openai_chat_completions(raw_request: Request):
     except HTTPException:
         raise
     except Exception as e:
-        # 检测 QClaw 网关 upstream auth 过期 (9002)，清除 litellm 客户端缓存后重试
+        # 9002: 绕过 litellm，http 直连 QClaw 网关重试
         if _is_auth_expired_error(e) and PREFERRED_PROVIDER == "qclaw":
-            await _reset_litellm_clients()
             try:
-                logger.info("🔄 Retrying /v1/chat/completions after litellm client reset...")
-                return await _do_litellm_call()
+                logger.info("🔄 /v1/chat/completions 9002 → fallback httpx 直连...")
+                oai_resp = await _qclaw_fallback_chat_completion(litellm_req)
+                return JSONResponse(content=oai_resp)
             except Exception as retry_e:
-                _log_exception("openai_chat_completions_retry_failed", retry_e, {"original_error": str(e)})
-                raise HTTPException(status_code=getattr(retry_e, "status_code", 500),
-                                     detail=f"Error (after retry): {str(retry_e)}")
+                _log_exception("openai_chat_completions_fallback_failed", retry_e, {"original_error": str(e)})
+                raise HTTPException(status_code=getattr(retry_e, "status_code", 502),
+                                     detail=f"QClaw fallback failed: {str(retry_e)}")
 
         _log_exception(
             "openai_chat_completions_failed",
@@ -2597,9 +2631,9 @@ async def create_message(request: MessagesRequest, raw_request: Request):
             try:
                 return await _passthrough_to_qclaw(litellm_request, request, original_model, request_id)
             except Exception as retry_e:
-                _log_exception("anthropic_messages_retry_failed", retry_e, {"original_error": str(e)})
-                status_code = getattr(retry_e, "status_code", 500)
-                raise HTTPException(status_code=status_code, detail=f"Error (after retry): {str(retry_e)}")
+                _log_exception("anthropic_messages_fallback_failed", retry_e, {"original_error": str(e)})
+                raise HTTPException(status_code=getattr(retry_e, "status_code", 502),
+                                     detail=f"QClaw fallback failed: {str(retry_e)}")
 
         # Format error for response
         error_message = f"Error: {str(e)}"

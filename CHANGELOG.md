@@ -1,5 +1,29 @@
 # Changelog
 
+## 2026-07-08 — QClaw 透传 9002 修复
+
+### 概述
+
+修复 QClaw 透传路径中 litellm keep-alive 连接触发网关 9002 后，透传 fallback 也被污染的问题。
+
+### 根因
+
+litellm 先用 keep-alive 连接发请求 → 网关返回 9002 → 网关在进程/IP 级别缓存 9002 → 紧接着的透传 fallback（同一秒内）也中 9002。
+
+### 修复
+
+- **qclaw 透传 header 加 `Connection: close`**：避免 keep-alive 复用被污染的连接 (line 1643)
+- **流式透传路径**：每次重试新建 `httpx.AsyncClient` + `asyncio.sleep(0.5)` 让网关缓存过期 + 新增 403 重试逻辑 (lines 1682-1709)
+- **非流式透传路径**：重试前 `asyncio.sleep(0.5)` 让网关缓存过期 (lines 1714-1716)
+
+### 文件变更
+
+| 文件 | 变更 |
+|------|------|
+| `server.py` | +13 / -8 |
+
+---
+
 ## 2026-07-06 — 全 provider 透传扩展
 
 ### 概述
