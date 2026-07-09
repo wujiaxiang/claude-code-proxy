@@ -2,13 +2,28 @@
 Claude Code 完整兼容性测试
 模拟 Claude Code 真实发送的所有请求场景
 """
-import http.client, json, time, sys
+import http.client, json, time, sys, os
 
 PROXY = "127.0.0.1"
 PORT = 8082
 passed = 0
 failed = 0
 warn = 0
+
+# ─── 根据 provider 选择测试模型名 ───
+# 翻译链路（/v1/messages）用别名（sonnet/opus/haiku），代理会自动映射
+# 透传链路（/v1/chat/completions）用真实模型名，直接透传给上游
+_PROVIDER = os.environ.get("PREFERRED_PROVIDER", "qclaw").lower()
+if _PROVIDER == "qclaw":
+    # QClaw 上游直连：用 pool-* 模型名
+    OAI_MODEL_BIG = os.environ.get("BIG_MODEL", "pool-glm-5.2")
+    OAI_MODEL_MED = os.environ.get("MEDIUM_MODEL", "pool-deepseek-v4-pro")
+    OAI_MODEL_SMALL = os.environ.get("SMALL_MODEL", "pool-deepseek-v4-flash")
+else:
+    # Copilot/OpenAI 等：用原始模型名
+    OAI_MODEL_BIG = "claude-opus-4-20250514"
+    OAI_MODEL_MED = "claude-sonnet-4.6"
+    OAI_MODEL_SMALL = "claude-haiku-4.5"
 
 def test(name, path, body=None, method="POST", checks=None):
     """测试单个请求，支持自定义校验"""
@@ -409,9 +424,9 @@ def oai_has_id(data, _):
 def oai_has_choices(data, _):
     return bool(data.get("choices")), "missing choices"
 
-# 15-1. 基础非流式（直接用 Copilot 模型名）
-oai_test("基础请求 claude-sonnet-4.6", {
-    "model": "claude-sonnet-4.6",
+# 15-1. 基础非流式
+oai_test(f"基础请求 {OAI_MODEL_MED}", {
+    "model": OAI_MODEL_MED,
     "messages": [{"role": "user", "content": "reply with one word: OK"}],
     "stream": False,
 }, checks={
@@ -421,30 +436,23 @@ oai_test("基础请求 claude-sonnet-4.6", {
     "has_usage": oai_has_usage,
 })
 
-# 15-2. Anthropic 模型名自动映射 → sonnet
-oai_test("模型映射 claude-sonnet-20241022 → copilot-medium", {
-    "model": "claude-sonnet-20241022",
+# 15-2. big 模型
+oai_test(f"big 模型 {OAI_MODEL_BIG}", {
+    "model": OAI_MODEL_BIG,
     "messages": [{"role": "user", "content": "reply: OK"}],
     "stream": False,
 }, checks={"has_content": oai_has_content})
 
-# 15-3. opus 映射
-oai_test("模型映射 claude-opus-4-20250514 → copilot-big", {
-    "model": "claude-opus-4-20250514",
+# 15-3. small 模型
+oai_test(f"small 模型 {OAI_MODEL_SMALL}", {
+    "model": OAI_MODEL_SMALL,
     "messages": [{"role": "user", "content": "reply: OK"}],
     "stream": False,
 }, checks={"has_content": oai_has_content})
 
-# 15-4. haiku/small 映射
-oai_test("模型映射 claude-haiku-3-5-20241022 → copilot-small (gpt-5.4-mini)", {
-    "model": "claude-haiku-3-5-20241022",
-    "messages": [{"role": "user", "content": "reply: OK"}],
-    "stream": False,
-}, checks={"has_content": oai_has_content})
-
-# 15-5. 多轮对话
+# 15-4. 多轮对话
 oai_test("多轮对话", {
-    "model": "claude-sonnet-4.6",
+    "model": OAI_MODEL_MED,
     "messages": [
         {"role": "user", "content": "my secret number is 42"},
         {"role": "assistant", "content": "Got it, your secret number is 42."},
@@ -453,9 +461,9 @@ oai_test("多轮对话", {
     "stream": False,
 }, checks={"has_content": oai_has_content})
 
-# 15-6. system prompt
+# 15-5. system prompt
 oai_test("system prompt", {
-    "model": "claude-sonnet-4.6",
+    "model": OAI_MODEL_MED,
     "messages": [
         {"role": "system", "content": "You are a concise assistant."},
         {"role": "user", "content": "reply: OK"},
@@ -463,9 +471,9 @@ oai_test("system prompt", {
     "stream": False,
 }, checks={"has_content": oai_has_content})
 
-# 15-7. max_tokens 参数透传（截断时 content 为空但 choices 存在，finish_reason=length）
+# 15-6. max_tokens 参数透传
 oai_test("max_tokens 参数", {
-    "model": "claude-sonnet-4.6",
+    "model": OAI_MODEL_MED,
     "messages": [{"role": "user", "content": "count to 100"}],
     "max_tokens": 20,
     "stream": False,
@@ -477,17 +485,17 @@ oai_test("max_tokens 参数", {
     ),
 })
 
-# 15-8. temperature / top_p
+# 15-7. temperature / top_p
 oai_test("temperature=0.5, top_p=0.9", {
-    "model": "claude-sonnet-4.6",
+    "model": OAI_MODEL_MED,
     "messages": [{"role": "user", "content": "reply: OK"}],
     "temperature": 0.5, "top_p": 0.9,
     "stream": False,
 }, checks={"has_content": oai_has_content})
 
-# 15-9. tools 定义
+# 15-8. tools 定义
 oai_test("tools 定义", {
-    "model": "claude-sonnet-4.6",
+    "model": OAI_MODEL_MED,
     "messages": [{"role": "user", "content": "hi"}],
     "tools": [{
         "type": "function",
@@ -504,11 +512,11 @@ oai_test("tools 定义", {
     "stream": False,
 }, checks={"has_choices": oai_has_choices})
 
-# 15-10. 流式响应（用 claude-haiku-4.5 避免 reasoning 阶段干扰）
+# 15-9. 流式响应
 print()
 conn = http.client.HTTPConnection(PROXY, PORT, timeout=60)
 conn.request("POST", "/v1/chat/completions", json.dumps({
-    "model": "claude-haiku-4.5",
+    "model": OAI_MODEL_SMALL,
     "messages": [{"role": "user", "content": "reply with exactly: streaming works"}],
     "stream": True,
 }).encode(), {"Content-Type": "application/json"})
@@ -536,15 +544,15 @@ for line in decoded.split("\n"):
         pass
 full = "".join(content_parts)
 if resp.status == 200 and full.strip():
-    print(f"✅ 流式响应 claude-haiku-4.5: {full[:80]!r}")
+    print(f"✅ 流式响应 {OAI_MODEL_SMALL}: {full[:80]!r}")
     passed += 1
 else:
     print(f"❌ 流式响应: HTTP {resp.status}  text={full[:80]!r}")
     failed += 1
 
-# 15-11. OpenAI 格式 usage 字段
+# 15-10. OpenAI 格式 usage 字段
 d = oai_test("usage 字段完整性", {
-    "model": "claude-haiku-4.5",
+    "model": OAI_MODEL_SMALL,
     "messages": [{"role": "user", "content": "say hi"}],
     "stream": False,
 }, checks={
@@ -554,11 +562,11 @@ d = oai_test("usage 字段完整性", {
                                         f"completion_tokens={d.get('usage',{}).get('completion_tokens')}"),
 })
 
-# 15-12. 性能基准
+# 15-11. 性能基准
 start = time.time()
 conn = http.client.HTTPConnection(PROXY, PORT)
 conn.request("POST", "/v1/chat/completions", json.dumps({
-    "model": "claude-sonnet-4.6",
+    "model": OAI_MODEL_MED,
     "messages": [{"role": "user", "content": "hi"}],
     "stream": False,
 }).encode(), {"Content-Type": "application/json"})

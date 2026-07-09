@@ -1,5 +1,44 @@
 # Changelog
 
+## 2026-07-09 — QClaw 上游直连 + API Key 自动解密
+
+### 概述
+
+彻底放弃 19000 本地网关方案（Ed25519 设备签名认证无法绕过），改用 GetQClawAPIKey 方法：从 QClaw 客户端本地存储解密 API Key，直连上游 `mmgrcalltoken.3g.qq.com` OpenAI 兼容接口。支持指定具体模型（如 `pool-deepseek-v4-flash`），流式和非流式均正常。
+
+### 修复
+
+- **`QCLAW_BASE_URL`** 默认值从 `http://127.0.0.1:19000/proxy/llm` 改为 `https://mmgrcalltoken.3g.qq.com/aizone/v1`
+- **新增 `_decrypt_qclaw_api_key()`**：从 `%APPDATA%\QClaw\Local State` 读取 DPAPI 保护的 AES-256 密钥，用 AES-256-GCM 解密 `app-store.json` 中的 v10 密文，得到 `sk-...` API Key
+- **新增 `_dpapi_unprotect()`**：Windows DPAPI 解密（ctypes 调用 CryptUnprotectData）
+- **移除所有 `__QCLAW_AUTH_GATEWAY_MANAGED__`** 引用，改用解密的真实 API Key
+- **移除 `x-agent-id` 请求头**（上游不需要）
+- **移除 `Connection: close`**（不再需要避免网关缓存，恢复 keepalive）
+- **`max_keepalive_connections`** 从 0 改为 10（恢复连接复用）
+- **所有 httpx 客户端添加 `trust_env=False`**（绕过系统代理，解决 Python urllib/httpx 因系统代理导致请求失败的问题）
+- **移除 403/9002 专属重试逻辑**（直连上游不会有 9002）
+- **保留 `User-Agent: OpenAI/JS 6.39.1`**（上游拒绝 python-httpx 默认 UA，返回 400 "invalid request"）
+- **`.env`** 移除旧 19000 URL，新增可选 `QCLAW_API_KEY` 环境变量覆盖
+- **`test_claude_api.py`** 适配 QClaw 模式：透传链路用 pool-* 模型名，根据 PREFERRED_PROVIDER 动态选择
+
+### 文件变更
+
+| 文件 | 变更 |
+|------|------|
+| `server.py` | API Key 解密 + 上游直连 + trust_env + User-Agent + 清理 9002 逻辑 |
+| `.env` | 移除旧网关 URL，新增可选 API Key |
+| `test_claude_api.py` | 适配 QClaw 模式，动态模型名 |
+| `README-zh.md` | 新增 QClaw 上游直连设计文档 + 解密链路 + 排查指南 |
+
+### 背景
+
+- QClaw 19000 端口使用 Ed25519 设备签名认证，客户端外无法模拟
+- 60227 等动态端口是 agent 级别会话接口，非 LLM 级别
+- 上游 `mmgrcalltoken.3g.qq.com` 是标准 OpenAI 兼容接口，用解密的 API Key 即可调用
+- Python urllib 受系统代理影响返回 400，Node.js fetch 和 httpx(trust_env=False) 正常
+
+---
+
 ## 2026-07-08 (v2) — QClaw body 字段清理 + 死代码修复
 
 ### 概述

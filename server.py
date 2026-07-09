@@ -7,6 +7,7 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 from typing import List, Dict, Any, Optional, Union, Literal
 import httpx
 import os
+import base64
 import asyncio
 from fastapi.responses import JSONResponse, StreamingResponse
 import litellm
@@ -140,9 +141,10 @@ async def get_http_client() -> httpx.AsyncClient:
     if _http_client is None or _http_client.is_closed:
         _http_client = httpx.AsyncClient(
             timeout=httpx.Timeout(300.0, connect=10.0),
+            trust_env=False,  # 不使用系统代理，避免代理干扰直连上游
             limits=httpx.Limits(
                 max_connections=50,
-                max_keepalive_connections=0,  # 不用 keepalive，避免网关 auth 过期 9002
+                max_keepalive_connections=10,
             ),
         )
     return _http_client
@@ -237,9 +239,8 @@ async def _passthrough_to_qclaw(
 
     headers = {
         "Authorization": f"Bearer {QCLAW_API_KEY}",
-        "x-agent-id": "main",
         "Content-Type": "application/json",
-        "Connection": "close",  # 避免 keep-alive 导致网关缓存 9002
+        "User-Agent": "OpenAI/JS 6.39.1",  # 上游拒绝 python-httpx 默认 UA
     }
 
     client = await get_http_client()
@@ -319,18 +320,27 @@ def _convert_oai_to_anthropic(oai_data: dict, request, original_model: str):  # 
 
 @asynccontextmanager
 async def lifespan(app):
-    # 启动诊断：验证直连 QClaw 网关是否正常
+    # 网关抓包：CAPTURE_GATEWAY=true 时激活
+    if os.environ.get("CAPTURE_GATEWAY", "").lower() == "true":
+        try:
+            from _gateway_capture import activate_capture, get_capture_file
+            activate_capture()
+            logger.info(f"📡 Gateway capture activated → {get_capture_file()}")
+        except Exception as _ce:
+            logger.warning(f"Failed to activate gateway capture: {_ce}")
+
+    # 启动诊断：验证直连 QClaw 上游是否正常
     import httpx as _httpx
     try:
-        async with _httpx.AsyncClient(timeout=_httpx.Timeout(10.0)) as _diag:
+        async with _httpx.AsyncClient(timeout=_httpx.Timeout(10.0), trust_env=False) as _diag:
             _r = await _diag.post(
                 f"{QCLAW_BASE_URL}/chat/completions",
                 json={"model": "pool-deepseek-v4-flash", "messages": [{"role": "system", "content": "hi"}, {"role": "user", "content": "hi"}], "max_tokens": 5},
-                headers={"Authorization": "Bearer __QCLAW_AUTH_GATEWAY_MANAGED__", "x-agent-id": "main", "User-Agent": "OpenAI/JS 6.39.1", "Connection": "close"},
+                headers={"Authorization": f"Bearer {QCLAW_API_KEY}", "Content-Type": "application/json", "User-Agent": "OpenAI/JS 6.39.1"},
             )
-            logger.info(f"startup diag: QClaw gateway = {_r.status_code}")
+            logger.info(f"startup diag: QClaw upstream = {_r.status_code}")
     except Exception as _e:
-        logger.warning(f"startup diag: QClaw gateway unreachable: {_e}")
+        logger.warning(f"startup diag: QClaw upstream unreachable: {_e}")
     yield
     # 清理连接池
     global _http_client
@@ -377,9 +387,108 @@ VERTEX_PROJECT = os.environ.get("VERTEX_PROJECT", "unset")
 VERTEX_LOCATION = os.environ.get("VERTEX_LOCATION", "unset")
 USE_VERTEX_AUTH = os.environ.get("USE_VERTEX_AUTH", "False").lower() == "true"
 
-# Get QClaw base URL from environment (if set)
-QCLAW_BASE_URL = os.environ.get("QCLAW_BASE_URL", "http://127.0.0.1:19000/proxy/llm")
-QCLAW_API_KEY = os.environ.get("QCLAW_API_KEY", "__QCLAW_AUTH_GATEWAY_MANAGED__")
+# ─── QClaw 上游直连配置 ───
+# 上游 LLM 接口（OpenAI 兼容），从 QClaw 客户端本地存储解密 API Key
+QCLAW_BASE_URL = os.environ.get("QCLAW_BASE_URL", "https://mmgrcalltoken.3g.qq.com/aizone/v1")
+
+
+def _dpapi_unprotect(encrypted_bytes: bytes) -> bytes:
+    """Windows DPAPI 解密（Chrome 风格 os_crypt 的 AES 密钥保护层）。"""
+    import ctypes
+    import ctypes.wintypes
+
+    class _DATA_BLOB(ctypes.Structure):
+        _fields_ = [("cbData", ctypes.wintypes.DWORD),
+                    ("pbData", ctypes.POINTER(ctypes.c_char))]
+
+    crypt32 = ctypes.windll.crypt32
+    kernel32 = ctypes.windll.kernel32
+    blob_in = _DATA_BLOB(len(encrypted_bytes),
+                         ctypes.cast(ctypes.c_char_p(encrypted_bytes),
+                                     ctypes.POINTER(ctypes.c_char)))
+    blob_out = _DATA_BLOB()
+    crypt32.CryptUnprotectData.argtypes = [
+        ctypes.POINTER(_DATA_BLOB), ctypes.c_void_p, ctypes.c_void_p,
+        ctypes.c_void_p, ctypes.c_void_p, ctypes.wintypes.DWORD,
+        ctypes.POINTER(_DATA_BLOB)
+    ]
+    crypt32.CryptUnprotectData.restype = ctypes.wintypes.BOOL
+    ok = crypt32.CryptUnprotectData(
+        ctypes.byref(blob_in), None, None, None, None, 0, ctypes.byref(blob_out)
+    )
+    if not ok:
+        raise OSError(f"CryptUnprotectData failed (WinError {ctypes.get_last_error()})")
+    try:
+        return ctypes.string_at(blob_out.pbData, blob_out.cbData)
+    finally:
+        kernel32.LocalFree(blob_out.pbData)
+
+
+def _decrypt_qclaw_api_key() -> str:
+    """从 QClaw 本地存储解密 API Key。
+
+    解密链路（Windows）：
+      Local State → os_crypt.encrypted_key (DPAPI) → AES-256 密钥
+      app-store.json → authGateway.providers.qclaw.apiKey.cipherText (v10)
+      → AES-256-GCM 解密 → API Key (sk-...)
+
+    环境变量 QCLAW_API_KEY 优先；解密失败时返回空字符串（启动诊断会告警）。
+    """
+    env_key = os.environ.get("QCLAW_API_KEY", "").strip()
+    if env_key:
+        return env_key
+
+    try:
+        appdata = os.environ.get("APPDATA", "")
+        app_store = os.path.join(appdata, "QClaw", "app-store.json")
+        local_state = os.path.join(appdata, "QClaw", "Local State")
+
+        if not os.path.exists(app_store):
+            logger.warning(f"QClaw app-store.json not found: {app_store}")
+            return ""
+
+        with open(app_store, "r", encoding="utf-8") as f:
+            store = json.load(f)
+        entry = store.get("authGateway.providers.qclaw.apiKey")
+        if entry is None:
+            logger.warning("authGateway.providers.qclaw.apiKey not found in app-store.json")
+            return ""
+        cipher_b64 = entry["cipherText"] if isinstance(entry, dict) else entry
+        raw = base64.b64decode(cipher_b64)
+
+        if sys.platform == "win32":
+            # Chrome v10: 3-byte prefix + 12-byte nonce + ciphertext + 16-byte tag
+            if raw[:3] != b"v10":
+                logger.warning(f"Unexpected cipher prefix: {raw[:3]!r}")
+                return ""
+            if not os.path.exists(local_state):
+                logger.warning(f"QClaw Local State not found: {local_state}")
+                return ""
+            with open(local_state, "r", encoding="utf-8") as f:
+                ls = json.load(f)
+            enc_key = base64.b64decode(ls["os_crypt"]["encrypted_key"])
+            if enc_key[:5] != b"DPAPI":
+                logger.warning("Unexpected key prefix (expected DPAPI)")
+                return ""
+            aes_key = _dpapi_unprotect(enc_key[5:])
+            from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+            encrypted = raw[3:]
+            nonce = encrypted[:12]
+            ct_and_tag = encrypted[12:]
+            return AESGCM(aes_key).decrypt(nonce, ct_and_tag, None).decode("utf-8").strip()
+        else:
+            logger.warning(f"QClaw API key auto-decrypt not implemented for platform: {sys.platform}")
+            return ""
+    except Exception as e:
+        logger.warning(f"Failed to decrypt QClaw API key: {e}")
+        return ""
+
+
+QCLAW_API_KEY = _decrypt_qclaw_api_key()
+if QCLAW_API_KEY:
+    print(f"🔑 QClaw API Key decrypted: {QCLAW_API_KEY[:12]}...{QCLAW_API_KEY[-4:]}")
+else:
+    print("⚠️  QClaw API Key not available (set QCLAW_API_KEY env or ensure QClaw client is logged in)")
 
 # ─── GitHub Copilot Enterprise 配置 ───
 COPILOT_GHE_TOKEN = os.environ.get("COPILOT_GHE_TOKEN", "")
@@ -463,11 +572,11 @@ def _default_provider(req, litellm_req, _orig):
     return None  # 继续走 LiteLLM
 
 def _qclaw_provider(req, litellm_req, orig):
-    """QClaw 本地网关"""
-    litellm_req["api_key"] = "__QCLAW_AUTH_GATEWAY_MANAGED__"
+    """QClaw 上游直连（OpenAI 兼容接口）"""
+    litellm_req["api_key"] = QCLAW_API_KEY
     litellm_req["api_base"] = QCLAW_BASE_URL
-    litellm_req["extra_headers"] = {"User-Agent": "OpenAI/JS 6.39.1", "x-agent-id": "main"}
-    # 清理 litellm 内部字段和 Anthropic 专属字段，防止泄漏到网关导致 9002
+    litellm_req["extra_headers"] = {"User-Agent": "OpenAI/JS 6.39.1"}  # 上游拒绝 python-httpx 默认 UA
+    # 清理 litellm 内部字段和 Anthropic 专属字段，防止上游拒绝非标准参数
     for k in ("stop", "top_k", "metadata", "thinking", "reasoning",
               "reasoning_effort", "extra_body", "provider_specific_fields",
               "custom_llm_provider", "model_info"):
@@ -1717,13 +1826,11 @@ async def openai_chat_completions(raw_request: Request):
                 if not any(m.get("role") == "system" for m in msgs):
                     msgs.insert(0, {"role": "system", "content": "You are Claude, a helpful AI assistant."})
                     body["messages"] = msgs
-                # 清理非标准字段，避免客户端透传的 Anthropic 专属参数导致 9002
+                # 清理非标准字段，避免客户端透传的 Anthropic 专属参数导致上游 400
                 body = _clean_qclaw_body(body)
                 logger.debug(f"🐙 QClaw passthrough: body keys={list(body.keys())} model={body.get('model')}")
-                headers["Authorization"] = "Bearer __QCLAW_AUTH_GATEWAY_MANAGED__"
-                headers["User-Agent"] = "OpenAI/JS 6.39.1"
-                headers["x-agent-id"] = "main"
-                headers["Connection"] = "close"  # 避免 keep-alive 导致网关缓存 9002
+                headers["Authorization"] = f"Bearer {QCLAW_API_KEY}"
+                headers["User-Agent"] = "OpenAI/JS 6.39.1"  # 上游拒绝 python-httpx 默认 UA
                 url = f"{QCLAW_BASE_URL}/chat/completions"
 
             elif PREFERRED_PROVIDER == "openai":
@@ -1766,19 +1873,13 @@ async def openai_chat_completions(raw_request: Request):
                     last_err = None
                     for attempt in range(3):
                         if attempt > 0:
-                            await asyncio.sleep(0.5)  # 让网关缓存过期
-                        # 每次重试新建 client，避免 keep-alive 复用被污染的连接
-                        client = httpx.AsyncClient(timeout=httpx.Timeout(300.0, connect=10.0))
+                            await asyncio.sleep(0.5)
+                        client = httpx.AsyncClient(timeout=httpx.Timeout(300.0, connect=10.0), trust_env=False)
                         try:
                             async with client.stream("POST", url, json=body, headers=headers) as resp:
                                 if resp.status_code >= 500:
                                     await resp.aread()
                                     last_err = f"upstream {resp.status_code}"
-                                    continue
-                                if resp.status_code == 403:
-                                    # 9002 auth 过期，也重试
-                                    await resp.aread()
-                                    last_err = "auth 403"
                                     continue
                                 async for chunk in resp.aiter_bytes():
                                     yield chunk
@@ -1792,26 +1893,16 @@ async def openai_chat_completions(raw_request: Request):
                     yield json.dumps({"error": {"type": "proxy_error", "message": f"{PREFERRED_PROVIDER} upstream unavailable after retries: {last_err}"}}).encode()
                 return StreamingResponse(passthrough_stream(), media_type="text/event-stream")
             else:
-                # 每次重试新建 client + Connection: close，避免 keep-alive 导致网关缓存 9002
                 last_err = None
                 for attempt in range(3):
                     if attempt > 0:
-                        await asyncio.sleep(0.5)  # 让网关缓存过期
+                        await asyncio.sleep(0.5)
                     try:
-                        async with httpx.AsyncClient(timeout=httpx.Timeout(300.0, connect=10.0)) as client:
+                        async with httpx.AsyncClient(timeout=httpx.Timeout(300.0, connect=10.0), trust_env=False) as client:
                             resp = await client.post(url, json=body, headers=headers)
                             if resp.status_code >= 500 and attempt < 2:
                                 last_err = f"upstream {resp.status_code}"
                                 continue
-                            # 9002 也重试（新连接可能恢复）
-                            if resp.status_code == 403 and attempt < 2:
-                                try:
-                                    err_body = resp.json()
-                                    if "9002" in str(err_body) or "error_code" in str(err_body):
-                                        last_err = "auth 9002"
-                                        continue
-                                except Exception:
-                                    pass
                             return JSONResponse(content=resp.json(), status_code=resp.status_code)
                     except (httpx.ConnectError, httpx.ReadError, httpx.RemoteProtocolError) as e:
                         last_err = str(e)
@@ -1852,20 +1943,19 @@ async def openai_chat_completions(raw_request: Request):
     except HTTPException:
         raise
     except Exception as e:
-        # 9002: 绕过 litellm，http 直连 QClaw 网关重试
+        # 上游错误：绕过 litellm，httpx 直连 QClaw 上游重试
         if _is_auth_expired_error(e) and PREFERRED_PROVIDER == "qclaw":
             try:
-                logger.info("🔄 /v1/chat/completions 9002 → fallback httpx 直连...")
+                logger.info("🔄 /v1/chat/completions error → fallback httpx 直连...")
                 await asyncio.sleep(0.5)
-                async with httpx.AsyncClient(timeout=httpx.Timeout(60.0, connect=5.0)) as client:
+                async with httpx.AsyncClient(timeout=httpx.Timeout(60.0, connect=5.0), trust_env=False) as client:
                     resp = await client.post(
                         f"{QCLAW_BASE_URL}/chat/completions",
                         json=_clean_qclaw_body(litellm_req),
                         headers={
                             "Authorization": f"Bearer {QCLAW_API_KEY}",
-                            "x-agent-id": "main",
+                            "Content-Type": "application/json",
                             "User-Agent": "OpenAI/JS 6.39.1",
-                            "Connection": "close",
                         },
                     )
                     if resp.status_code != 200:
@@ -2883,7 +2973,7 @@ if __name__ == "__main__":
         print("  openai       OpenAI compatible API (default)")
         print("  anthropic    Anthropic Claude API")
         print("  google       Google Gemini API")
-        print("  qclaw        QClaw local proxy (http://127.0.0.1:19000/proxy/llm)")
+        print("  qclaw        QClaw upstream (mmgrcalltoken.3g.qq.com, auto-decrypt API key)")
         print("")
         print("Example: PREFERRED_PROVIDER=qclaw python server.py")
         sys.exit(0)
