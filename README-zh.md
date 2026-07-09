@@ -198,12 +198,30 @@ tail -f /tmp/proxy.log
 
 ## 测试
 
+统一测试套件 [test_suite.py](test_suite.py)，整合自历史三个文件（`test_claude_api.py` / `test_messages_endpoint.py` / `tests.py`），覆盖翻译链路 `/v1/messages` 和透传链路 `/v1/chat/completions`。
+
 ```bash
-# 启动服务后运行完整兼容性测试（含 OpenAI 端点）
-python test_claude_api.py
+# 启动服务后运行全部测试（15 大类，38 个测试点）
+python test_suite.py
+
+# 分场景运行
+python test_suite.py --simple       # 基础场景：连通性/模型名/system/消息格式
+python test_suite.py --tools        # 工具 + thinking + 错误处理
+python test_suite.py --oai          # 仅 OpenAI 透传端点
+python test_suite.py --no-streaming # 跳过流式测试
 ```
 
-测试覆盖：连通性、模型名还原、System Prompt、流式响应、多轮对话、参数透传、Stop Sequences、Tools、Token 计数、**OpenAI `/v1/chat/completions` 端点**（12 个场景）。
+环境变量可覆盖默认模型名（QClaw 模式用 `pool-*`）：
+
+```bash
+PREFERRED_PROVIDER=qclaw \
+BIG_MODEL=pool-glm-5.2 \
+MEDIUM_MODEL=pool-deepseek-v4-pro \
+SMALL_MODEL=pool-deepseek-v4-flash \
+python test_suite.py
+```
+
+测试覆盖：连通性、模型名还原、System Prompt、流式 SSE 事件序列、多轮对话、参数透传、Stop Sequences、Tools、Tool Choice、**Thinking**（adaptive/enabled/budget/历史 422 bug/工具组合）、Token 计数、错误处理、性能基准、**OpenAI `/v1/chat/completions` 透传端点**（11 个场景）。
 
 ---
 

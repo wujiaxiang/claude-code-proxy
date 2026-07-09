@@ -1,5 +1,35 @@
 # Changelog
 
+## 2026-07-09 (v2) — 测试套件整合
+
+### 概述
+
+将根目录三个历史测试文件整合为一个统一测试套件 `test_suite.py`，消除功能重叠，统一 QClaw 模型名适配。
+
+### 变更
+
+- **新增 `test_suite.py`**（869 行）：整合 `test_claude_api.py` / `test_messages_endpoint.py` / `tests.py`
+  - 15 大类测试场景，38 个测试点
+  - 合并 `test_messages_endpoint.py` 的 thinking 场景（adaptive/enabled/budget/历史 422 bug/工具组合）和 SSE 事件序列验证
+  - 合并 `tests.py` 的 argparse 支持（`--simple` / `--tools` / `--oai` / `--no-streaming`）
+  - 统一根据 `PREFERRED_PROVIDER` 动态选择模型名
+- **删除 `test_claude_api.py`**（528 行）
+- **删除 `test_messages_endpoint.py`**（262 行）
+- **删除 `tests.py`**（691 行）
+- **`README-zh.md`** 更新测试章节，反映整合后的使用方式
+
+### 文件变更
+
+| 文件 | 变更 |
+|------|------|
+| `test_suite.py` | 新增，整合三个历史测试文件 |
+| `test_claude_api.py` | 删除 |
+| `test_messages_endpoint.py` | 删除 |
+| `tests.py` | 删除 |
+| `README-zh.md` | 更新测试章节 |
+
+---
+
 ## 2026-07-09 — QClaw 上游直连 + API Key 自动解密
 
 ### 概述
