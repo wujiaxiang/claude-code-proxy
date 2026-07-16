@@ -29,11 +29,130 @@ LOG_RETENTION_DAYS = int(os.environ.get("LOG_RETENTION_DAYS", "7"))
 LOG_ROTATE_WHEN = os.environ.get("LOG_ROTATE_WHEN", "midnight")
 LOG_ROTATE_INTERVAL = int(os.environ.get("LOG_ROTATE_INTERVAL", "1"))
 
+# Response cache configuration
+CACHE_ENABLED = os.environ.get("CACHE_ENABLED", "True").lower() == "true"
+CACHE_MAX_SIZE = int(os.environ.get("CACHE_MAX_SIZE", "500"))
+CACHE_TTL_SECONDS = int(os.environ.get("CACHE_TTL_SECONDS", "3600"))
+CACHE_MAX_ITEM_SIZE_KB = int(os.environ.get("CACHE_MAX_ITEM_SIZE_KB", "100"))
+
 # Configure logging
 _log_level = logging.DEBUG if DEBUG else logging.INFO
 _log_fmt = "%(asctime)s - %(levelname)s - %(message)s"
 logging.basicConfig(level=_log_level, format=_log_fmt)
 logger = logging.getLogger(__name__)
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 本地 token 估算（tiktoken）— 上游 QClaw 网关不返回 usage，需自行估算
+# ══════════════════════════════════════════════════════════════════════════════
+import tiktoken as _tiktoken
+
+# 缓存 tokenizer 实例（每个 encoding 只加载一次）
+_TIKTOKEN_CACHE: Dict[str, "_tiktoken.Encoding"] = {}
+
+
+def _get_tokenizer(model_name: str) -> "_tiktoken.Encoding":
+    """根据模型名选合适的 tokenizer。
+
+    QClaw 透传模型（DeepSeek/GLM/Kimi/MiniMax）以及 Claude 都用 cl100k_base 做近似估算——
+    这是经验上最接近的通用 tokenizer，估算误差通常在 ±10% 内，足够给 Claude Code 显示用量。
+    """
+    cache_key = "cl100k_base"
+    if cache_key not in _TIKTOKEN_CACHE:
+        try:
+            _TIKTOKEN_CACHE[cache_key] = _tiktoken.get_encoding(cache_key)
+        except Exception as _e:
+            logger.warning(f"Failed to load tiktoken encoding {cache_key}: {_e}")
+            _TIKTOKEN_CACHE[cache_key] = None  # type: ignore
+    return _TIKTOKEN_CACHE[cache_key]
+
+
+def _extract_text_from_content(content: Any) -> str:
+    """从 messages 的 content 字段（可能是 str / list[dict]）抽出纯文本用于估算。"""
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: List[str] = []
+        for block in content:
+            if isinstance(block, dict):
+                t = block.get("type")
+                if t == "text":
+                    parts.append(block.get("text", ""))
+                elif t == "thinking":
+                    parts.append(block.get("thinking", ""))
+                elif t == "tool_use":
+                    # 工具调用：序列化 input + name
+                    try:
+                        parts.append(block.get("name", ""))
+                        parts.append(json.dumps(block.get("input", {}), ensure_ascii=False))
+                    except Exception:
+                        pass
+                elif t == "tool_result":
+                    # 工具结果：递归抽 text
+                    parts.append(_extract_text_from_content(block.get("content", "")))
+            elif isinstance(block, str):
+                parts.append(block)
+        return "\n".join(parts)
+    try:
+        return json.dumps(content, ensure_ascii=False)
+    except Exception:
+        return str(content)
+
+
+def _estimate_messages_tokens(messages: List[Any], model: str = "", system: Any = None, tools: Optional[List[Any]] = None) -> int:
+    """估算 Anthropic/OpenAI messages 的输入 token 数。
+
+    估算规则（参考 OpenAI 官方公式）：
+        tokens = sum(每条 message: 4 + role + text) + 3 (priming)
+    system / tools 单独累加。
+    """
+    enc = _get_tokenizer(model)
+    if enc is None:
+        # fallback：粗略按 4 字符 / token 估算
+        total_chars = 0
+        for m in messages:
+            total_chars += len(_extract_text_from_content(getattr(m, "content", None) if not isinstance(m, dict) else m.get("content")))
+        if system:
+            total_chars += len(_extract_text_from_content(system))
+        return max(1, total_chars // 4)
+
+    total = 3  # priming
+    if system:
+        sys_text = _extract_text_from_content(system)
+        total += 4 + len(enc.encode(sys_text))
+    if tools:
+        for tool in tools:
+            try:
+                # tool 可能是 Pydantic 对象或 dict
+                if hasattr(tool, "model_dump"):
+                    tool_dict = tool.model_dump()
+                else:
+                    tool_dict = tool
+                total += 4 + len(enc.encode(json.dumps(tool_dict, ensure_ascii=False)))
+            except Exception:
+                pass
+    for m in messages:
+        # m 可能是 dict 或 Pydantic Message
+        if isinstance(m, dict):
+            role = m.get("role", "")
+            content = m.get("content")
+        else:
+            role = getattr(m, "role", "")
+            content = getattr(m, "content", None)
+        text = _extract_text_from_content(content)
+        total += 4 + len(enc.encode(role)) + len(enc.encode(text))
+    return total
+
+
+def _estimate_text_tokens(text: str, model: str = "") -> int:
+    """估算单段文本的 token 数（用于 output_tokens）。"""
+    if not text:
+        return 0
+    enc = _get_tokenizer(model)
+    if enc is None:
+        return max(1, len(text) // 4)
+    return len(enc.encode(text))
 
 def _cleanup_old_log_files(log_file: str, retention_days: int):
     if not log_file or retention_days <= 0:
@@ -196,6 +315,7 @@ _QCLAW_ALLOWED_KEYS = {
     "stream", "temperature", "top_p", "stop", "tools", "tool_choice",
     "frequency_penalty", "presence_penalty", "n", "user", "seed",
     "logprobs", "top_logprobs", "response_format", "logit_bias",
+    "cache_control",
 }
 
 def _clean_qclaw_body(body: dict) -> dict:
@@ -301,8 +421,29 @@ def _convert_oai_to_anthropic(oai_data: dict, request, original_model: str):  # 
             "input": inp,
         })
 
-    # usage
-    usage = oai_data.get("usage", {})
+    # usage — QClaw 网关不返回 usage，缺失时用 tiktoken 本地估算
+    usage = oai_data.get("usage") or {}
+    prompt_tokens = usage.get("prompt_tokens") or 0
+    completion_tokens = usage.get("completion_tokens") or 0
+    if prompt_tokens == 0 or completion_tokens == 0:
+        # 估算 input：从 request.messages + system + tools
+        try:
+            req_msgs = getattr(request, "messages", []) or []
+            req_system = getattr(request, "system", None)
+            req_tools = getattr(request, "tools", None)
+            est_in = _estimate_messages_tokens(req_msgs, original_model, req_system, req_tools)
+            if prompt_tokens == 0:
+                prompt_tokens = est_in
+        except Exception as _e:
+            logger.debug(f"tiktoken input estimate failed: {_e}")
+        # 估算 output：从响应 content_blocks 抽文本
+        if completion_tokens == 0:
+            try:
+                out_text = _extract_text_from_content(content_blocks)
+                completion_tokens = _estimate_text_tokens(out_text, original_model)
+            except Exception as _e:
+                logger.debug(f"tiktoken output estimate failed: {_e}")
+
     return MessagesResponse(
         id=f"msg_{uuid.uuid4().hex[:12]}",
         type="message",
@@ -312,8 +453,8 @@ def _convert_oai_to_anthropic(oai_data: dict, request, original_model: str):  # 
         stop_reason=choice.get("finish_reason") or "stop",
         stop_sequence=None,
         usage=Usage(
-            input_tokens=usage.get("prompt_tokens", 0),
-            output_tokens=usage.get("completion_tokens", 0),
+            input_tokens=prompt_tokens,
+            output_tokens=completion_tokens,
         ),
     )
 
@@ -329,12 +470,13 @@ async def lifespan(app):
         except Exception as _ce:
             logger.warning(f"Failed to activate gateway capture: {_ce}")
 
-    # 启动诊断：验证直连 QClaw 上游是否正常
+    # 启动诊断：验证 QClaw 链路是否正常
     import httpx as _httpx
+    _qclaw_diag_base = QCLAW_LOCAL_BASE_URL if PREFERRED_PROVIDER == "qclaw-local" else QCLAW_BASE_URL
     try:
         async with _httpx.AsyncClient(timeout=_httpx.Timeout(10.0), trust_env=False) as _diag:
             _r = await _diag.post(
-                f"{QCLAW_BASE_URL}/chat/completions",
+                f"{_qclaw_diag_base}/chat/completions",
                 json={"model": "pool-deepseek-v4-flash", "messages": [{"role": "system", "content": "hi"}, {"role": "user", "content": "hi"}], "max_tokens": 5},
                 headers={"Authorization": f"Bearer {QCLAW_API_KEY}", "Content-Type": "application/json", "User-Agent": "OpenAI/JS 6.39.1"},
             )
@@ -390,6 +532,9 @@ USE_VERTEX_AUTH = os.environ.get("USE_VERTEX_AUTH", "False").lower() == "true"
 # ─── QClaw 上游直连配置 ───
 # 上游 LLM 接口（OpenAI 兼容），从 QClaw 客户端本地存储解密 API Key
 QCLAW_BASE_URL = os.environ.get("QCLAW_BASE_URL", "https://mmgrcalltoken.3g.qq.com/aizone/v1")
+# qclaw-local: 走 QClaw 进程内转发服务器（19001），绕过 19000 网关签名
+# 需先运行 _inject_forward_server.js 在 QClaw 进程内注入转发服务器
+QCLAW_LOCAL_BASE_URL = os.environ.get("QCLAW_LOCAL_BASE_URL", "http://127.0.0.1:19001")
 
 
 def _dpapi_unprotect(encrypted_bytes: bytes) -> bytes:
@@ -503,7 +648,7 @@ COPILOT_SMALL_MODEL  = os.environ.get("COPILOT_SMALL_MODEL",  "claude-haiku-4.5"
 
 # Get preferred provider
 PREFERRED_PROVIDER = os.environ.get("PREFERRED_PROVIDER", "openai").lower()
-valid_providers = ("openai", "anthropic", "qclaw", "gemini", "gemini-openai", "copilot")
+valid_providers = ("openai", "anthropic", "qclaw", "qclaw-local", "gemini", "gemini-openai", "copilot")
 if PREFERRED_PROVIDER not in valid_providers:
     print(f"Warning: Unknown PREFERRED_PROVIDER '{PREFERRED_PROVIDER}', falling back to 'openai'")
     PREFERRED_PROVIDER = "openai"
@@ -511,7 +656,7 @@ if PREFERRED_PROVIDER not in valid_providers:
 print(f"🚀 Preferred provider: {PREFERRED_PROVIDER}")
 
 # 注册 QClaw 模型到 LiteLLM，避免 "model isn't mapped" 错误
-if PREFERRED_PROVIDER == "qclaw":
+if PREFERRED_PROVIDER in ("qclaw", "qclaw-local"):
     _qclaw_all_models = {
         m: {
             "max_tokens": 16384, "input_cost_per_token": 0, "output_cost_per_token": 0,
@@ -574,7 +719,7 @@ def _default_provider(req, litellm_req, _orig):
 def _qclaw_provider(req, litellm_req, orig):
     """QClaw 上游直连（OpenAI 兼容接口）"""
     litellm_req["api_key"] = QCLAW_API_KEY
-    litellm_req["api_base"] = QCLAW_BASE_URL
+    litellm_req["api_base"] = QCLAW_LOCAL_BASE_URL if PREFERRED_PROVIDER == "qclaw-local" else QCLAW_BASE_URL
     litellm_req["extra_headers"] = {"User-Agent": "OpenAI/JS 6.39.1"}  # 上游拒绝 python-httpx 默认 UA
     # 清理 litellm 内部字段和 Anthropic 专属字段，防止上游拒绝非标准参数
     for k in ("stop", "top_k", "metadata", "thinking", "reasoning",
@@ -669,6 +814,7 @@ def _copilot_provider(req, litellm_req, orig):
 _PROVIDER_STRATEGIES = {
     "openai": _default_provider,
     "qclaw": _qclaw_provider,
+    "qclaw-local": _qclaw_provider,
     "anthropic": _anthropic_provider,
     "gemini": _gemini_provider,
     "gemini-openai": _gemini_provider,
@@ -845,6 +991,7 @@ class MessagesRequest(BaseModel):
     tool_choice: Optional[Dict[str, Any]] = None
     thinking: Optional[ThinkingConfig] = None
     original_model: Optional[str] = None  # Will store the original model name
+    cache_control: Optional[Dict[str, Any]] = None
 
     @field_validator("model")
     def validate_model_field(cls, v, info):  # Renamed to avoid conflict
@@ -1452,6 +1599,9 @@ def convert_anthropic_to_litellm(anthropic_request: MessagesRequest) -> Dict[str
     if anthropic_request.top_k and PREFERRED_PROVIDER in ("anthropic", "gemini", "gemini-openai"):
         litellm_request["top_k"] = anthropic_request.top_k
 
+    if anthropic_request.cache_control:
+        litellm_request["cache_control"] = anthropic_request.cache_control
+
     # Convert tools to OpenAI format
     if anthropic_request.tools:
         openai_tools = []
@@ -1715,11 +1865,27 @@ def convert_litellm_to_anthropic(
 
         # Get usage information - extract values safely from object or dict
         if isinstance(usage_info, dict):
-            prompt_tokens = usage_info.get("prompt_tokens", 0)
-            completion_tokens = usage_info.get("completion_tokens", 0)
+            prompt_tokens = usage_info.get("prompt_tokens", 0) or 0
+            completion_tokens = usage_info.get("completion_tokens", 0) or 0
         else:
-            prompt_tokens = getattr(usage_info, "prompt_tokens", 0)
-            completion_tokens = getattr(usage_info, "completion_tokens", 0)
+            prompt_tokens = getattr(usage_info, "prompt_tokens", 0) or 0
+            completion_tokens = getattr(usage_info, "completion_tokens", 0) or 0
+
+        # QClaw 网关不返回 usage → 用 tiktoken 本地估算
+        if prompt_tokens == 0 or completion_tokens == 0:
+            try:
+                if prompt_tokens == 0:
+                    prompt_tokens = _estimate_messages_tokens(
+                        getattr(original_request, "messages", []) or [],
+                        original_request.model,
+                        getattr(original_request, "system", None),
+                        getattr(original_request, "tools", None),
+                    )
+                if completion_tokens == 0:
+                    out_text = _extract_text_from_content(content)
+                    completion_tokens = _estimate_text_tokens(out_text, original_request.model)
+            except Exception as _e:
+                logger.debug(f"tiktoken estimate failed in convert_litellm_to_anthropic: {_e}")
 
         # Map OpenAI finish_reason to Anthropic stop_reason
         stop_reason = None
@@ -1806,7 +1972,7 @@ async def openai_chat_completions(raw_request: Request):
         is_stream = body.get("stream", False)
 
         # ── 透传模式：qclaw / openai / copilot / gemini-openai ──
-        _PASSTHROUGH_PROVIDERS = ("qclaw", "openai", "copilot", "gemini-openai")
+        _PASSTHROUGH_PROVIDERS = ("qclaw", "qclaw-local", "openai", "copilot", "gemini-openai")
         if PREFERRED_PROVIDER in _PASSTHROUGH_PROVIDERS:
             passthrough_model = req_model
             # 去掉 provider 前缀（如果有）
@@ -1819,7 +1985,7 @@ async def openai_chat_completions(raw_request: Request):
             headers = {"Content-Type": "application/json"}
             url = ""
 
-            if PREFERRED_PROVIDER == "qclaw":
+            if PREFERRED_PROVIDER in ("qclaw", "qclaw-local"):
                 body["model"] = passthrough_model
                 # QClaw 网关要求必须有 system message
                 msgs = body.get("messages", [])
@@ -1831,7 +1997,8 @@ async def openai_chat_completions(raw_request: Request):
                 logger.debug(f"🐙 QClaw passthrough: body keys={list(body.keys())} model={body.get('model')}")
                 headers["Authorization"] = f"Bearer {QCLAW_API_KEY}"
                 headers["User-Agent"] = "OpenAI/JS 6.39.1"  # 上游拒绝 python-httpx 默认 UA
-                url = f"{QCLAW_BASE_URL}/chat/completions"
+                _qclaw_base = QCLAW_LOCAL_BASE_URL if PREFERRED_PROVIDER == "qclaw-local" else QCLAW_BASE_URL
+                url = f"{_qclaw_base}/chat/completions"
 
             elif PREFERRED_PROVIDER == "openai":
                 body["model"] = passthrough_model
@@ -1903,7 +2070,37 @@ async def openai_chat_completions(raw_request: Request):
                             if resp.status_code >= 500 and attempt < 2:
                                 last_err = f"upstream {resp.status_code}"
                                 continue
-                            return JSONResponse(content=resp.json(), status_code=resp.status_code)
+                            # QClaw 网关不返回 usage → 用 tiktoken 本地估算后注入
+                            try:
+                                resp_data = resp.json()
+                            except Exception:
+                                return JSONResponse(content={"error": "invalid upstream JSON"}, status_code=502)
+                            if isinstance(resp_data, dict) and not resp_data.get("usage"):
+                                try:
+                                    est_in = _estimate_messages_tokens(
+                                        body.get("messages", []) or [],
+                                        body.get("model", req_model),
+                                    )
+                                    # 抽出响应文本用于估算 output
+                                    _choices = resp_data.get("choices") or [{}]
+                                    _msg = _choices[0].get("message", {}) if _choices else {}
+                                    _out_text = _msg.get("content", "") or ""
+                                    if _msg.get("reasoning_content"):
+                                        _out_text += _msg.get("reasoning_content")
+                                    for _tc in _msg.get("tool_calls", []) or []:
+                                        try:
+                                            _out_text += json.dumps(_tc.get("function", {}).get("arguments", ""), ensure_ascii=False)
+                                        except Exception:
+                                            pass
+                                    est_out = _estimate_text_tokens(_out_text, body.get("model", req_model))
+                                    resp_data["usage"] = {
+                                        "prompt_tokens": est_in,
+                                        "completion_tokens": est_out,
+                                        "total_tokens": est_in + est_out,
+                                    }
+                                except Exception as _e:
+                                    logger.debug(f"tiktoken passthrough estimate failed: {_e}")
+                            return JSONResponse(content=resp_data, status_code=resp.status_code)
                     except (httpx.ConnectError, httpx.ReadError, httpx.RemoteProtocolError) as e:
                         last_err = str(e)
                         continue
@@ -1997,6 +2194,18 @@ async def handle_streaming(
         # Send message_start event
         message_id = f"msg_{uuid.uuid4().hex[:24]}"  # Format similar to Anthropic's IDs
 
+        # QClaw 网关不返回 usage，message_start 阶段提前用 tiktoken 估算 input_tokens
+        try:
+            est_input_tokens = _estimate_messages_tokens(
+                getattr(original_request, "messages", []) or [],
+                original_model_name or original_request.model,
+                getattr(original_request, "system", None),
+                getattr(original_request, "tools", None),
+            )
+        except Exception as _e:
+            logger.debug(f"tiktoken input estimate (stream) failed: {_e}")
+            est_input_tokens = 0
+
         message_data = {
             "type": "message_start",
             "message": {
@@ -2008,7 +2217,7 @@ async def handle_streaming(
                 "stop_reason": None,
                 "stop_sequence": None,
                 "usage": {
-                    "input_tokens": 0,
+                    "input_tokens": est_input_tokens,
                     "cache_creation_input_tokens": 0,
                     "cache_read_input_tokens": 0,
                     "output_tokens": 0,
@@ -2043,7 +2252,7 @@ async def handle_streaming(
         thinking_block_started = False  # Track if thinking content block has been started
         accumulated_reasoning = ""  # Track accumulated reasoning content
         text_block_index = 0  # Track current text block index (0 if no thinking, 1 if after thinking)
-        input_tokens = 0
+        input_tokens = est_input_tokens  # 已用 tiktoken 估算（上游 QClaw 不返回）
         output_tokens = 0
         has_sent_stop_reason = False
         last_tool_index = 0
@@ -2312,6 +2521,26 @@ async def handle_streaming(
                             stop_reason = "end_turn"
 
                         # Send message_delta with stop reason and usage
+                        # 上游 QClaw 不返回 usage → 用 tiktoken 估算 output_tokens
+                        if output_tokens == 0:
+                            try:
+                                _est_text = (
+                                    accumulated_text
+                                    + (accumulated_reasoning if thinking_enabled else "")
+                                    + "".join(tool_json_buffers.values())
+                                )
+                                output_tokens = _estimate_text_tokens(
+                                    _est_text,
+                                    original_model_name or original_request.model,
+                                )
+                                logger.debug(
+                                    f"STREAM EARLY-EXIT ESTIMATE: acc_text_len={len(accumulated_text)} "
+                                    f"acc_reasoning_len={len(accumulated_reasoning)} "
+                                    f"thinking_enabled={thinking_enabled} "
+                                    f"est_output_tokens={output_tokens}"
+                                )
+                            except Exception as _e:
+                                logger.debug(f"tiktoken output estimate (stream early-exit) failed: {_e}")
                         usage = {"output_tokens": output_tokens}
 
                         yield f"event: message_delta\ndata: {json.dumps({'type': 'message_delta', 'delta': {'stop_reason': stop_reason, 'stop_sequence': None}, 'usage': usage})}\n\n"
@@ -2367,6 +2596,26 @@ async def handle_streaming(
                     pass
 
             # Send final message_delta with usage
+            # 上游 QClaw 不返回 usage → 用 tiktoken 估算 output_tokens
+            if output_tokens == 0:
+                try:
+                    output_accumulated_text = (
+                        accumulated_text
+                        + (accumulated_reasoning if thinking_enabled else "")
+                        + "".join(tool_json_buffers.values())
+                    )
+                    output_tokens = _estimate_text_tokens(
+                        output_accumulated_text,
+                        original_model_name or original_request.model,
+                    )
+                    logger.debug(
+                        f"STREAM FINAL ESTIMATE: acc_text_len={len(accumulated_text)} "
+                        f"acc_reasoning_len={len(accumulated_reasoning)} "
+                        f"thinking_enabled={thinking_enabled} "
+                        f"est_output_tokens={output_tokens}"
+                    )
+                except Exception as _e:
+                    logger.debug(f"tiktoken output estimate (stream final) failed: {_e}")
             usage = {"output_tokens": output_tokens}
 
             yield f"event: message_delta\ndata: {json.dumps({'type': 'message_delta', 'delta': {'stop_reason': 'end_turn', 'stop_sequence': None}, 'usage': usage})}\n\n"
@@ -2444,9 +2693,9 @@ async def handle_qclaw_streaming(qclaw_response, display_model: str):
     # content_block_stop
     yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': 0})}\n\n".encode()
 
-    # message_delta
+    # message_delta — 用 tiktoken 估算 output_tokens（之前是 len(split()) 太粗）
     stop_reason = "end_turn"
-    usage = {"output_tokens": len(accumulated.split())}
+    usage = {"output_tokens": _estimate_text_tokens(accumulated, display_model)}
     yield f"event: message_delta\ndata: {json.dumps({'type': 'message_delta', 'delta': {'stop_reason': stop_reason, 'stop_sequence': None}, 'usage': usage})}\n\n".encode()
 
     # message_stop
@@ -2842,8 +3091,17 @@ async def count_tokens(request: TokenCountRequest, raw_request: Request):
 
         except ImportError:
             logger.error("Could not import token_counter from litellm")
-            # Fallback to a simple approximation
-            return TokenCountResponse(input_tokens=1000)  # Default fallback
+            # Fallback：用 tiktoken 本地估算（之前硬编码 1000 误差太大）
+            try:
+                est = _estimate_messages_tokens(
+                    converted_request.get("messages", []) or [],
+                    converted_request.get("model", request.model),
+                    system=getattr(request, "system", None),
+                    tools=getattr(request, "tools", None),
+                )
+                return TokenCountResponse(input_tokens=est)
+            except Exception:
+                return TokenCountResponse(input_tokens=1000)  # 终极兜底
 
     except Exception as e:
         import traceback
@@ -2853,36 +3111,87 @@ async def count_tokens(request: TokenCountRequest, raw_request: Request):
         raise HTTPException(status_code=500, detail=f"Error counting tokens: {str(e)}")
 
 
+def _build_models_list():
+    """构建模型列表，同时兼容 OpenAI 和 Anthropic 两套规范。
+
+    OpenAI 客户端读 object/owned_by，Anthropic 客户端读 type/display_name，
+    两套字段都塞进去，各取所需。
+    """
+    models = []
+
+    # ── 翻译链路别名（Claude Code 等 Anthropic 客户端用）──
+    _claude_aliases = [
+        ("claude-sonnet-4-20250514", "Claude Sonnet 4"),
+        ("claude-haiku-4-20250514", "Claude Haiku 4"),
+        ("claude-opus-4-20250514", "Claude Opus 4"),
+        ("sonnet", "Claude Sonnet"),
+        ("haiku", "Claude Haiku"),
+        ("opus", "Claude Opus"),
+    ]
+
+    # ── 透传链路真实模型（根据 provider 动态选择）──
+    _passthrough_models = []
+    if PREFERRED_PROVIDER in ("qclaw", "qclaw-local"):
+        _passthrough_models = [
+            ("modelroute", "QClaw Model Route"),
+            ("pool-deepseek-v4-pro", "DeepSeek V4 Pro"),
+            ("pool-deepseek-v4-flash", "DeepSeek V4 Flash"),
+            ("pool-glm-5.2", "GLM 5.2"),
+            ("pool-glm-5.1", "GLM 5.1"),
+            ("pool-kimi-k2.7-code-highspeed", "Kimi K2.7 Code"),
+            ("pool-kimi-k2.6", "Kimi K2.6"),
+            ("pool-minimax-m3", "MiniMax M3"),
+            ("pool-minimax-m2.7", "MiniMax M2.7"),
+        ]
+    elif PREFERRED_PROVIDER == "copilot":
+        _passthrough_models = [
+            (COPILOT_BIG_MODEL, "Copilot Big"),
+            (COPILOT_MEDIUM_MODEL, "Copilot Medium"),
+            (COPILOT_SMALL_MODEL, "Copilot Small"),
+        ]
+
+    for mid, display in _claude_aliases + _passthrough_models:
+        models.append({
+            "id": mid,
+            "object": "model",          # OpenAI 字段
+            "type": "model",            # Anthropic 字段
+            "created": 1700000000,      # OpenAI 字段
+            "owned_by": "anthropic" if mid.startswith("claude") or mid in ("sonnet", "haiku", "opus") else "qclaw",
+            "display_name": display,    # Anthropic 字段
+        })
+
+    return models
+
+
 @app.get("/v1/models")
+@app.get("/api/v1/models")
+@app.get("/openai/v1/models")
 async def list_models():
-    """返回模型列表，Claude Code 需要这个端点来初始化"""
+    """返回模型列表，兼容 OpenAI 和 Anthropic 两套规范。
+
+    各种 OpenAI 兼容工具（Cline/aider/Continue/openclaw 等）会用不同路径探测模型列表，
+    所以同时挂载 /v1/models、/api/v1/models、/openai/v1/models 三个路由。
+    """
     return {
-        "data": [
-            {
-                "id": "claude-sonnet-4-20250514",
-                "object": "model",
-                "created": 1700000000,
-                "owned_by": "anthropic",
-                "type": "model",
-            },
-            {
-                "id": "claude-haiku-4-20250514",
-                "object": "model",
-                "created": 1700000000,
-                "owned_by": "anthropic",
-                "type": "model",
-            },
-            {
-                "id": "claude-opus-4-20250514",
-                "object": "model",
-                "created": 1700000000,
-                "owned_by": "anthropic",
-                "type": "model",
-            },
-        ],
+        "data": _build_models_list(),
         "object": "list",
         "has_more": False,
     }
+
+
+@app.get("/api/tags")
+async def list_ollama_tags():
+    """Ollama 风格的模型列表（部分工具如 openclaw 会探测 /api/tags）。"""
+    models = []
+    for m in _build_models_list():
+        models.append({
+            "name": m["id"],
+            "model": m["id"],
+            "modified_at": "2024-01-01T00:00:00Z",
+            "size": 0,
+            "details": {"family": "qclaw", "parameter_size": "unknown"},
+        })
+    return {"models": models}
 
 
 @app.get("/")
@@ -2974,6 +3283,7 @@ if __name__ == "__main__":
         print("  anthropic    Anthropic Claude API")
         print("  google       Google Gemini API")
         print("  qclaw        QClaw upstream (mmgrcalltoken.3g.qq.com, auto-decrypt API key)")
+        print("  qclaw-local  QClaw via 19001 parasitic forward server (needs qclaw_inject.js)")
         print("")
         print("Example: PREFERRED_PROVIDER=qclaw python server.py")
         sys.exit(0)
