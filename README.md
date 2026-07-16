@@ -213,9 +213,11 @@ The proxy exposes **two endpoints**, both available for all providers:
 | **`gemini-openai`** | LiteLLM 翻译 | **直接透传** |
 | **`copilot`** | LiteLLM 翻译 | **直接透传** |
 | **`qclaw`** | LiteLLM 翻译 | **直接透传** |
+| **`qclaw-local`** | LiteLLM 翻译 | **直接透传** |
 
-> **透传模式**：`openai`、`gemini-openai`、`copilot`、`qclaw` 四个 provider 在 `/v1/chat/completions` 上直接转发请求体给后端，不做格式翻译或模型映射。各 provider 仅注入必要的认证 header 和请求体预处理：
+> **透传模式**：`openai`、`gemini-openai`、`copilot`、`qclaw`、`qclaw-local` 五个 provider 在 `/v1/chat/completions` 上直接转发请求体给后端，不做格式翻译或模型映射。各 provider 仅注入必要的认证 header 和请求体预处理：
 > - **qclaw**：去掉 `qclaw/` 前缀，自动补 system message，注入网关认证 header
+> - **qclaw-local**：同 qclaw，但走 19001 寄生服务器而非直连上游
 > - **openai**：去掉 `openai/` 前缀，注入 `Authorization: Bearer`
 > - **copilot**：模型映射（haiku/sonnet/opus → COPILOT_*_MODEL），注入 `Copilot-Integration-Id`，清理空 content 和无效 tool_choice
 > - **gemini-openai**：去掉 `gemini/` 前缀，注入 `Authorization: Bearer`
@@ -244,13 +246,13 @@ Contributions are welcome! Please feel free to submit a Pull Request. 🎁
 
 ## Environment Variables Quick Reference 🔧
 
-Copy `.env.example` to `.env` and fill in your keys. The proxy supports **6 providers** — pick one and set `PREFERRED_PROVIDER` accordingly.
+Copy `.env.example` to `.env` and fill in your keys. The proxy supports **7 providers** — pick one and set `PREFERRED_PROVIDER` accordingly.
 
 ### Common Variables
 
 | Variable | Required | Default | Description |
 |----------|----------|---------|-------------|
-| `PREFERRED_PROVIDER` | ✅ | `openai` | Active backend: `anthropic` / `gemini` / `gemini-openai` / `openai` / `qclaw` / `copilot` |
+| `PREFERRED_PROVIDER` | ✅ | `openai` | Active backend: `anthropic` / `gemini` / `gemini-openai` / `openai` / `qclaw` / `qclaw-local` / `copilot` |
 | `BIG_MODEL` | — | provider default | Maps `opus`-series requests |
 | `MEDIUM_MODEL` | — | provider default | Maps `sonnet`-series requests |
 | `SMALL_MODEL` | — | provider default | Maps `haiku`-series requests |
@@ -338,6 +340,98 @@ BIG_REASONING=high
 MEDIUM_REASONING=low
 SMALL_REASONING=low
 ```
+
+---
+
+### Provider 5b — QClaw Local Gateway via Parasitic Forward Server
+
+Bypasses the 19000 gateway's OS-level PID check by injecting a forward server into the QClaw process. Use this when `qclaw` direct upstream connection is not available or you want to route through QClaw's local gateway.
+
+**架构**：`client → server.py(8083) → 19001(parasitic server) → 19000(QClaw gateway) → upstream LLM`
+
+**背景**：QClaw v0.2.33 的 19000 网关通过 koffi FFI 调用 `GetExtendedTcpTable` 反查连接 PID，仅允许 QClaw 进程树内的请求通过。外部进程即使签名正确也会被 403。本方案通过 Electron inspector 在 QClaw 进程内注入 HTTP 服务器，借用 QClaw 自己的 axios 实例发请求。详见 [QCLAW_19000_GATEWAY_REVERSE.md](QCLAW_19000_GATEWAY_REVERSE.md)。
+
+#### 前置条件
+
+1. **QClaw 已安装并登录**（用于获取 API Key，存储在 `%APPDATA%\QClaw\app-store.json`）
+2. **QClaw 以 `--inspect=9229` 模式启动**（默认不开启 inspector）
+3. **Node.js 可用**（QClaw 自带：`C:\Program Files\QClaw\v0.2.33.617\resources\node\node.exe`）
+
+#### 部署步骤（Windows / PowerShell）
+
+**步骤 1：以调试模式启动 QClaw**
+
+关闭当前 QClaw，然后用以下命令启动（或在 QClaw 快捷方式目标后追加 `--inspect=9229`）：
+
+```powershell
+& "C:\Program Files\QClaw\v0.2.33.617\QClaw.exe" --inspect=9229
+```
+
+验证 inspector 已开启：
+
+```powershell
+# 应返回 JSON 列表，包含 webSocketDebuggerUrl 字段
+Invoke-RestMethod http://127.0.0.1:9229/json
+```
+
+**步骤 2：注入寄生转发服务器**
+
+```powershell
+& "C:\Program Files\QClaw\v0.2.33.617\resources\node\node.exe" qclaw_inject.js
+```
+
+预期输出：
+
+```
+[qclaw_inject] ✅ Forward server injected successfully
+[qclaw_inject]    Port: 19001
+[qclaw_inject]    Now set PREFERRED_PROVIDER=qclaw-local and start server.py
+```
+
+验证 19001 端口已监听：
+
+```powershell
+Get-NetTCPConnection -LocalPort 19001 -State Listen
+```
+
+**步骤 3：启动代理服务**
+
+```powershell
+$env:PREFERRED_PROVIDER = "qclaw-local"
+$env:PORT = "8083"  # 本地调试用 8083 避免与 8082 冲突
+python server.py
+```
+
+启动日志中应看到 `🚀 Preferred provider: qclaw-local` 和 `✅ QClaw 链路正常`。
+
+#### 使用示例
+
+```ini
+PREFERRED_PROVIDER=qclaw-local
+BIG_MODEL=pool-deepseek-v4-pro
+MEDIUM_MODEL=pool-deepseek-v4-pro
+SMALL_MODEL=pool-deepseek-v4-flash
+BIG_REASONING=high
+MEDIUM_REASONING=low
+SMALL_REASONING=low
+```
+
+#### 维护说明
+
+- **QClaw 重启后**：需要重新执行步骤 2（注入是进程级寄生，QClaw 关闭后自动消失）
+- **QClaw 升级后**：`qclaw_inject.js` 通过 inspector 注入，不依赖 QClaw 版本，但需确认新版 QClaw 仍以 `axios.cjs` 作为 axios 模块名
+- **19001 端口被占用**：修改 `qclaw_inject.js` 中的 `FORWARD_PORT` 常量，同时修改 `server.py` 中的 `QCLAW_LOCAL_BASE_URL`
+- **可重复执行**：`qclaw_inject.js` 支持重复注入，会先关闭旧服务器再创建新服务器
+- **无破坏性**：注入不修改 QClaw 任何文件或行为，只是额外开了一个 HTTP 服务器
+
+#### 诊断
+
+如果 qclaw-local 不通，按以下顺序检查：
+
+1. `Invoke-RestMethod http://127.0.0.1:9229/json` — inspector 是否在线
+2. `Get-NetTCPConnection -LocalPort 19001 -State Listen` — 寄生服务器是否运行
+3. `Get-NetTCPConnection -LocalPort 19000 -State Listen` — QClaw 网关是否运行
+4. 查看 `server.py` 启动日志中的诊断输出
 
 ---
 
