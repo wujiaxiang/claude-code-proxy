@@ -238,6 +238,138 @@ This proxy works by:
 
 The proxy handles both streaming and non-streaming responses, maintaining compatibility with all Claude clients. 🌊
 
+## Windows Deployment Pitfalls 🪤（Windows 部署踩坑实录）
+
+在 Windows Server 上通过计划任务 + VBS + BAT 三层架构自启代理时踩过的坑，供后来者参考。完整启动架构见 `start_proxy.vbs` → `start_proxy.bat` → `python server.py`，watchdog 见 `watchdog.ps1`。
+
+### 坑 1：GBK 编码导致 Python 启动崩溃（最严重，根因）
+
+**症状**：代理在 Trae IDE 终端能跑，但计划任务触发后秒挂，`proxy.log` 完全为空。
+
+**根因**：`server.py` 启动时 `print(f"\U0001f511 QClaw API Key decrypted: ...")` 输出 emoji 🔑。Windows 计划任务环境的 codepage 是 GBK（936），Python 默认按 stdout 编码 print，遇到 emoji 立即抛 `UnicodeEncodeError: 'gbk' codec can't encode character '\U0001f511'`，进程在绑定 8082 端口之前就死了。
+
+**修复**：在 `start_proxy.bat` 中显式设：
+```bat
+set PYTHONIOENCODING=utf-8
+set PYTHONUTF8=1
+".venv\Scripts\python.exe" server.py > proxy.log 2>&1
+```
+
+**排查教训**：日志为空不代表没启动过——是 Python 在写日志之前就崩了。先 `python server.py` 同步跑一次看 stderr 才能定位。
+
+---
+
+### 坑 2：VBS 的 `WshShell.Run` 不支持 shell 重定向
+
+**症状**：`WshShell.Run "python.exe server.py > proxy.log 2>&1", 0, False` 在 VBS 中不生效——`>` 不会被解释为重定向，proxy.log 永远是空的。
+
+**根因**：`WshShell.Run` 不是 `cmd.exe`，不解析 `>` / `>>` / `2>&1` 等 shell 操作符。
+
+**修复**：VBS 只负责隐藏窗口启动，重定向交给 `.bat` 文件处理。VBS → BAT → Python 三层架构。
+
+---
+
+### 坑 3：`cmd /c` 在 Trae IDE 沙盒中被禁用
+
+**症状**：在 VBS 中用 `WshShell.Run "cmd /c ..."` 启动会失败，Trae IDE 的安全沙盒拦截了 `cmd /c` 调用。
+
+**报错**：`invalid command: The use of 'cmd /c' (or 'cmd.exe /c') is blocked on Windows for safety`
+
+**修复**：不要在 VBS / PowerShell 中用 `cmd /c`，直接 `WshShell.Run "path\to.bat", 0, False` 调用 bat 文件即可。
+
+---
+
+### 坑 4：watchdog.vbs 的 COM 对象端口检测全部静默失败
+
+**症状**：用 `MSWinsock.Winsock` / `MSXML2.XMLHTTP` / `System.Net.Sockets.TcpClient` 三种 COM 对象在 VBS 中检测端口，全部静默失败——`watchdog.log` 不写入、代理不重启、`WScript.Quit` 异常。
+
+**根因**：
+- `MSWinsock.Winsock` 在新版 Windows 默认未注册
+- `System.Net.Sockets.TcpClient` 是 .NET 类，不是 COM 组件，VBS 通过 COM 调用行为不稳定
+- `On Error Resume Next` 吞掉了所有错误，看不出哪一步挂了
+
+**修复**：彻底放弃 VBS 做 watchdog，改用 PowerShell 脚本 `watchdog.ps1`。PowerShell 原生支持 .NET，`New-Object System.Net.Sockets.TcpClient` + `BeginConnect` + `WaitOne(2000)` 异步超时检测，稳定可靠。
+
+---
+
+### 坑 5：系统装的是 PowerShell 7（`pwsh.exe`），没有 `powershell.exe`
+
+**症状**：计划任务调用 `powershell.exe -File watchdog.ps1` 失败，报 "not recognized"。手动 `Get-Command powershell` 也找不到。
+
+**根因**：Windows Server 安装了 PowerShell 7+ 作为默认 PowerShell，传统 `C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe`（Windows PowerShell 5.1）反而不存在。
+
+**修复**：计划任务的 Action 必须用：
+```
+Command:    C:\Program Files\PowerShell\7\pwsh.exe
+Arguments:  -ExecutionPolicy Bypass -WindowStyle Hidden -File "...\watchdog.ps1"
+```
+
+**排查技巧**：用 `Test-Path` 检查两个路径都存在与否，不要假设哪个是默认。
+
+---
+
+### 坑 6：`schtasks /create` 引号转义地狱，改用 XML
+
+**症状**：`schtasks /create /tr "wscript.exe ..."` 在 PowerShell 中引号嵌套转义失败，要么 bat 路径被截断，要么参数丢失。
+
+**修复**：放弃命令行参数方式，改用 `schtasks /create /xml task.xml /tn \TaskName /f`。XML 文件可以精确控制 `UserId`、`LogonType`、`Triggers`、`Actions`，且不依赖 shell 转义规则。
+
+**坑中坑**：XML 中 `LogonType` 的合法值是 `InteractiveToken`，不是 `Interactive`（后者会报 "incorrectly formatted or out of range"）。`UserId` 必须填当前用户的完整 SID，可用 `[System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value` 获取。
+
+---
+
+### 坑 7：PATH 污染导致 `Get-NetTCPConnection` 等 cmdlet 不可用
+
+**症状**：在 PowerShell 中执行 `Get-NetTCPConnection -LocalPort 8082` 报 "not recognized"。
+
+**根因**：Trae IDE 的 ripgrep、QClaw 的工具链等会把 `...\@vscode\ripgrep\bin` 或其他路径前缀加到 PATH，覆盖了 `C:\Windows\System32\WindowsPowerShell\Modules`，导致 PowerShell 模块加载失败。
+
+**修复**：调用 Windows 系统命令前先清理 PATH：
+```powershell
+$env:Path = "C:\Windows\System32;C:\Windows"
+```
+
+或者直接用 `netstat -ano | findstr :8082`，不依赖任何 PowerShell 模块。
+
+---
+
+### 最终架构总结
+
+```
+计划任务 \ClaudeCodeProxy          计划任务 \ClaudeCodeProxyWatchdog
+触发：用户登录                       触发：每 2 分钟
+        │                                    │
+        ▼                                    ▼
+wscript.exe start_proxy.vbs        pwsh.exe -File watchdog.ps1
+        │                                    │
+        ▼                                    ▼
+start_proxy.bat                    .NET TcpClient 检测 8082 端口
+  set PYTHONIOENCODING=utf-8               │
+  set PYTHONUTF8=1                  ┌───────┴───────┐
+  python server.py > proxy.log     │               │
+                                  端口通         端口不通
+                                  退出           ↓
+                                            wscript.exe start_proxy.vbs
+                                            （触发重启）
+```
+
+**关键文件**：
+- [`start_proxy.vbs`](start_proxy.vbs) — VBS 启动器，隐藏窗口调用 bat
+- [`start_proxy.bat`](start_proxy.bat) — 设 PYTHONIOENCODING=utf-8，启动 python 并重定向日志
+- [`watchdog.ps1`](watchdog.ps1) — PowerShell watchdog，端口检测 + 自动重启
+
+**计划任务创建命令**（参考）：
+```powershell
+# 主任务（登录触发）
+schtasks /create /xml proxy_task.xml /tn \ClaudeCodeProxy /f
+
+# Watchdog 任务（每 2 分钟触发）
+schtasks /create /xml wd_task.xml /tn \ClaudeCodeProxyWatchdog /f
+
+# 手动触发 watchdog 测试
+schtasks /run /tn \ClaudeCodeProxyWatchdog
+```
+
 ## Contributing 🤝
 
 Contributions are welcome! Please feel free to submit a Pull Request. 🎁
