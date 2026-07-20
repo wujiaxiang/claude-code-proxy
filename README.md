@@ -333,6 +333,31 @@ $env:Path = "C:\Windows\System32;C:\Windows"
 
 ---
 
+### 坑 8：PowerShell 7 (`pwsh.exe`) 在计划任务中闪黑框
+
+**症状**：每 2 分钟触发 watchdog 时，桌面会闪过一个黑色 console 窗口，瞬间消失，用户能感知到。即使 `-WindowStyle Hidden` 参数也无效。
+
+**根因**：PowerShell 7 (`pwsh.exe`) 启动时会创建真实的 console 窗口（与 PowerShell 5.1 不同），即使加了 `-WindowStyle Hidden`，console 已经被分配出来再隐藏，肉眼可见闪现。计划任务的 `wscript.exe` 同样如此——只要 Action 的 `Command` 指向带 console 的进程，都会闪。
+
+**修复**：用一个无窗口的 wscript.exe 作为外层包装，再通过 `WshShell.Run(cmd, 0, False)` 的 `0`（vbHide）启动 pwsh.exe。`WshShell.Run` 的第二参数 `0` 在 CreateProcess 时直接传 `STARTUPINFO.wShowWindow = SW_HIDE`，从根源抑制 console 窗口创建。
+
+新建 `watchdog_launcher.vbs`：
+```vbs
+Set WshShell = CreateObject("WScript.Shell")
+WshShell.CurrentDirectory = "c:\Users\Administrator\claude-code-proxy-main"
+WshShell.Run "C:\Program Files\PowerShell\7\pwsh.exe -ExecutionPolicy Bypass -WindowStyle Hidden -File ""...\watchdog.ps1""", 0, False
+```
+
+计划任务 Action 改为：
+```
+Command:    wscript.exe
+Arguments:  "...\watchdog_launcher.vbs"
+```
+
+**关键点**：`-WindowStyle Hidden` 只是 pwsh 内部隐藏窗口，console 已经被分配；必须由父进程通过 `WshShell.Run(..., 0, ...)` 在 CreateProcess 阶段就传 `SW_HIDE`，才能彻底避免闪框。这是 Windows 计划任务隐藏 console 进程的标准做法。
+
+---
+
 ### 最终架构总结
 
 ```
@@ -340,13 +365,14 @@ $env:Path = "C:\Windows\System32;C:\Windows"
 触发：用户登录                       触发：每 2 分钟
         │                                    │
         ▼                                    ▼
-wscript.exe start_proxy.vbs        pwsh.exe -File watchdog.ps1
-        │                                    │
+wscript.exe start_proxy.vbs        wscript.exe watchdog_launcher.vbs
+        │                                    │  (vbHide 包装，避免 pwsh 闪框)
         ▼                                    ▼
-start_proxy.bat                    .NET TcpClient 检测 8082 端口
+start_proxy.bat                    pwsh.exe -File watchdog.ps1
   set PYTHONIOENCODING=utf-8               │
-  set PYTHONUTF8=1                  ┌───────┴───────┐
-  python server.py > proxy.log     │               │
+  set PYTHONUTF8=1                  .NET TcpClient 检测 8082 端口
+  python server.py > proxy.log             │
+                                  ┌───────┴───────┐
                                   端口通         端口不通
                                   退出           ↓
                                             wscript.exe start_proxy.vbs
@@ -357,6 +383,7 @@ start_proxy.bat                    .NET TcpClient 检测 8082 端口
 - [`start_proxy.vbs`](start_proxy.vbs) — VBS 启动器，隐藏窗口调用 bat
 - [`start_proxy.bat`](start_proxy.bat) — 设 PYTHONIOENCODING=utf-8，启动 python 并重定向日志
 - [`watchdog.ps1`](watchdog.ps1) — PowerShell watchdog，端口检测 + 自动重启
+- [`watchdog_launcher.vbs`](watchdog_launcher.vbs) — watchdog 的无窗口启动器，避免 pwsh 闪黑框
 
 **计划任务创建命令**（参考）：
 ```powershell
