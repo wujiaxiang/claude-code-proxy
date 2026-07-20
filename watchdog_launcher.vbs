@@ -4,4 +4,12 @@
 
 Set WshShell = CreateObject("WScript.Shell")
 WshShell.CurrentDirectory = "c:\Users\Administrator\claude-code-proxy-main"
-WshShell.Run "C:\Program Files\PowerShell\7\pwsh.exe -ExecutionPolicy Bypass -WindowStyle Hidden -File ""c:\Users\Administrator\claude-code-proxy-main\watchdog.ps1""", 0, False
+
+' 用 Chr(34) 表示引号，避免 VBS 字符串中嵌套引号的转义问题
+' 路径含空格时必须用引号包裹，否则 CreateProcess 会把空格解析为参数分隔符
+Dim pwshPath, scriptPath, cmd
+pwshPath = Chr(34) & "C:\Program Files\PowerShell\7\pwsh.exe" & Chr(34)
+scriptPath = Chr(34) & "c:\Users\Administrator\claude-code-proxy-main\watchdog.ps1" & Chr(34)
+cmd = pwshPath & " -ExecutionPolicy Bypass -WindowStyle Hidden -File " & scriptPath
+
+WshShell.Run cmd, 0, False

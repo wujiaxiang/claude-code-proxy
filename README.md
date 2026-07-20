@@ -345,7 +345,13 @@ $env:Path = "C:\Windows\System32;C:\Windows"
 ```vbs
 Set WshShell = CreateObject("WScript.Shell")
 WshShell.CurrentDirectory = "c:\Users\Administrator\claude-code-proxy-main"
-WshShell.Run "C:\Program Files\PowerShell\7\pwsh.exe -ExecutionPolicy Bypass -WindowStyle Hidden -File ""...\watchdog.ps1""", 0, False
+
+Dim pwshPath, scriptPath, cmd
+pwshPath = Chr(34) & "C:\Program Files\PowerShell\7\pwsh.exe" & Chr(34)
+scriptPath = Chr(34) & "c:\Users\Administrator\claude-code-proxy-main\watchdog.ps1" & Chr(34)
+cmd = pwshPath & " -ExecutionPolicy Bypass -WindowStyle Hidden -File " & scriptPath
+
+WshShell.Run cmd, 0, False
 ```
 
 计划任务 Action 改为：
@@ -354,7 +360,10 @@ Command:    wscript.exe
 Arguments:  "...\watchdog_launcher.vbs"
 ```
 
-**关键点**：`-WindowStyle Hidden` 只是 pwsh 内部隐藏窗口，console 已经被分配；必须由父进程通过 `WshShell.Run(..., 0, ...)` 在 CreateProcess 阶段就传 `SW_HIDE`，才能彻底避免闪框。这是 Windows 计划任务隐藏 console 进程的标准做法。
+**关键点**：
+- `Chr(34)` 在 VBS 中表示双引号，比字符串内嵌套转义引号更可靠
+- 路径含空格时必须用引号包裹，否则 CreateProcess 会把空格解析为参数分隔符
+- `-WindowStyle Hidden` 只是 pwsh 内部隐藏窗口，console 已经被分配；必须由父进程通过 `WshShell.Run(..., 0, ...)` 在 CreateProcess 阶段就传 `SW_HIDE`，才能彻底避免闪框
 
 ---
 
