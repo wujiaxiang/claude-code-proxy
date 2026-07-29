@@ -776,7 +776,36 @@ async def _parse_http_request(reader):
         content_len = int(headers.get("content-length", 0))
         body = b""
         if content_len > 0:
-            body = await asyncio.wait_for(reader.read(content_len), timeout=30)
+            # reader.read(n) 可能返回少于 n 字节，必须循环读满
+            while len(body) < content_len:
+                remaining = content_len - len(body)
+                chunk = await asyncio.wait_for(reader.read(remaining), timeout=30)
+                if not chunk:
+                    break
+                body += chunk
+        elif headers.get("transfer-encoding", "").lower() == "chunked":
+            # 处理分块编码（OpenCode 等客户端可能使用）
+            while True:
+                line = await asyncio.wait_for(reader.readline(), timeout=30)
+                chunk_size_str = line.decode("utf-8", errors="replace").strip()
+                if not chunk_size_str:
+                    continue
+                try:
+                    chunk_size = int(chunk_size_str, 16)
+                except ValueError:
+                    break
+                if chunk_size == 0:
+                    break
+                # reader.read(n) 同上的问题，必须循环读满
+                chunk_data = b""
+                while len(chunk_data) < chunk_size:
+                    remaining = chunk_size - len(chunk_data)
+                    part = await asyncio.wait_for(reader.read(remaining), timeout=30)
+                    if not part:
+                        break
+                    chunk_data += part
+                body += chunk_data
+                await asyncio.wait_for(reader.readline(), timeout=10)  # 吃掉 \r\n
 
         parsed = urlparse(raw_path)
         return method, parsed.path, raw_path, headers, body
@@ -825,7 +854,7 @@ async def _write_response(writer, resp, *, stats=None):
         if is_stream:
             writer.write(f"HTTP/1.1 {status} {reason}\r\n".encode())
             for k, v in resp.headers.items():
-                if k.lower() not in ("transfer-encoding", "connection"):
+                if k.lower() not in ("transfer-encoding", "connection", "content-length"):
                     writer.write(f"{k}: {v}\r\n".encode())
             writer.write(b"\r\n")
             async for chunk in resp.aiter_bytes():
@@ -843,7 +872,7 @@ async def _write_response(writer, resp, *, stats=None):
 
         resp_headers = "".join(
             f"{k}: {v}\r\n" for k, v in resp.headers.items()
-            if k.lower() not in ("transfer-encoding", "connection")
+            if k.lower() not in ("transfer-encoding", "connection", "content-length")
         )
         writer.write(f"HTTP/1.1 {status} {reason}\r\n{resp_headers}Content-Length: {len(body_bytes)}\r\n\r\n".encode())
         writer.write(body_bytes)
@@ -869,7 +898,7 @@ def _resolve_auth(headers: dict, target: dict = None, provider: str = None) -> d
     - 否则透传客户端 Authorization / x-api-key
     - 返回可直接转发用的 headers dict（不含 host/connection）
     """
-    fwd = {k: v for k, v in headers.items() if k not in ("host", "connection")}
+    fwd = {k: v for k, v in headers.items() if k not in ("host", "connection", "content-length", "transfer-encoding")}
     api_key = None
 
     if target:
@@ -1040,7 +1069,7 @@ async def _handle_openai_proxy_request(reader, writer):
         # ── 其余请求：透传到上游（/v1/messages 等）──
         upstream_url, auth_headers = _choose_openai_upstream({})
         upstream_url = upstream_url.replace("/chat/completions", raw_path)
-        merged_headers = {**auth_headers, **{k: v for k, v in headers.items() if k not in ("host", "connection")}}
+        merged_headers = {**auth_headers, **{k: v for k, v in headers.items() if k not in ("host", "connection", "content-length", "transfer-encoding")}}
         async with httpx.AsyncClient(timeout=httpx.Timeout(300.0, connect=10.0), trust_env=False) as client:
             resp = await client.request(method, upstream_url, headers=merged_headers, content=body)
             await _write_response(writer, resp, stats=_OPENAI_STATS)
