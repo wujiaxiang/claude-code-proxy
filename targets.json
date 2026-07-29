@@ -1,0 +1,39 @@
+[
+  {
+    "label": "openrouter",
+    "listenPort": 8090,
+    "targetHost": "openrouter.ai",
+    "targetPort": 443,
+    "targetProtocol": "https",
+    "routePrefix": "/api/v1",
+    "apikeyEnv": "TARGET_APIKEY_OPENROUTER",
+    "models": [
+      "nvidia/nemotron-3-ultra-550b-a55b:free",
+      "nvidia/nemotron-3-super-120b-a12b:free",
+      "openai/gpt-oss-20b:free",
+      "google/gemma-4-26b-a4b-it:free",
+      "inclusionai/ling-3.0-flash:free",
+      "poolside/laguna-s-2.1:free",
+      "cohere/north-mini-code:free"
+    ]
+  },
+  {
+    "label": "nvidia",
+    "listenPort": 8091,
+    "targetHost": "integrate.api.nvidia.com",
+    "targetPort": 443,
+    "targetProtocol": "https",
+    "routePrefix": "/v1",
+    "apikeyEnv": "TARGET_APIKEY_NVIDIA",
+    "models": [
+      "deepseek-ai/deepseek-v4-flash",
+      "deepseek-ai/deepseek-v4-pro",
+      "nvidia/nemotron-3-ultra-550b-a55b",
+      "nvidia/nemotron-3-super-120b-a12b",
+      "openai/gpt-oss-20b",
+      "qwen/qwen3-coder-480b-a35b-instruct",
+      "z-ai/glm-5.2",
+      "meta/llama-4-maverick-17b-128e-instruct"
+    ]
+  }
+]
