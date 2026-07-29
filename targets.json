@@ -6,7 +6,6 @@
     "targetPort": 443,
     "targetProtocol": "https",
     "routePrefix": "/api/v1",
-    "apikeyEnv": "TARGET_APIKEY_OPENROUTER",
     "models": [
       "nvidia/nemotron-3-ultra-550b-a55b:free",
       "nvidia/nemotron-3-super-120b-a12b:free",
@@ -24,7 +23,6 @@
     "targetPort": 443,
     "targetProtocol": "https",
     "routePrefix": "/v1",
-    "apikeyEnv": "TARGET_APIKEY_NVIDIA",
     "models": [
       "deepseek-ai/deepseek-v4-flash",
       "deepseek-ai/deepseek-v4-pro",

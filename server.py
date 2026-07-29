@@ -9,7 +9,10 @@ import httpx
 import os
 import base64
 import asyncio
+import struct
+from urllib.parse import urlparse
 from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import HTMLResponse
 import litellm
 import uuid
 import time
@@ -483,7 +486,29 @@ async def lifespan(app):
             logger.info(f"startup diag: QClaw upstream = {_r.status_code}")
     except Exception as _e:
         logger.warning(f"startup diag: QClaw upstream unreachable: {_e}")
+    # 预热下游模型列表缓存（copilot/openai 等能从 /models 拉取的 provider）
+    if PREFERRED_PROVIDER in ("copilot", "openai"):
+        try:
+            await _fetch_downstream_models()
+            logger.info(f"startup: preloaded {len(_DOWNSTREAM_MODELS_CACHE or [])} downstream models")
+        except Exception as _me:
+            logger.warning(f"startup: failed to preload downstream models: {_me}")
+
+    # ── 启动 asyncio TCP 服务器（8082 OpenAI, 8090 openrouter, 8091 nvidia）──
+    # 8081 Anthropic 由 uvicorn FastAPI 处理（不在此处启动）
+    _vendor_servers = []
+    for t in _VENDOR_TARGETS:
+        srv = await _vendor_server("0.0.0.0", t["listenPort"], t)
+        _vendor_servers.append(srv)
+    _openai_srv = await _openai_server("0.0.0.0", _OPENAI_PORT)
+    _vendor_servers.append(_openai_srv)
+
     yield
+
+    # 停掉透明反代服务器
+    for srv in _vendor_servers:
+        srv.close()
+        await srv.wait_closed()
     # 清理连接池
     global _http_client
     if _http_client and not _http_client.is_closed:
@@ -704,6 +729,598 @@ if PREFERRED_PROVIDER == "copilot":
 BIG_MODEL = os.environ.get("BIG_MODEL", "gpt-4.1")
 MEDIUM_MODEL = os.environ.get("MEDIUM_MODEL", os.environ.get("BIG_MODEL", "gpt-4.1"))
 SMALL_MODEL = os.environ.get("SMALL_MODEL", "gpt-4.1-mini")
+
+# ─── 透明反代目标（vendor passthrough proxy，本进程内嵌） ───
+
+_VENDOR_TARGETS: list = []
+_VENDOR_STATS: Dict[str, dict] = {}
+_VENDOR_RETRY_AFTER = int(os.environ.get("VENDOR_RETRY_AFTER_SECONDS", "3"))
+
+_VENDOR_ERROR_PATTERNS = [
+    re.compile(r'"ResourceExhausted"'),
+    re.compile(r'Worker local total request limit reached', re.IGNORECASE),
+    re.compile(r'"(error_)?code"\s*:\s*"?(rate_limit_exceeded|too_many_requests)"?', re.IGNORECASE),
+    re.compile(r'"type"\s*:\s*"rate_limit_error"', re.IGNORECASE),
+]
+
+def _vendor_body_retryable(body_text: str) -> bool:
+    if not re.search(r'"error"\s*:', body_text):
+        return False
+    return any(p.search(body_text) for p in _VENDOR_ERROR_PATTERNS)
+
+
+# ─── HTTP 代理共享工具函数（所有端口统一用，不要各写各的） ───
+
+async def _parse_http_request(reader):
+    """统一 HTTP 请求解析。
+    返回 (method, path, raw_path, headers, body)，请求无效时全返回 None。
+    """
+    try:
+        req_line = await asyncio.wait_for(reader.readline(), timeout=30)
+        if not req_line:
+            return None, None, None, None, None
+        parts = req_line.decode("utf-8", errors="replace").strip().split(" ", 2)
+        method = parts[0] if len(parts) > 0 else "GET"
+        raw_path = parts[1] if len(parts) > 1 else "/"
+
+        headers = {}
+        while True:
+            line = await asyncio.wait_for(reader.readline(), timeout=10)
+            line_str = line.decode("utf-8", errors="replace").strip()
+            if not line_str:
+                break
+            if ":" in line_str:
+                k, v = line_str.split(":", 1)
+                headers[k.strip().lower()] = v.strip()
+
+        content_len = int(headers.get("content-length", 0))
+        body = b""
+        if content_len > 0:
+            body = await asyncio.wait_for(reader.read(content_len), timeout=30)
+
+        parsed = urlparse(raw_path)
+        return method, parsed.path, raw_path, headers, body
+    except asyncio.TimeoutError:
+        logger.warning("_parse_http_request timeout reading request")
+        return None, None, None, None, None
+
+
+async def _write_error_response(writer, status, message, *, content_type="application/json", retry_after=None):
+    """统一错误响应回写，带日志。"""
+    body = json.dumps({"error": {"type": "proxy_error", "message": message}}, ensure_ascii=False)
+    status_text = {429: "Too Many Requests", 502: "Bad Gateway", 503: "Service Unavailable", 504: "Gateway Timeout"}.get(status, "Error")
+    header_lines = f"HTTP/1.1 {status} {status_text}\r\nContent-Type: {content_type}\r\nContent-Length: {len(body.encode())}\r\n"
+    if retry_after is not None:
+        header_lines += f"Retry-After: {retry_after}\r\n"
+    header_lines += "\r\n"
+    logger.warning(f"_write_error_response: {status} — {message}")
+    try:
+        writer.write(header_lines.encode() + body.encode())
+        await writer.drain()
+    except Exception:
+        pass
+    try:
+        writer.close()
+    except Exception:
+        pass
+
+
+async def _write_response(writer, resp, *, stats=None):
+    """统一从 httpx 响应回写到 writer。
+    自动区分流式/非流式，非 200 自动记录日志。
+    返回 (status_code, body_bytes) — body_bytes=None 表示流式已写完。
+    """
+    status, body_bytes, is_stream = None, None, False
+    try:
+        status = resp.status_code
+        reason = resp.reason_phrase or "OK"
+        content_type = resp.headers.get("content-type", "")
+        is_stream = "text/event-stream" in content_type
+
+        # ── 日志：非 200 记录响应前 300 字符 ──
+        if status >= 400:
+            logger.warning(f"[{resp.url.host if hasattr(resp, 'url') else 'upstream'}] "
+                           f"HTTP {status} {reason} | content-type: {content_type}")
+
+        if is_stream:
+            writer.write(f"HTTP/1.1 {status} {reason}\r\n".encode())
+            for k, v in resp.headers.items():
+                if k.lower() not in ("transfer-encoding", "connection"):
+                    writer.write(f"{k}: {v}\r\n".encode())
+            writer.write(b"\r\n")
+            async for chunk in resp.aiter_bytes():
+                writer.write(chunk)
+                await writer.drain()
+            if stats:
+                stats["passthroughOk"] += 1
+            return status, None
+
+        body_bytes = await resp.aread()
+        body_text = body_bytes.decode("utf-8", errors="replace")
+        if status >= 400:
+            logger.warning(f"[{resp.url.host if hasattr(resp, 'url') else 'upstream'}] "
+                           f"HTTP {status} body: {body_text[:300]}")
+
+        resp_headers = "".join(
+            f"{k}: {v}\r\n" for k, v in resp.headers.items()
+            if k.lower() not in ("transfer-encoding", "connection")
+        )
+        writer.write(f"HTTP/1.1 {status} {reason}\r\n{resp_headers}Content-Length: {len(body_bytes)}\r\n\r\n".encode())
+        writer.write(body_bytes)
+        await writer.drain()
+        if stats:
+            stats["passthroughOk"] += 1
+        return status, body_bytes
+    except Exception:
+        if status is not None and status >= 400 and body_bytes:
+            logger.exception(f"Error writing {status} response to client")
+        raise
+    finally:
+        try:
+            writer.close()
+        except Exception:
+            pass
+
+
+def _resolve_auth(headers: dict, target: dict = None, provider: str = None) -> dict:
+    """统一鉴权 headers 解析。
+    - target 有 apikey → 注入（覆盖客户端传入的 key，vendor 场景）
+    - target 有 apikeyEnv → 从环境变量读取（避免 key 明文入仓）
+    - 否则透传客户端 Authorization / x-api-key
+    - 返回可直接转发用的 headers dict（不含 host/connection）
+    """
+    fwd = {k: v for k, v in headers.items() if k not in ("host", "connection")}
+    api_key = None
+
+    if target:
+        api_key = target.get("apikey")
+        if not api_key and target.get("apikeyEnv"):
+            api_key = os.environ.get(target["apikeyEnv"], "")
+            if api_key:
+                logger.debug(f"key: read from env ${target['apikeyEnv']} ({target.get('label', 'unknown')})")
+
+    if api_key:
+        fwd["authorization"] = f"Bearer {api_key}"
+        logger.debug(f"key: injected ({target.get('label', 'unknown')})")
+    elif headers.get("authorization"):
+        fwd["authorization"] = headers["authorization"]
+        logger.debug("key: passed through from client request")
+
+    if target and target.get("targetHost"):
+        fwd["host"] = target["targetHost"]
+
+    return fwd
+
+
+def _load_vendor_targets():
+    global _VENDOR_TARGETS, _VENDOR_STATS
+    import pathlib
+    cfg_path = pathlib.Path(__file__).parent / "targets.json"
+    try:
+        with open(cfg_path) as f:
+            raw = json.load(f)
+        _VENDOR_TARGETS = [t for t in raw if t.get("listenPort") and t.get("targetHost")]
+        for t in _VENDOR_TARGETS:
+            _VENDOR_STATS[t["label"]] = {
+                "totalRequests": 0, "translated429": 0,
+                "passthroughOk": 0, "passthroughError": 0,
+                "startedAt": datetime.now().isoformat(),
+            }
+        print(f"🔀 Vendor targets loaded: {len(_VENDOR_TARGETS)} targets")
+    except Exception as e:
+        print(f"⚠️  Failed to load vendor targets.json: {e}")
+
+_load_vendor_targets()
+
+# ─── 8081 Anthropic 协议端口（对内透传 8082，模型列表隔离） ───
+
+_ANTHROPIC_PORT = int(os.environ.get("ANTHROPIC_PORT", "8081"))
+
+_ANTHROPIC_PORT_MODELS = [
+    "claude-opus-4-20250514",
+    "claude-sonnet-4-20250514",
+    "claude-haiku-4-20250514",
+    "opus",
+    "sonnet",
+    "haiku",
+]
+
+_ANTHROPIC_STATS: Dict[str, int] = {"totalRequests": 0, "passthroughOk": 0, "passthroughError": 0, "startedAt": datetime.now().isoformat()}
+
+
+# ─── 8082 OpenAI 协议端口（asyncio TCP，纯透传 + 多 provider 路由）───
+
+_OPENAI_PORT = int(os.environ.get("OPENAI_PORT", "8082"))
+_OPENAI_STATS: Dict[str, int] = {"totalRequests": 0, "passthroughOk": 0, "passthroughError": 0, "startedAt": datetime.now().isoformat()}
+
+
+def _choose_openai_upstream(body_json: dict):
+    """根据 PREFERRED_PROVIDER 选择上游 URL 和鉴权 headers"""
+    provider = PREFERRED_PROVIDER
+    if provider == "copilot":
+        return (
+            f"https://{COPILOT_GHE_HOST}/chat/completions",
+            {
+                "Authorization": f"Bearer {COPILOT_GHE_TOKEN}",
+                "Copilot-Integration-Id": COPILOT_INTEGRATION_ID,
+                "Content-Type": "application/json",
+            },
+        )
+    elif provider in ("qclaw", "qclaw-local"):
+        return (
+            f"{QCLAW_BASE_URL}/chat/completions",
+            {
+                "Authorization": f"Bearer {QCLAW_API_KEY}",
+                "Content-Type": "application/json",
+                "User-Agent": "OpenAI/JS 6.39.1",
+            },
+        )
+    elif provider == "openai":
+        base = OPENAI_BASE_URL or "https://api.openai.com/v1"
+        return (
+            f"{base.rstrip('/')}/chat/completions",
+            {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"},
+        )
+    else:
+        # 兜底走 copilot
+        return (
+            f"https://{COPILOT_GHE_HOST}/chat/completions",
+            {
+                "Authorization": f"Bearer {COPILOT_GHE_TOKEN}",
+                "Copilot-Integration-Id": COPILOT_INTEGRATION_ID,
+                "Content-Type": "application/json",
+            },
+        )
+
+
+async def _handle_openai_proxy_request(reader, writer):
+    """8082 OpenAI 端口：透传 /v1/chat/completions 到上游（多 provider 路由，共享 HTTP 工具函数）"""
+    try:
+        method, path, raw_path, headers, body = await _parse_http_request(reader)
+        if method is None:
+            return
+
+        # ── 自检端点 ──
+        if path == "/__proxy_info__":
+            payload = json.dumps({
+                "label": "claude-code-openai", "listenPort": _OPENAI_PORT,
+                "targetHost": PREFERRED_PROVIDER, "targetPort": 443, "targetProtocol": "https",
+                "models": [m["id"] for m in _build_models_list(include_aliases=False)],
+                "retryAfterSeconds": 0, "errorPatterns": [],
+                "startedAt": _OPENAI_STATS["startedAt"],
+            })
+            writer.write(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: %d\r\n\r\n%s" % (len(payload.encode()), payload.encode()))
+            await writer.drain(); writer.close(); return
+
+        if path == "/__proxy_stats__":
+            payload = json.dumps({"label": "claude-code-openai", "listenPort": _OPENAI_PORT, **_OPENAI_STATS})
+            writer.write(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: %d\r\n\r\n%s" % (len(payload.encode()), payload.encode()))
+            await writer.drain(); writer.close(); return
+
+        # ── /v1/models：返回真实下游模型列表（不含 Anthropic 别名）──
+        if path in ("/v1/models", "/api/v1/models", "/openai/v1/models") and method == "GET":
+            payload = json.dumps({"data": _build_models_list(include_aliases=False), "object": "list", "has_more": False})
+            writer.write(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: %d\r\n\r\n%s" % (len(payload.encode()), payload.encode()))
+            await writer.drain(); writer.close(); return
+
+        # ── /dashboard：代理到 8081 FastAPI ──
+        if path == "/dashboard" and method == "GET":
+            async with httpx.AsyncClient(timeout=httpx.Timeout(5.0), trust_env=False) as c:
+                resp = await c.get("http://127.0.0.1:8081/dashboard")
+                writer.write(b"HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: %d\r\n\r\n%s" % (len(resp.content), resp.content))
+                await writer.drain()
+            writer.close(); return
+
+        _OPENAI_STATS["totalRequests"] += 1
+
+        # ── /v1/chat/completions：多 provider 路由转发 ──
+        if path == "/v1/chat/completions" and method == "POST":
+            try:
+                body_json = json.loads(body.decode("utf-8")) if body else {}
+            except Exception:
+                await _write_error_response(writer, 400, "Invalid JSON body")
+                return
+
+            upstream_url, auth_headers = _choose_openai_upstream(body_json)
+            is_stream = body_json.get("stream", False)
+            payload = body
+
+            async with httpx.AsyncClient(timeout=httpx.Timeout(300.0, connect=10.0), trust_env=False) as client:
+                for attempt in range(3):
+                    resp = await client.post(upstream_url, headers=auth_headers, content=payload)
+                    if resp.status_code >= 500 and attempt < 2:
+                        logger.warning(f"[openai-8082] retry {attempt+1} on HTTP {resp.status_code}")
+                        await asyncio.sleep(1)
+                        continue
+                    break
+
+                await _write_response(writer, resp, stats=_OPENAI_STATS)
+            return
+
+        # ── 其余请求：透传到上游（/v1/messages 等）──
+        upstream_url, auth_headers = _choose_openai_upstream({})
+        upstream_url = upstream_url.replace("/chat/completions", raw_path)
+        merged_headers = {**auth_headers, **{k: v for k, v in headers.items() if k not in ("host", "connection")}}
+        async with httpx.AsyncClient(timeout=httpx.Timeout(300.0, connect=10.0), trust_env=False) as client:
+            resp = await client.request(method, upstream_url, headers=merged_headers, content=body)
+            await _write_response(writer, resp, stats=_OPENAI_STATS)
+    except Exception:
+        _OPENAI_STATS["passthroughError"] += 1
+        logger.exception("[openai-8082] proxy exception")
+        try:
+            await _write_error_response(writer, 503, "OpenAI proxy error")
+        except Exception:
+            pass
+
+
+async def _openai_server(host="0.0.0.0", port=8082):
+    srv = await asyncio.start_server(_handle_openai_proxy_request, host=host, port=port)
+    print(f"🔀 [claude-code-openai] 0.0.0.0:{port} -> {PREFERRED_PROVIDER} upstream (multi-provider routing)")
+    return srv
+
+
+async def _handle_anthropic_proxy_request(reader, writer):
+    """8081 Anthropic 专用端口：/v1/messages 翻译成 OpenAI 格式后内部请求 8082，其余透传"""
+    try:
+        req_line = await asyncio.wait_for(reader.readline(), timeout=30)
+        if not req_line:
+            writer.close(); return
+        parts = req_line.decode("utf-8", errors="replace").strip().split(" ", 2)
+        method = parts[0] if len(parts) > 0 else "GET"
+        raw_path = parts[1] if len(parts) > 1 else "/"
+
+        headers = {}
+        while True:
+            line = await asyncio.wait_for(reader.readline(), timeout=10)
+            line_str = line.decode("utf-8", errors="replace").strip()
+            if not line_str: break
+            if ":" in line_str:
+                k, v = line_str.split(":", 1)
+                headers[k.strip().lower()] = v.strip()
+
+        content_len = int(headers.get("content-length", 0))
+        body = b""
+        if content_len > 0:
+            body = await asyncio.wait_for(reader.read(content_len), timeout=30)
+
+        parsed = urlparse(raw_path)
+        path = parsed.path
+
+        # ── 自检端点 ──
+        if path == "/__proxy_info__":
+            import json as _json
+            payload = _json.dumps({
+                "label": "claude-code-anthropic", "listenPort": _ANTHROPIC_PORT,
+                "targetHost": "127.0.0.1", "targetPort": 8082, "targetProtocol": "http",
+                "models": _ANTHROPIC_PORT_MODELS,
+                "retryAfterSeconds": 0, "errorPatterns": [],
+                "startedAt": _ANTHROPIC_STATS["startedAt"],
+            })
+            writer.write(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: %d\r\n\r\n%s" % (len(payload.encode()), payload.encode()))
+            await writer.drain(); writer.close(); return
+
+        if path == "/__proxy_stats__":
+            import json as _json
+            payload = _json.dumps({"label": "claude-code-anthropic", "listenPort": _ANTHROPIC_PORT, **_ANTHROPIC_STATS})
+            writer.write(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: %d\r\n\r\n%s" % (len(payload.encode()), payload.encode()))
+            await writer.drain(); writer.close(); return
+
+        # ── /v1/models 拦截：只返回 Anthropic 模型 ──
+        if path == "/v1/models" and method == "GET":
+            import json as _json
+            full_list = _build_models_list()
+            anthropic_ids = set(_ANTHROPIC_PORT_MODELS)
+            filtered = [m for m in full_list if m["id"] in anthropic_ids]
+            payload = _json.dumps({"data": filtered, "object": "list", "has_more": False})
+            writer.write(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: %d\r\n\r\n%s" % (len(payload.encode()), payload.encode()))
+            await writer.drain(); writer.close(); return
+
+        _ANTHROPIC_STATS["totalRequests"] += 1
+
+        # ── /v1/messages：Anthropic→OpenAI 翻译，内部请求 8082 ──
+        if path == "/v1/messages" and method == "POST":
+            from anthropic_convert import convert_anthropic_request_to_openai, convert_openai_response_to_anthropic
+            try:
+                anthropic_body = json.loads(body.decode("utf-8"))
+            except Exception:
+                writer.write(b"HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\n\r\n{\"error\":\"invalid json\"}")
+                await writer.drain(); writer.close(); return
+
+            original_model = anthropic_body.get("model", "unknown")
+            is_stream = anthropic_body.get("stream", False)
+            openai_body = convert_anthropic_request_to_openai(anthropic_body)
+            openai_payload = json.dumps(openai_body).encode("utf-8")
+
+            fwd_headers = {
+                "content-type": "application/json",
+                "host": "127.0.0.1:8082",
+                "content-length": str(len(openai_payload)),
+            }
+            if headers.get("authorization"):
+                fwd_headers["authorization"] = headers["authorization"]
+            if headers.get("x-api-key"):
+                fwd_headers["x-api-key"] = headers["x-api-key"]
+
+            upstream_url = "http://127.0.0.1:8082/v1/chat/completions"
+
+            async with httpx.AsyncClient(timeout=httpx.Timeout(300.0, connect=10.0), trust_env=False) as client:
+                req = client.build_request("POST", upstream_url, headers=fwd_headers, content=openai_payload)
+                resp = await client.send(req, stream=is_stream)
+
+                if is_stream:
+                    _ANTHROPIC_STATS["passthroughOk"] += 1
+                    writer.write(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: keep-alive\r\n\r\n")
+                    async for chunk in resp.aiter_bytes():
+                        writer.write(chunk)
+                        await writer.drain()
+                    writer.write(b"data: [DONE]\n\n")
+                    await writer.drain()
+                    writer.close(); return
+
+                body_bytes = await resp.aread()
+                try:
+                    openai_resp = json.loads(body_bytes.decode("utf-8"))
+                except Exception:
+                    _ANTHROPIC_STATS["passthroughError"] += 1
+                    writer.write(b"HTTP/1.1 502 Bad Gateway\r\n\r\n")
+                    await writer.drain(); writer.close(); return
+
+                if resp.status_code >= 400:
+                    _ANTHROPIC_STATS["passthroughOk"] += 1
+                    content_len = len(body_bytes)
+                    writer.write(f"HTTP/1.1 {resp.status_code} {resp.reason_phrase or 'Error'}\r\nContent-Type: application/json\r\nContent-Length: {content_len}\r\n\r\n".encode())
+                    writer.write(body_bytes)
+                    await writer.drain(); writer.close(); return
+
+                anthropic_resp = convert_openai_response_to_anthropic(openai_resp, original_model)
+                resp_payload = json.dumps(anthropic_resp).encode("utf-8")
+                _ANTHROPIC_STATS["passthroughOk"] += 1
+                writer.write(f"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {len(resp_payload)}\r\n\r\n".encode())
+                writer.write(resp_payload)
+                await writer.drain()
+                writer.close(); return
+            return
+
+        # ── 其余请求：透传到 127.0.0.1:8082 ──
+        upstream_url = f"http://127.0.0.1:8082{raw_path}"
+        fwd_headers = {k: v for k, v in headers.items() if k not in ("host", "connection")}
+        fwd_headers["host"] = "127.0.0.1:8082"
+
+        async with httpx.AsyncClient(timeout=httpx.Timeout(300.0, connect=10.0), trust_env=False) as client:
+            req = client.build_request(method, upstream_url, headers=fwd_headers, content=body if body else None)
+            resp = await client.send(req, stream=True)
+
+            content_type = resp.headers.get("content-type", "")
+            is_stream = "text/event-stream" in content_type
+            if is_stream:
+                writer.write(f"HTTP/1.1 {resp.status_code} {resp.reason_phrase or 'OK'}\r\n".encode())
+                for k, v in resp.headers.items():
+                    if k.lower() not in ("transfer-encoding", "connection"):
+                        writer.write(f"{k}: {v}\r\n".encode())
+                writer.write(b"\r\n")
+                async for chunk in resp.aiter_bytes():
+                    writer.write(chunk)
+                    await writer.drain()
+                _ANTHROPIC_STATS["passthroughOk"] += 1
+                writer.close(); return
+
+            body_bytes = await resp.aread()
+            _ANTHROPIC_STATS["passthroughOk"] += 1
+            resp_headers = "".join(f"{k}: {v}\r\n" for k, v in resp.headers.items() if k.lower() not in ("transfer-encoding", "connection"))
+            writer.write(f"HTTP/1.1 {resp.status_code} {resp.reason_phrase or 'OK'}\r\n{resp_headers}Content-Length: {len(body_bytes)}\r\n\r\n".encode())
+            writer.write(body_bytes)
+            await writer.drain()
+    except Exception:
+        _ANTHROPIC_STATS["passthroughError"] += 1
+        try: writer.close()
+        except: pass
+
+
+async def _anthropic_server(host="0.0.0.0", port=8081):
+    srv = await asyncio.start_server(_handle_anthropic_proxy_request, host=host, port=port)
+    print(f"🔀 [claude-code-anthropic] 0.0.0.0:{port} -> http://127.0.0.1:8082 (Anthropic protocol, /v1/models isolated)")
+    return srv
+
+
+async def _handle_vendor_request(reader, writer, target):
+    """单个透明反代连接处理：解析 HTTP → forward → 429 翻译"""
+    stats = _VENDOR_STATS[target["label"]]
+    try:
+        method, path, raw_path, headers, body = await _parse_http_request(reader)
+        if method is None:
+            return
+
+        # ── 内建 JSON 端点 ──
+        if path == "/__proxy_info__":
+            payload = json.dumps({
+                "label": target["label"], "listenPort": target["listenPort"],
+                "targetHost": target["targetHost"], "targetPort": target.get("targetPort", 443),
+                "targetProtocol": target.get("targetProtocol", "https"),
+                "models": target.get("models", []),
+                "retryAfterSeconds": _VENDOR_RETRY_AFTER,
+                "errorPatterns": [p.pattern for p in _VENDOR_ERROR_PATTERNS],
+                "startedAt": stats["startedAt"],
+            })
+            writer.write(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: %d\r\n\r\n%s" % (len(payload.encode()), payload.encode()))
+            await writer.drain(); writer.close(); return
+
+        if path == "/__proxy_stats__":
+            payload = json.dumps({"label": target["label"], "listenPort": target["listenPort"], **stats})
+            writer.write(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: %d\r\n\r\n%s" % (len(payload.encode()), payload.encode()))
+            await writer.drain(); writer.close(); return
+
+        stats["totalRequests"] += 1
+
+        # ── 上游转发（含路径重写：routePrefix 解决 OpenRouter /api/v1 路径差异）──
+        transport = "https" if target.get("targetProtocol", "https") == "https" else "http"
+        upstream_path = raw_path
+        route_prefix = target.get("routePrefix")
+        if route_prefix and upstream_path.startswith("/v1"):
+            upstream_path = route_prefix + upstream_path[3:]
+        upstream_url = f"{transport}://{target['targetHost']}:{target.get('targetPort', 443)}{upstream_path}"
+        fwd_headers = _resolve_auth(headers, target=target)
+        fwd_headers["host"] = target["targetHost"]
+
+        async with httpx.AsyncClient(timeout=httpx.Timeout(300.0, connect=10.0), trust_env=False) as client:
+            req = client.build_request(method, upstream_url, headers=fwd_headers, content=body if body else None)
+            resp = await client.send(req, stream=True)
+
+            content_type = resp.headers.get("content-type", "")
+            is_stream = "text/event-stream" in content_type
+
+            if is_stream:
+                status, _ = await _write_response(writer, resp, stats=stats)
+                if status and status >= 400:
+                    logger.warning(f"[{target['label']}] stream returned HTTP {status}")
+                return
+
+            # 非流式：先读 body，再判断是否要翻译 429
+            body_bytes = await resp.aread()
+            body_text = body_bytes.decode("utf-8", errors="replace")
+            status = resp.status_code
+
+            if status >= 400:
+                logger.warning(f"[{target['label']}] HTTP {status}: {body_text[:300]}")
+
+            if _vendor_body_retryable(body_text):
+                stats["translated429"] += 1
+                logger.info(f"[{target['label']}] translated HTTP {status} → 429 (rate_limit_error)")
+                err_payload = json.dumps({
+                    "error": {
+                        "type": "rate_limit_error",
+                        "message": "Upstream temporarily over capacity.",
+                        "original_status": resp.status_code,
+                    }
+                })
+                writer.write(
+                    f"HTTP/1.1 429 Too Many Requests\r\n"
+                    f"Content-Type: application/json\r\n"
+                    f"Retry-After: {_VENDOR_RETRY_AFTER}\r\n"
+                    f"Content-Length: {len(err_payload.encode())}\r\n"
+                    f"\r\n{err_payload}".encode()
+                )
+                await writer.drain()
+                writer.close()
+            else:
+                await _write_response(writer, resp, stats=stats)
+    except Exception:
+        stats["passthroughError"] += 1
+        logger.exception(f"[{target['label']}] vendor proxy exception")
+        try:
+            await _write_error_response(writer, 503, f"Proxy error for {target['label']}")
+        except Exception:
+            pass
+
+
+async def _vendor_server(host, port, target):
+    server = await asyncio.start_server(
+        lambda r, w: _handle_vendor_request(r, w, target),
+        host=host, port=port,
+    )
+    print(f"🔀 [{target['label']}] 0.0.0.0:{port} -> {target.get('targetProtocol','https')}://{target['targetHost']}:{target.get('targetPort', 443)}")
+    return server
+
+
 # ─── Provider 策略（开闭原则：新增 provider 只需在此注册） ───
 
 def _default_provider(req, litellm_req, _orig):
@@ -2734,6 +3351,79 @@ async def create_message(request: MessagesRequest, raw_request: Request):
             f"📊 UPSTREAM REQUEST: model={original_model} stream={body_json.get('stream')} max_tokens={upstream_max_tokens} thinking={upstream_thinking}"
         )
 
+        # ── Copilot /v1/messages 透传：直接转发 Anthropic 格式到下游 /v1/messages ──
+        # 绕过 convert_anthropic_to_litellm() → LiteLLM → /chat/completions 的双层翻译，
+        # Anthropic 原生格式零转换，thinking/tool_use/stream 等复杂结构不会丢失。
+        if PREFERRED_PROVIDER == "copilot":
+            target_model = _copilot_model_name(original_model)
+            copilot_msgs_body = dict(body_json)
+            copilot_msgs_body["model"] = target_model
+            # 清理 Copilot 不接受的空/None content
+            for msg in copilot_msgs_body.get("messages", []):
+                c = msg.get("content")
+                if c is None or (isinstance(c, str) and not c.strip()):
+                    msg["content"] = "."
+            # Copilot 不接受没有 tools 时的 tool_choice
+            if copilot_msgs_body.get("tool_choice") and not copilot_msgs_body.get("tools"):
+                copilot_msgs_body.pop("tool_choice")
+
+            copilot_msgs_url = f"{COPILOT_API_BASE}/v1/messages"
+            copilot_headers = {
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {COPILOT_GHE_TOKEN}",
+                "Copilot-Integration-Id": COPILOT_INTEGRATION_ID,
+                "anthropic-version": raw_request.headers.get("anthropic-version", "2023-06-01"),
+            }
+            log_request_beautifully(
+                "POST", raw_request.url.path, original_model, target_model,
+                len(copilot_msgs_body.get("messages", [])),
+                len(copilot_msgs_body.get("tools") or []), 200
+            )
+
+            if copilot_msgs_body.get("stream"):
+                async def copilot_messages_stream():
+                    last_err = None
+                    for attempt in range(3):
+                        if attempt > 0:
+                            await asyncio.sleep(0.5)
+                        client = httpx.AsyncClient(timeout=httpx.Timeout(300.0, connect=10.0), trust_env=False)
+                        try:
+                            async with client.stream("POST", copilot_msgs_url, json=copilot_msgs_body, headers=copilot_headers) as resp:
+                                if resp.status_code >= 500:
+                                    await resp.aread()
+                                    last_err = f"upstream {resp.status_code}"
+                                    continue
+                                async for chunk in resp.aiter_bytes():
+                                    yield chunk
+                                return
+                        except (httpx.ConnectError, httpx.ReadError, httpx.RemoteProtocolError) as e:
+                            last_err = str(e)
+                            continue
+                        finally:
+                            await client.aclose()
+                    yield json.dumps({"error": {"type": "proxy_error", "message": f"copilot /v1/messages upstream unavailable: {last_err}"}}).encode()
+                return StreamingResponse(copilot_messages_stream(), media_type="text/event-stream")
+            else:
+                last_err = None
+                for attempt in range(3):
+                    if attempt > 0:
+                        await asyncio.sleep(0.5)
+                    try:
+                        async with httpx.AsyncClient(timeout=httpx.Timeout(300.0, connect=10.0), trust_env=False) as client:
+                            resp = await client.post(copilot_msgs_url, json=copilot_msgs_body, headers=copilot_headers)
+                            if resp.status_code >= 500 and attempt < 2:
+                                last_err = f"upstream {resp.status_code}"
+                                continue
+                            resp_data = resp.json()
+                            # 还原 Claude Code 原始模型名
+                            if isinstance(resp_data, dict) and "model" in resp_data:
+                                resp_data["model"] = original_model
+                            return JSONResponse(content=resp_data, status_code=resp.status_code)
+                    except (httpx.ConnectError, httpx.ReadError, httpx.RemoteProtocolError) as e:
+                        last_err = str(e)
+                        continue
+                raise HTTPException(status_code=502, detail=f"copilot /v1/messages upstream unavailable: {last_err}")
+
         # Convert Anthropic request to LiteLLM format
         litellm_request = convert_anthropic_to_litellm(request)
 
@@ -3111,25 +3801,136 @@ async def count_tokens(request: TokenCountRequest, raw_request: Request):
         raise HTTPException(status_code=500, detail=f"Error counting tokens: {str(e)}")
 
 
-def _build_models_list():
+# ── 下游模型列表缓存（避免每次 /v1/models 都请求上游）──
+_DOWNSTREAM_MODELS_CACHE: Optional[List[dict]] = None
+_DOWNSTREAM_MODELS_CACHE_TIME: float = 0
+_MODELS_CACHE_TTL: float = 300.0  # 5 分钟
+
+
+async def _fetch_downstream_models() -> List[dict]:
+    """从下游网关拉取模型列表，按下游 endpoint 区分 provider 拉取方式。
+
+    - copilot / openai / qclaw：直连下游 /models（OpenAI 格式）
+    - 返回统一格式的 model dict 列表
+    """
+    global _DOWNSTREAM_MODELS_CACHE, _DOWNSTREAM_MODELS_CACHE_TIME
+    now = time.time()
+    if _DOWNSTREAM_MODELS_CACHE and (now - _DOWNSTREAM_MODELS_CACHE_TIME) < _MODELS_CACHE_TTL:
+        return _DOWNSTREAM_MODELS_CACHE
+
+    downstream = []
+    try:
+        if PREFERRED_PROVIDER == "copilot":
+            async with httpx.AsyncClient(timeout=httpx.Timeout(10.0), trust_env=False) as client:
+                resp = await client.get(
+                    f"{COPILOT_API_BASE}/models",
+                    headers={
+                        "Authorization": f"Bearer {COPILOT_GHE_TOKEN}",
+                        "Copilot-Integration-Id": COPILOT_INTEGRATION_ID,
+                    },
+                )
+                if resp.status_code == 200:
+                    data = resp.json()
+                    for m in data.get("data", []):
+                        caps = m.get("capabilities", {}) or {}
+                        family = caps.get("family", m.get("id", ""))
+                        limits = caps.get("limits", {}) or {}
+                        supports = caps.get("supports", {}) or {}
+                        endpoints = m.get("supported_endpoints", [])
+                        downstream.append({
+                            "id": m["id"],
+                            "object": "model",
+                            "created": 1700000000,
+                            "owned_by": m.get("vendor", "copilot"),
+                            "display_name": m.get("name", m["id"]),
+                            "description": m.get("id", ""),
+                            # 扩展字段 — 透传给了解下游能力的客户端
+                            "context_window": limits.get("max_context_window_tokens"),
+                            "max_output_tokens": limits.get("max_output_tokens"),
+                            "supports_tools": supports.get("tool_calls", False),
+                            "supports_vision": supports.get("vision", False),
+                            "supports_streaming": supports.get("streaming", False),
+                            "supports_thinking": supports.get("adaptive_thinking", False),
+                            "supports_reasoning_effort": supports.get("reasoning_effort", []),
+                            "supported_endpoints": endpoints,
+                            "model_family": family,
+                            "tokenizer": caps.get("tokenizer"),
+                            "preview": m.get("preview", False),
+                        })
+        elif PREFERRED_PROVIDER in ("openai",):
+            # OpenAI 上游
+            base = OPENAI_BASE_URL or "https://api.openai.com/v1"
+            url = base.rstrip("/") + "/models"
+            async with httpx.AsyncClient(timeout=httpx.Timeout(10.0), trust_env=False) as client:
+                resp = await client.get(url, headers={"Authorization": f"Bearer {OPENAI_API_KEY}"})
+                if resp.status_code == 200:
+                    data = resp.json()
+                    for m in data.get("data", []):
+                        downstream.append({
+                            "id": m["id"],
+                            "object": "model",
+                            "created": m.get("created", 1700000000),
+                            "owned_by": m.get("owned_by", "openai"),
+                            "display_name": m.get("id", ""),
+                        })
+
+        if downstream:
+            logger.debug(f"Fetched {len(downstream)} downstream models from {PREFERRED_PROVIDER}")
+            _DOWNSTREAM_MODELS_CACHE = downstream
+            _DOWNSTREAM_MODELS_CACHE_TIME = now
+    except Exception as e:
+        logger.warning(f"Failed to fetch downstream models: {e}")
+        if _DOWNSTREAM_MODELS_CACHE:
+            return _DOWNSTREAM_MODELS_CACHE  # 用过期缓存兜底
+
+    return downstream
+
+
+def _build_models_list(include_aliases: bool = True) -> List[dict]:
     """构建模型列表，同时兼容 OpenAI 和 Anthropic 两套规范。
+
+    - copilot/openai provider：从下游 /models 拉取 + Claude Code 别名
+    - 其他 provider：硬编码列表 + 别名
+    - include_aliases=True：加 Anthropic 别名（8081 Anthropic 端口用）
+    - include_aliases=False：只返回真实下游模型（8082 OpenAI 端口用）
 
     OpenAI 客户端读 object/owned_by，Anthropic 客户端读 type/display_name，
     两套字段都塞进去，各取所需。
     """
-    models = []
+    models: List[dict] = []
 
-    # ── 翻译链路别名（Claude Code 等 Anthropic 客户端用）──
-    _claude_aliases = [
+    # ── 翻译链路别名（仅 8081 Anthropic 端口需要）──
+    if include_aliases:
+        _claude_aliases = [
         ("claude-sonnet-4-20250514", "Claude Sonnet 4"),
         ("claude-haiku-4-20250514", "Claude Haiku 4"),
-        ("claude-opus-4-20250514", "Claude Opus 4"),
+            ("claude-opus-4-20250514", "Claude Opus 4"),
         ("sonnet", "Claude Sonnet"),
         ("haiku", "Claude Haiku"),
         ("opus", "Claude Opus"),
     ]
 
-    # ── 透传链路真实模型（根据 provider 动态选择）──
+        # ── 先加别名（同步可用的）──
+        for mid, display in _claude_aliases:
+            models.append({
+                "id": mid,
+                "object": "model",
+                "type": "model",
+                "created": 1700000000,
+                "owned_by": "anthropic",
+                "display_name": display,
+            })
+
+    # ── 能用下游 /models 的 provider：直接用缓存的列表（异步预拉取在 startup 完成）──
+    _downstream = _DOWNSTREAM_MODELS_CACHE or []
+    if _downstream:
+        for dm in _downstream:
+            entry = dict(dm)
+            entry.setdefault("type", "model")
+            models.append(entry)
+        return models
+
+    # ── 无下游缓存的 fallback（qclaw / gemini / anthropic 等）──
     _passthrough_models = []
     if PREFERRED_PROVIDER in ("qclaw", "qclaw-local"):
         _passthrough_models = [
@@ -3150,14 +3951,14 @@ def _build_models_list():
             (COPILOT_SMALL_MODEL, "Copilot Small"),
         ]
 
-    for mid, display in _claude_aliases + _passthrough_models:
+    for mid, display in _passthrough_models:
         models.append({
             "id": mid,
-            "object": "model",          # OpenAI 字段
-            "type": "model",            # Anthropic 字段
-            "created": 1700000000,      # OpenAI 字段
-            "owned_by": "anthropic" if mid.startswith("claude") or mid in ("sonnet", "haiku", "opus") else "qclaw",
-            "display_name": display,    # Anthropic 字段
+            "object": "model",
+            "type": "model",
+            "created": 1700000000,
+            "owned_by": "qclaw" if mid.startswith("pool") or mid == "modelroute" else "copilot",
+            "display_name": display,
         })
 
     return models
@@ -3167,16 +3968,12 @@ def _build_models_list():
 @app.get("/api/v1/models")
 @app.get("/openai/v1/models")
 async def list_models():
-    """返回模型列表，兼容 OpenAI 和 Anthropic 两套规范。
-
-    各种 OpenAI 兼容工具（Cline/aider/Continue/openclaw 等）会用不同路径探测模型列表，
-    所以同时挂载 /v1/models、/api/v1/models、/openai/v1/models 三个路由。
-    """
-    return {
-        "data": _build_models_list(),
-        "object": "list",
-        "has_more": False,
-    }
+    """8081 Anthropic /v1/models — 硬编码 6 个模型"""
+    models = [
+        {"id": m, "object": "model", "type": "model", "created": 1700000000, "owned_by": "anthropic", "display_name": m}
+        for m in _ANTHROPIC_PORT_MODELS
+    ]
+    return {"data": models, "object": "list", "has_more": False}
 
 
 @app.get("/api/tags")
@@ -3197,6 +3994,178 @@ async def list_ollama_tags():
 @app.get("/")
 async def root():
     return {"message": "Anthropic Proxy for LiteLLM"}
+
+
+# ─── 统一管理面板（所有 LLM 相关服务一览）─────────────────────────────
+
+DASHBOARD_STYLE = """
+  body { font-family: -apple-system, "Segoe UI", sans-serif; background: #0f1117; color: #e0e0e0; margin: 0; padding: 32px; }
+  h1 { font-size: 20px; margin-bottom: 4px; }
+  .sub { color: #8b8fa3; font-size: 13px; margin-bottom: 28px; }
+  .section { margin-bottom: 28px; }
+  .section-title { font-size: 14px; font-weight: 600; color: #9ca3af; text-transform: uppercase; letter-spacing: 1px; margin-bottom: 10px; padding-bottom: 6px; border-bottom: 1px solid #1f2233; }
+  .card { background: #1a1c2e; border: 1px solid #2a2d3e; border-radius: 10px; padding: 18px 22px; margin-bottom: 14px; }
+  .card:hover { border-color: #3b4060; }
+  .card-header { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 10px; margin-bottom: 12px; }
+  .card-name { font-size: 16px; font-weight: 600; }
+  .card-note { font-weight: 400; color: #6b7280; font-size: 13px; }
+  .badge-group { display: flex; gap: 6px; flex-wrap: wrap; }
+  .badge { font-size: 11px; padding: 3px 9px; border-radius: 5px; font-weight: 600; white-space: nowrap; }
+  .badge.green { background: #16241c; color: #4ade80; }
+  .badge.yellow { background: #2a1f10; color: #fbbf24; }
+  .badge.blue { background: #16213e; color: #60a5fa; }
+  .badge.purple { background: #2a1e3e; color: #c084fc; }
+  .badge.red { background: #2e1a1a; color: #f87171; }
+  .kv { display: grid; grid-template-columns: 130px 1fr; gap: 6px 16px; font-size: 13px; margin-bottom: 10px; }
+  .kv div:nth-child(odd) { color: #8b8fa3; }
+  code { color: #60a5fa; }
+  a { color: #6c8cff; }
+  .mini-stats { display: flex; gap: 18px; flex-wrap: wrap; font-size: 12.5px; color: #9ca3af; margin-top: 4px; }
+  .mini-stats b { color: #e0e0e0; }
+  details { margin-top: 10px; }
+  summary { cursor: pointer; font-size: 13px; color: #6c8cff; user-select: none; padding: 4px 0; }
+  summary:hover { color: #8ba3ff; }
+  ul { list-style: none; padding: 0; margin: 8px 0 0 0; display: flex; flex-wrap: wrap; gap: 6px; }
+  li { background: #151827; border: 1px solid #2a2d3e; border-radius: 6px; padding: 5px 9px; font-size: 12.5px; }
+"""
+
+
+def _html_escape(s):
+    return str(s).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;")
+
+
+def _model_details_html(models):
+    if not models:
+        return '<div style="font-size:12px;color:#6b7280;margin-top:6px;">(暂无模型数据)</div>'
+    rows = "".join(f"<li><code>{_html_escape(m)}</code></li>" for m in models)
+    return f'<details><summary>▸ 展开模型列表（{len(models)} 个）</summary><ul>{rows}</ul></details>'
+
+
+def _build_card_html(name, note, kind_badge, status_badge, status_badge_class, kv_items, stats_items, models, description=""):
+    """统一卡片渲染：透传目标和定制服务用同一套视觉风格。"""
+    badges = f'<span class="badge {kind_badge}">{_html_escape(kind_badge)}</span>'
+    if status_badge:
+        badges += f' <span class="badge {status_badge_class}">{_html_escape(status_badge)}</span>'
+    kv = "".join(f"<div>{_html_escape(k)}</div><div><code>{_html_escape(str(v))}</code></div>" for k, v in kv_items)
+    stats = "".join(f"<div>{_html_escape(k)} <b>{_html_escape(str(v))}</b></div>" for k, v in stats_items) if stats_items else ""
+    return f"""<div class="card">
+  <div class="card-header">
+    <div class="card-name">🔀 {_html_escape(name)} <span class="card-note">（{_html_escape(note)}）</span></div>
+    <div class="badge-group">{badges}</div>
+  </div>
+  <div class="kv">{kv}</div>
+  {f'<div style="font-size:12.5px;color:#8b8fa3;margin-bottom:8px;">{_html_escape(description)}</div>' if description else ""}
+  {f'<div class="mini-stats">{stats}</div>' if stats_items else ""}
+  {_model_details_html(models)}
+</div>"""
+
+
+@app.get("/dashboard", response_class=HTMLResponse)
+async def dashboard():
+    """统一管理面板 — 展示本机所有 LLM 相关服务的架构与状态。"""
+
+    # ── 并行拉取各 asyncio TCP 端口的状态 ──
+    async def _fetch(port):
+        try:
+            async with httpx.AsyncClient(timeout=httpx.Timeout(5.0), trust_env=False) as c:
+                info_r = await c.get(f"http://127.0.0.1:{port}/__proxy_info__")
+                stats_r = await c.get(f"http://127.0.0.1:{port}/__proxy_stats__")
+                info = info_r.json() if info_r.status_code == 200 else {}
+                stats = stats_r.json() if stats_r.status_code == 200 else {}
+                return {
+                    "label": info.get("label", f"port-{port}"),
+                    "listenPort": port, "upstream": f"{info.get('targetProtocol','https')}://{info.get('targetHost','?')}:{info.get('targetPort',443)}",
+                    "models": info.get("models", []),
+                    "total": stats.get("totalRequests", 0),
+                    "ok": stats.get("passthroughOk", 0),
+                    "translated": stats.get("translated429", 0),
+                    "err": stats.get("passthroughError", 0),
+                    "alive": info_r.status_code == 200,
+                }
+        except Exception:
+            return {"label": f"port-{port}", "listenPort": port, "upstream": "?", "models": [], "total": 0, "ok": 0, "translated": 0, "err": 0, "alive": False}
+
+    results = await asyncio.gather(_fetch(8082), _fetch(8090), _fetch(8091))
+
+    cards = []
+
+    # ── 8081 Anthropic（FastAPI，本 App 自身） ──
+    cards.append(_build_card_html(
+        name="claude-code-proxy (8081 Anthropic)",
+        note="FastAPI · Anthropic 协议入口 · /v1/messages 翻译为 OpenAI 后内部请求 8082",
+        kind_badge="协议转换",
+        status_badge="运行中",
+        status_badge_class="purple",
+        kv_items=[
+            ("监听地址", "http://0.0.0.0:8081"),
+            ("内部回调", "http://127.0.0.1:8082/v1/chat/completions"),
+            ("协议", "Anthropic /v1/messages → OpenAI 翻译"),
+            ("模型数量", f"{len(_ANTHROPIC_PORT_MODELS)} 个（仅 Anthropic）"),
+            ("systemd 服务", "claude-code-proxy"),
+        ],
+        stats_items=[],
+        models=_ANTHROPIC_PORT_MODELS,
+        description="接收 Anthropic 客户端请求，结构化解码后转换为 OpenAI 格式，内部转发到 8082 的多 provider 路由。响应译回 Anthropic 格式。",
+    ))
+
+    # ── 8082 OpenAI（asyncio TCP，多 provider 路由） ──
+    r82 = results[0]
+    cards.append(_build_card_html(
+        name="OpenAI Proxy (8082)",
+        note="asyncio TCP · OpenAI 协议 · 多 provider 路由",
+        kind_badge="透传路由",
+        status_badge=f"{r82['total']} 请求" if r82["alive"] else "离线",
+        status_badge_class="blue" if r82["alive"] else "red",
+        kv_items=[
+            ("监听地址", "http://0.0.0.0:8082"),
+            ("映射后端", f"按 PREFERRED_PROVIDER 动态切换（当前: {_html_escape(PREFERRED_PROVIDER)}）"),
+            ("协议", "OpenAI /v1/chat/completions 直接透传"),
+            ("模型数量", f"{len(r82['models'])} 个"),
+            ("systemd 服务", "claude-code-proxy"),
+        ],
+        stats_items=[("总请求", r82["total"]), ("正常透传", r82["ok"]), ("代理错误", r82["err"])] if r82["alive"] else [],
+        models=r82["models"] if r82["alive"] else [],
+        description="纯透传 + 多 provider 鉴权路由（copilot/qclaw/openai ···）。8081 翻译后的 OpenAI 请求和外部 OpenAI 客户端都走这里。",
+    ))
+
+    # ── 8090 / 8091 透明反代 ──
+    for r in results[1:]:
+        s = "alive" if r["alive"] else "offline"
+        cards.append(_build_card_html(
+            name=r["label"],
+            note="asyncio TCP · 透明反代 + 429 错误翻译",
+            kind_badge="透传代理" if r["alive"] else "offline",
+            status_badge=f"已翻译 429 × {r['translated']}" if r["translated"] > 0 else "无异常",
+            status_badge_class="yellow" if r["translated"] > 0 else "green",
+            kv_items=[
+                ("监听地址", f"http://0.0.0.0:{r['listenPort']}"),
+                ("映射上游", r["upstream"]),
+                ("模型数量", f"{len(r['models'])} 个"),
+            ],
+            stats_items=[("总请求", r["total"]), ("正常透传", r["ok"]), ("翻译 429", r["translated"]), ("代理错误", r["err"])] if r["alive"] else [],
+            models=r["models"],
+        ))
+
+    cards_html = "".join(cards)
+    all_models = _build_models_list()
+
+    return f"""<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta http-equiv="refresh" content="15">
+<title>LLM Gateway — 管理总览</title>
+<style>{DASHBOARD_STYLE}</style>
+</head>
+<body>
+  <h1>🔀 LLM Gateway — 管理总览</h1>
+  <div class="sub">8081 Anthropic (FastAPI) → 8082 OpenAI (asyncio TCP 多 provider 路由) → 上游 · 自动 15s 刷新</div>
+  <div class="section">
+    <div class="section-title">服务架构</div>
+    {cards_html}
+  </div>
+</body>
+</html>"""
 
 
 # Catch-all route to handle OAuth and other unexpected endpoints
@@ -3288,7 +4257,7 @@ if __name__ == "__main__":
         print("Example: PREFERRED_PROVIDER=qclaw python server.py")
         sys.exit(0)
 
-    port = 8082
+    port = 8081
     if "--port" in sys.argv:
         idx = sys.argv.index("--port")
         if idx + 1 < len(sys.argv):
