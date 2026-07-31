@@ -494,6 +494,16 @@ async def lifespan(app):
         except Exception as _me:
             logger.warning(f"startup: failed to preload downstream models: {_me}")
 
+    # ── 破解类 target：缺 key 时自动调用破解工具提取 ──
+    for t in _TARGETS:
+        if t.get("category") == "crack" and t.get("enabled", True):
+            if not _cfg.resolve_secret(t, _SECRETS) and t.get("crackTool"):
+                print(f"🔓 [{t['label']}] 缺 token，调用破解工具 {t['crackTool']} ...")
+                _run_crack_tool(t["crackTool"])
+            else:
+                has = bool(_cfg.resolve_secret(t, _SECRETS))
+                print(f"🔑 [{t['label']}] token {'已就绪' if has else '缺失（跳过破解，dashboard 可补）'}")
+
     # ── 启动所有 target 驱动端口（8082 copilot, 8084 codebuddy, 8085 qclaw, 8090-8094 等）──
     # 8081 Anthropic 由 uvicorn FastAPI 处理（不在此处启动）
     _vendor_servers = []
@@ -991,6 +1001,41 @@ def _load_vendor_targets():
     print(f"🔀 Targets loaded: {len(_TARGETS)} targets, anthropicForwardPort={_ANTHROPIC_FORWARD_PORT}")
 
 _load_vendor_targets()
+
+
+def _refresh_secrets():
+    """重读 secrets.json 到内存（热生效）。"""
+    global _SECRETS
+    _SECRETS = _cfg.load_secrets()
+    logger.info(f"🔑 secrets.json reloaded ({len(_SECRETS)} keys)")
+
+
+def _run_crack_tool(crack_tool: str) -> bool:
+    """调用破解工具脚本提取 token（超时 30s）。成功返回 True。"""
+    import subprocess
+    script = Path(__file__).parent / crack_tool
+    if not script.exists():
+        logger.warning(f"破解工具不存在: {script}")
+        return False
+    try:
+        r = subprocess.run(
+            [sys.executable, str(script)],
+            capture_output=True, text=True, timeout=30,
+            cwd=str(Path(__file__).parent),
+        )
+        if r.returncode == 0:
+            logger.info(f"🔓 破解工具 {crack_tool} 成功: {r.stdout.strip()[:200]}")
+            _refresh_secrets()
+            return True
+        logger.warning(f"🔓 破解工具 {crack_tool} 失败 (rc={r.returncode}): {r.stdout.strip()[:200]}")
+        return False
+    except subprocess.TimeoutExpired:
+        logger.warning(f"🔓 破解工具 {crack_tool} 超时（30s）")
+        return False
+    except Exception as e:
+        logger.warning(f"🔓 破解工具 {crack_tool} 异常: {e}")
+        return False
+
 
 # ─── 8081 Anthropic 协议端口（对内透传 8082，模型列表隔离） ───
 
