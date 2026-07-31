@@ -198,56 +198,26 @@ tail -f /tmp/proxy.log
 
 ---
 
-## 四端口架构
+## 多端口架构 🏗️
 
-单进程运行 **4 个端口**：
+| 端口 | 供应商 | 分类 | handler |
+|------|--------|------|---------|
+| 8081 | Anthropic 入口 + dashboard | — | FastAPI |
+| 8082 | copilot | crack | copilot |
+| 8084 | codebuddy | crack | passthrough |
+| 8085 | claw (QClaw) | crack | qclaw |
+| 8086 | trae-work (预留) | crack | passthrough |
+| 8090 | openrouter | free | passthrough |
+| 8091 | nvidia | free | passthrough |
+| 8092 | gemini-openai | free | passthrough |
+| 8093 | opencode-zen | free | passthrough |
+| 8094 | open-go | paid | passthrough |
 
-| 端口 | 协议 | 处理方式 | 用途 |
-|------|------|---------|------|
-| **8081** | Anthropic | FastAPI (uvicorn) | `/v1/messages` → 翻译成 OpenAI → 内部请求 8082 |
-| **8082** | OpenAI | asyncio TCP | 多 provider 路由（qclaw/copilot/openai），共用 HTTP 工具函数 |
-| **8090** | OpenAI | asyncio TCP（透明代理） | 透传 → OpenRouter（自动 `/v1`→`/api/v1` 路径重写） |
-| **8091** | OpenAI | asyncio TCP（透明代理） | 透传 → Nvidia API |
-
-```
-Claude Code (Anthropic)
-  ──▶ 8081 (Anthropic FastAPI)
-        └── 翻译成 OpenAI ──▶ 8082 (OpenAI TCP)
-                              ├─ qclaw      → httpx → QClaw 上游
-                              ├─ copilot    → httpx → Copilot Enterprise
-                              └─ openai     → httpx → OpenAI
-
-OpenCode / OpenAI 客户端
-  ├──▶ 8082 (OpenAI TCP，多 provider 路由)
-  ├──▶ 8090 (透明代理 → OpenRouter，key 透传)
-  └──▶ 8091 (透明代理 → Nvidia，key 透传)
-```
-
-### 透明代理（8090 / 8091）
-
-通过 [`targets.json`](targets.json) 配置：
-
-```json
-{
-  "label": "openrouter",
-  "listenPort": 8090,
-  "targetHost": "openrouter.ai",
-  "routePrefix": "/api/v1",
-  "models": ["nvidia/nemotron-3-ultra-550b-a55b:free"]
-}
-```
-
-- **routePrefix**：客户端发 `/v1/...`，代理自动重写为上游实际路径（OpenRouter 需 `/api/v1`）
-- **Key 透传**：不硬编码 API Key，客户端发什么 `Authorization` 就透传什么
-- **429 翻译**：上游 `ResourceExhausted` 自动转为 HTTP 429 + `Retry-After: 3`，客户端自动退避
-- **非 200 日志**：所有 4xx/5xx 错误自动记录响应 body（前 300 字符）
-- **异常保护**：连接错误返回 HTTP 503，不会静默断连
-
-### 模型列表隔离
-
-- **8081** `/v1/models`：只返回 6 个 Anthropic 模型（`claude-sonnet-4-20250514` 等）
-- **8082** `/v1/models`：返回完整的真实下游模型列表（不含 Anthropic 别名）
-- **8090/8091** `/v1/models`：透传上游的完整模型列表
+- **统一透传引擎**：所有端口共享 HTTP 解析/转发/429 翻译/重试逻辑，由 `targets.json` 驱动
+- **分类**：`crack`（破解，注入 secrets.json token）/ `free`（免费，透传客户端 key）/ `paid`（收费，透传客户端 key）
+- **isFree**：管理界面维护，标记供应商 key 是否免费（重试策略预留字段）
+- **破解工具**：`crack_qclaw.py` / `crack_codebuddy.py` / `crack_copilot.py` / `crack_traework.py`，启动时自动调用，可独立 CLI 运行
+- **管理界面**：`http://127.0.0.1:8081/dashboard` 可编辑 token/isFree，热生效无需重启
 
 ## 测试
 

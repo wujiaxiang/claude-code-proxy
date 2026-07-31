@@ -1,5 +1,22 @@
 # Changelog
 
+## [Unreleased]
+
+### Added
+- 横向扩展多端口架构：一端口一供应商（8082 copilot / 8084 codebuddy / 8085 qclaw / 8086 trae-work 预留 / 8090-8094 免费代理）
+- targets.json 新 schema（category/isFree/handler/crackTool/secretRef/enabled/modelMapping/reasoning）
+- secrets.json 私密 key/token 存储（gitignore，dashboard 热更新）
+- 独立破解工具 crack_qclaw / crack_codebuddy / crack_copilot / crack_traework（统一 CLI）
+- dashboard 管理界面：REST API（/api/targets、/api/secrets、/api/reload、recrack）+ token/isFree 编辑表单
+- 配置热重载：mtime 轮询（2s），端口动态增删，无需重启
+
+### Changed
+- 8082 从 PREFERRED_PROVIDER 动态切换改为固定 copilot
+- qclaw 配置从 .env 迁入 targets.json 的 8085 条目
+- 8081 转发目标由 anthropicForwardPort 配置（默认 8082）
+
+---
+
 ## 2026-07-16 — qclaw-local provider 方案落地 + 19000 网关机制完整破解
 
 ### 新增

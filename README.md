@@ -226,55 +226,26 @@ The proxy exposes **two endpoints**, both available for all providers:
 >
 > `anthropic` 和 `gemini`（原生 API）后端不是 OpenAI 兼容格式，`/v1/chat/completions` 上仍通过 LiteLLM 进行格式翻译。
 
-## Architecture (4 Ports) 🏗️
+## Architecture (Multi-Port) 🏗️
 
-The proxy now runs **4 ports** in a single process:
+| 端口 | 供应商 | 分类 | handler |
+|------|--------|------|---------|
+| 8081 | Anthropic 入口 + dashboard | — | FastAPI |
+| 8082 | copilot | crack | copilot |
+| 8084 | codebuddy | crack | passthrough |
+| 8085 | claw (QClaw) | crack | qclaw |
+| 8086 | trae-work (预留) | crack | passthrough |
+| 8090 | openrouter | free | passthrough |
+| 8091 | nvidia | free | passthrough |
+| 8092 | gemini-openai | free | passthrough |
+| 8093 | opencode-zen | free | passthrough |
+| 8094 | open-go | paid | passthrough |
 
-| Port | Protocol | Handler | Purpose |
-|------|----------|---------|---------|
-| **8081** | Anthropic | FastAPI (uvicorn) | `/v1/messages` → translates to OpenAI → internal request to 8082 |
-| **8082** | OpenAI | asyncio TCP | Multi-provider routing (qclaw/copilot/openai), `/v1/chat/completions` |
-| **8090** | OpenAI | asyncio TCP (vendor) | Transparent proxy → OpenRouter API (with `/v1`→`/api/v1` path rewrite) |
-| **8091** | OpenAI | asyncio TCP (vendor) | Transparent proxy → Nvidia API |
-
-```
-Claude Code (Anthropic)
-  ──▶ 8081 (Anthropic FastAPI)
-        └── translates to OpenAI ──▶ 8082 (OpenAI TCP)
-                                      ├─ qclaw      → httpx → QClaw upstream
-                                      ├─ copilot    → httpx → Copilot Enterprise
-                                      └─ openai     → httpx → OpenAI
-
-OpenCode / OpenAI clients
-  ├──▶ 8082 (OpenAI TCP, multi-provider routing)
-  ├──▶ 8090 (vendor proxy → OpenRouter, with key passthrough)
-  └──▶ 8091 (vendor proxy → Nvidia, with key passthrough)
-```
-
-### Vendor Proxy (8090 / 8091)
-
-Configured via [`targets.json`](targets.json). Each target specifies upstream host, route prefix, and model list:
-
-```json
-{
-  "label": "openrouter",
-  "listenPort": 8090,
-  "targetHost": "openrouter.ai",
-  "routePrefix": "/api/v1",
-  "models": ["nvidia/nemotron-3-ultra-550b-a55b:free", "..."]
-}
-```
-
-- **routePrefix**: Rewrites request path `/v1/...` → custom prefix (e.g., OpenRouter needs `/api/v1/...`)
-- **Key passthrough**: API keys are NOT stored in targets.json — the proxy forwards whatever `Authorization` header the client sends
-- **429 translation**: Upstream `ResourceExhausted` errors are translated to HTTP 429 with `Retry-After: 3` for automatic client backoff
-- **Non-200 logging**: All upstream error responses (4xx/5xx) are automatically logged with body preview (300 chars)
-- **Exception handling**: Connection errors return HTTP 503 instead of silent connection close
-
-### 8081 /v1/models Isolation
-
-8081 returns only 6 Anthropic models (`claude-sonnet-4-20250514`, etc.).  
-8082 returns the full real downstream model list (no hardcoded Anthropic aliases).
+- **统一透传引擎**：所有端口共享 HTTP 解析/转发/429 翻译/重试逻辑，由 `targets.json` 驱动
+- **分类**：`crack`（破解，注入 secrets.json token）/ `free`（免费，透传客户端 key）/ `paid`（收费，透传客户端 key）
+- **isFree**：管理界面维护，标记供应商 key 是否免费（重试策略预留字段）
+- **破解工具**：`crack_qclaw.py` / `crack_codebuddy.py` / `crack_copilot.py` / `crack_traework.py`，启动时自动调用，可独立 CLI 运行
+- **管理界面**：`http://127.0.0.1:8081/dashboard` 可编辑 token/isFree，热生效无需重启
 
 ## How It Works 🧩
 

@@ -45,60 +45,49 @@ Set-Location "c:\Users\Administrator\claude-code-proxy-main"
 
 ---
 
-## 3. 配置文件 `.env`
+## 3. 配置文件
 
-**所有 provider/model 配置都在 `.env`**，不要硬编码到 VBS 或环境变量。
+### `.env`（已简化）
 
-### 当前配置（DeepSeek V4 Pro）
+多端口架构下，`PREFERRED_PROVIDER` 已废弃——不再由 `.env` 控制端口路由，所有 target 由 [`targets.json`](targets.json) 定义。
 
-```ini
-PREFERRED_PROVIDER=qclaw
-BIG_MODEL=pool-deepseek-v4-pro
-MEDIUM_MODEL=pool-deepseek-v4-pro
-SMALL_MODEL=pool-deepseek-v4-pro
-BIG_REASONING=high
-MEDIUM_REASONING=low
-SMALL_REASONING=low
-```
+`.env` 中仅保留全局配置：`DEBUG`、`LOG_FILE`、`LOG_RETENTION_DAYS`、`LOG_ROTATE_WHEN`、`LOG_ROTATE_INTERVAL`。
 
-### 支持的 Provider（7 个）
+### `targets.json`（Target 定义）
 
-| Provider | 后端 | `/v1/chat/completions` 行为 |
-|----------|------|---------------------------|
-| `anthropic` | Anthropic / DeepSeek | LiteLLM 翻译 |
-| `gemini` | Gemini 原生 API | LiteLLM 翻译 |
-| `gemini-openai` | Gemini OpenAI 兼容端点 | **直接透传** |
-| `openai` | OpenAI 官方 | **直接透传** |
-| `copilot` | GitHub Copilot Enterprise | **直接透传** |
-| `qclaw` | QClaw 直连上游 `mmgrcalltoken.3g.qq.com` | **直接透传** |
-| `qclaw-local` | QClaw 19000 本地网关（需寄生注入） | **直接透传** |
+每个 target 指定端口、供应商、分类、handler、上游 host、模型映射等。端口-供应商绑定由 targets.json 的 `listenPort` 字段定义，无需修改 server.py。
 
-### QClaw 可用模型（11 个）
+### `secrets.json`（私密 key/token）
 
-`modelroute`、`pool-hy3-preview`、`pool-deepseek-v4-pro`、`pool-deepseek-v4-flash`、`pool-glm-5.2`、`pool-glm-5.2-night`、`pool-glm-5.1`、`pool-kimi-k2.7-code-highspeed`、`pool-kimi-k2.6`、`pool-minimax-m3`、`pool-minimax-m2.7`
+破解工具 (`crack_copilot.py` / `crack_codebuddy.py` / `crack_qclaw.py`) 提取的 API key/token 写入此文件，dashboard 可编辑。不入库（gitignored）。
 
-> ⚠️ `hunyuan/hy3` 系列上游不支持，会返回 `model_not_valid`。
+格式：`{"copilot_token": "...", "codebuddy_token": "...", "qclaw_api_key": "...", "trae_work_token": ""}`
 
 ---
 
-## 4. API 端点
+## 4. API 端点（多端口架构）
 
-| 端点 | 协议 | 用途 |
-|------|------|------|
-| `POST /v1/messages` | Anthropic | Claude Code / Anthropic SDK |
-| `POST /v1/chat/completions` | OpenAI | OpenAI SDK / 透传链路 |
-| `POST /v1/messages/count_tokens` | Anthropic | Token 计数 |
-| `GET /v1/models` | OpenAI | 模型列表 |
+| 端口 | 供应商 | 协议 | 用途 |
+|------|--------|------|------|
+| **8081** | Anthropic 入口 + dashboard | FastAPI | `/v1/messages`（Anthropic）/ dashboard 管理界面 / `/api/targets` 等 REST API |
+| **8082** | copilot | OpenAI | `/v1/chat/completions`（透传）+ 由 8081 内部转发 |
+| **8084** | codebuddy | OpenAI | `/v1/chat/completions`（crack 透传） |
+| **8085** | qclaw | OpenAI | `/v1/chat/completions`（qclaw 透传） |
+| **8086** | trae-work (预留) | OpenAI | 暂未启用 |
+| **8090** | openrouter | OpenAI | 免费代理（透传客户端 key） |
+| **8091** | nvidia | OpenAI | 免费代理 |
+| **8092** | gemini-openai | OpenAI | 免费代理 |
+| **8093** | opencode-zen | OpenAI | 免费代理 |
+| **8094** | open-go | OpenAI | 收费代理 |
 
-### 默认监听端口
-
-- `0.0.0.0:8082`（生产环境，`192.168.2.177:8082`）
-- 本地调试用 `8083` 避免冲突
+- **配置驱动**：所有 target 由 `targets.json` 定义，无需修改 server.py
+- **分类**：`crack`（破解获取 token）/ `free`（免费透传）/ `paid`（收费透传）
+- **热重载**：mtime 轮询（2s），targets.json / secrets.json 修改后自动生效
 
 ### 客户端接入
 
 **OpenAI 协议**：`base_url = http://192.168.2.177:8082/v1`，`api_key = "dummy"`（代理不校验）
-**Anthropic 协议**：`base_url = http://192.168.2.177:8082`，`api_key = "dummy"`
+**Anthropic 协议**：`base_url = http://192.168.2.177:8081`，`api_key = "dummy"`
 
 ---
 
@@ -110,6 +99,7 @@ SMALL_REASONING=low
 - 读取 `%APPDATA%\QClaw\app-store.json` 的 `authGateway.providers.qclaw.apiKey.cipherText`
 - 读取 `%APPDATA%\QClaw\Local State` 的 `os_crypt.encrypted_key`
 - DPAPI 解密 AES 密钥 → AES-256-GCM 解密 cipherText → 得到 `sk-...` API Key
+- Key 提取后写入 `secrets.json` 的 `qclaw_api_key` 字段，dashboard 可编辑
 - 环境变量 `QCLAW_API_KEY` 优先级最高，可手动覆盖
 
 **所以 QClaw 客户端只需登录过一次，代理就能自动拿到 Key，不需要 QClaw 持续运行**（除非用 `qclaw-local`）。
@@ -147,22 +137,23 @@ SMALL_REASONING=low
 ## 6. 代码结构（server.py）
 
 ```
-Line 1-50      模块导入 + load_dotenv()
-Line 44-156    tiktoken 本地 token 估算
-Line 157-256   日志配置（彩色 + 滚动）
-Line 257-320   httpx 客户端管理 + QClaw body 清理
-Line 321-462   QClaw 透传函数 + OpenAI→Anthropic 转换
-Line 463-533   FastAPI lifespan（启动诊断）+ 异常处理
-Line 534-650   QClaw API Key DPAPI/AES 解密
-Line 651-822   Provider 策略注册（开闭原则）
-Line 824-870   模型名映射（opus/sonnet/haiku → BIG/MEDIUM/SMALL）
-Line 872-1200  Pydantic 模型（Anthropic 协议）
-Line 1205-1370 中间件 + 工具函数
-Line 1371-1940 Anthropic ↔ LiteLLM 双向转换
-Line 1957-2185 /v1/chat/completions（透传 + LiteLLM 分流）
-Line 2186-2700 流式响应处理
-Line 2705-3020 /v1/messages（Anthropic 端点）
-Line 3027-3110 /v1/messages/count_tokens + /v1/models
+Line 1-60      模块导入 + load_dotenv() + 常量
+Line 61-156    tiktoken 本地 token 估算
+Line 157-270   日志配置（彩色 + 滚动）
+Line 271-350   httpx 客户端管理 + QClaw body 清理
+Line 351-500   QClaw 透传函数 + OpenAI→Anthropic 转换
+Line 501-600   FastAPI lifespan（启动诊断）+ 异常处理
+Line 601-750   QClaw API Key DPAPI/AES 解密
+Line 751-850   targets.json 配置加载 + 热重载
+Line 851-950   Provider 策略注册（开闭原则）
+Line 951-1050  模型名映射（opus/sonnet/haiku → BIG/MEDIUM/SMALL）
+Line 1051-1350 Pydantic 模型（Anthropic 协议）
+Line 1351-1550 中间件 + 工具函数
+Line 1551-2100 Anthropic ↔ LiteLLM 双向转换
+Line 2101-2400 /v1/chat/completions（透传 + LiteLLM 分流）
+Line 2401-2800 流式响应处理
+Line 2801-3100 /v1/messages（Anthropic 端点）+ dashboard API
+Line 3101-3200 /v1/messages/count_tokens + /v1/models
 ```
 
 ### Provider 策略机制
@@ -235,7 +226,7 @@ $env:DEBUG = "true"
 
 ### 排查代理不通
 
-1. `netstat -ano | findstr :8082` — 端口是否监听
+1. `netstat -ano | findstr :8081` — 主端口是否监听
 2. `Get-Content proxy.log -Tail 20` — 查最近日志
 3. `Get-Process python` — 进程是否存活
 4. 日志中 `startup diag: QClaw upstream = 200` 表示上游连通
