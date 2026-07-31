@@ -4439,6 +4439,112 @@ def _build_card_html(name, note, kind_badge, status_badge, status_badge_class,
 </div>"""
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# Task 8: 管理 REST API（dashboard 配置管理）
+# ══════════════════════════════════════════════════════════════════════════════
+
+@app.get("/api/targets")
+async def api_targets():
+    """返回全部 target 配置 + secrets 元信息（key 打码）+ 统计。"""
+    result = []
+    for t in _TARGETS:
+        secret = _cfg.resolve_secret(t, _SECRETS)
+        result.append({
+            **t,
+            "secretSet": bool(secret),
+            "secretMasked": _cfg.mask_secret(secret),
+            "stats": _TARGET_STATS.get(t["label"], {}),
+        })
+    return {
+        "anthropicForwardPort": _ANTHROPIC_FORWARD_PORT,
+        "targets": result,
+    }
+
+
+class TargetUpdate(BaseModel):
+    label: Optional[str] = None
+    listenPort: Optional[int] = None
+    category: Optional[str] = None
+    handler: Optional[str] = None
+    isFree: Optional[bool] = None
+    enabled: Optional[bool] = None
+    targetHost: Optional[str] = None
+    targetPort: Optional[int] = None
+    targetProtocol: Optional[str] = None
+    routePrefix: Optional[str] = None
+    models: Optional[List[str]] = None
+    crackTool: Optional[str] = None
+    secretRef: Optional[str] = None
+    apikeyEnv: Optional[str] = None
+
+
+@app.put("/api/targets/{label}")
+async def api_update_target(label: str, update: TargetUpdate):
+    """更新 target 非私密字段，写 targets.json 并热重载。"""
+    cfg = _cfg.load_targets()
+    for t in cfg["targets"]:
+        if t["label"] == label:
+            payload = update.model_dump(exclude_none=True)
+            payload.pop("label", None)
+            t.update(payload)
+            break
+    else:
+        raise HTTPException(status_code=404, detail=f"target '{label}' 不存在")
+    errors = _cfg.validate_targets(cfg)
+    if errors:
+        raise HTTPException(status_code=422, detail=errors)
+    _cfg.save_targets(cfg)
+    await _reload_targets()
+    return {"ok": True, "label": label}
+
+
+class SecretUpdate(BaseModel):
+    value: str = ""
+
+
+@app.put("/api/secrets/{label}")
+async def api_update_secret(label: str, update: SecretUpdate):
+    """更新 target 的私密 key/token，写 secrets.json 并热加载。"""
+    cfg = _cfg.load_targets()
+    target = next((t for t in cfg["targets"] if t["label"] == label), None)
+    if target is None:
+        raise HTTPException(status_code=404, detail=f"target '{label}' 不存在")
+    ref = target.get("secretRef")
+    if not ref:
+        raise HTTPException(status_code=422, detail=f"target '{label}' 未配置 secretRef")
+    secrets = _cfg.load_secrets()
+    if update.value:
+        secrets[ref] = update.value
+    else:
+        secrets.pop(ref, None)
+    _cfg.save_secrets(secrets)
+    _refresh_secrets()
+    return {"ok": True, "label": label, "secretRef": ref, "secretSet": bool(update.value)}
+
+
+@app.post("/api/targets/{label}/recrack")
+async def api_recrack(label: str):
+    """触发破解工具重新提取 token。"""
+    target = next((t for t in _TARGETS if t["label"] == label), None)
+    if target is None:
+        raise HTTPException(status_code=404, detail=f"target '{label}' 不存在")
+    tool = target.get("crackTool")
+    if not tool:
+        raise HTTPException(status_code=422, detail=f"target '{label}' 无 crackTool")
+    ok = _run_crack_tool(tool)
+    if not ok:
+        return {"ok": False, "label": label, "message": "破解工具执行失败，请查看日志或手工填写"}
+    return {"ok": True, "label": label, "message": "破解工具执行成功"}
+
+
+@app.post("/api/reload")
+async def api_reload():
+    changes = await _reload_targets()
+    return {"ok": True, "changes": changes}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+
 @app.get("/dashboard", response_class=HTMLResponse)
 async def dashboard():
     """统一管理面板 — 展示本机所有 LLM 相关服务的架构与状态。"""
@@ -4465,7 +4571,9 @@ async def dashboard():
         except Exception:
             return {"label": f"port-{port}", "listenPort": port, "upstream": "?", "models": [], "total": 0, "ok": 0, "translated": 0, "err": 0, "alive": False, "startedAt": ""}
 
-    results = await asyncio.gather(_fetch(8082), _fetch(8090), _fetch(8091), _fetch(8084))
+    _dash_ports = [t["listenPort"] for t in _TARGETS if t.get("enabled", True)]
+    results = await asyncio.gather(*[_fetch(p) for p in _dash_ports]) if _dash_ports else []
+    _result_map = {r["listenPort"]: r for r in results}
 
     def _make_stats_detail(r):
         """构建增强统计字典（成功率、时长、进度条数据）。"""
@@ -4507,7 +4615,7 @@ async def dashboard():
     ))
 
     # ── 8082 OpenAI（asyncio TCP，多 provider 路由） ──
-    r82 = results[0]
+    r82 = _result_map.get(8082, {"label": "port-8082", "listenPort": 8082, "upstream": "?", "models": [], "total": 0, "ok": 0, "translated": 0, "err": 0, "alive": False, "startedAt": ""})
     cards.append(_build_card_html(
         name="OpenAI Proxy (8082)",
         note="asyncio TCP · OpenAI 协议 · 多 provider 路由",
@@ -4529,7 +4637,8 @@ async def dashboard():
 
     # ── 8090 / 8091 / 8084 透明反代 ──
     port_accent_map = {8090: "accent-8090", 8091: "accent-8091", 8084: "accent-8084"}
-    for r in results[1:]:
+    _vendor_ports = {8090, 8091, 8084}
+    for r in (x for x in results if x["listenPort"] in _vendor_ports):
         port = r["listenPort"]
         cards.append(_build_card_html(
             name=r["label"],
@@ -4545,6 +4654,42 @@ async def dashboard():
             stats_detail=_make_stats_detail(r),
             models=r["models"],
             accent_class=port_accent_map.get(port, ""),
+        ))
+
+    # ── 动态 target 卡片（targets.json 驱动）──
+    for t in _TARGETS:
+        port = t["listenPort"]
+        r = _result_map.get(port)
+        if r is None:
+            try:
+                r = await _fetch(port)
+            except Exception:
+                r = {"label": t["label"], "listenPort": port, "upstream": "?", "models": [], "total": 0, "ok": 0, "translated": 0, "err": 0, "alive": False, "startedAt": ""}
+        category = t.get("category", "free")
+        badge_map = {"crack": "破解·质量高", "free": "免费·不破解", "paid": "收费·不破解"}
+        badge_class_map = {"crack": "blue", "free": "green", "paid": "orange"}
+        secret = _cfg.resolve_secret(t, _SECRETS)
+        kv = [
+            ("分类", badge_map.get(category, category)),
+            ("handler", t.get("handler", "passthrough")),
+            ("上游", f"{t.get('targetProtocol','https')}://{t['targetHost']}:{t.get('targetPort',443)}{t.get('routePrefix','')}"),
+            ("token", ("已配置 " + _cfg.mask_secret(secret)) if secret else "⚠️ 缺失（点击卡片编辑/破解）"),
+        ]
+        if t.get("isFree") is not None:
+            kv.append(("isFree", "是（免费）" if t["isFree"] else "否（收费）"))
+        if t.get("enabled") is False:
+            kv.append(("状态", "预留（未监听）"))
+        cards.append(_build_card_html(
+            name=f"{t['label']} ({port})",
+            note="统一透传引擎 · targets.json 驱动",
+            kind_badge=badge_map.get(category, category),
+            status_badge=f"{r['total']} 请求" if r["alive"] else ("未监听" if t.get("enabled") is False else "离线"),
+            status_badge_class=badge_class_map.get(category, "gray") if r["alive"] else "red",
+            kv_items=kv,
+            models=t.get("models", []),
+            stats_detail=_make_stats_detail(r),
+            description=f"category={category} · handler={t.get('handler','passthrough')} · isFree={t.get('isFree')}",
+            accent_class=f"accent-{port}",
         ))
 
     cards_html = "".join(cards)
@@ -4573,12 +4718,69 @@ async def dashboard():
     <div class="divider"></div>
     <div>存活端口 <b>{alive_ports}</b> / {len(results)}</div>
     <div class="divider"></div>
-    <div>{overview_dots} 8082 8090 8091 8084</div>
+    <div>{overview_dots} {" ".join(str(p) for p in _dash_ports)}</div>
   </div>
   <div class="section">
     <div class="section-title">服务架构</div>
     <div class="card-grid">{cards_html}</div>
   </div>
+  <div class="admin-panel">
+  <h3>⚙️ 管理操作</h3>
+  <div id="admin-msg"></div>
+  <table class="model-table" id="admin-table">
+    <thead><tr><th>label</th><th>端口</th><th>分类</th><th>isFree</th><th>token</th><th>操作</th></tr></thead>
+    <tbody id="admin-tbody"></tbody>
+  </table>
+  <p><button onclick="doReload()">♻️ 手动重载配置</button></p>
+</div>
+<script>
+async function loadAdmin() {{
+  const resp = await fetch('/api/targets');
+  const data = await resp.json();
+  const tbody = document.getElementById('admin-tbody');
+  tbody.innerHTML = '';
+  for (const t of data.targets) {{
+    const tr = document.createElement('tr');
+    tr.innerHTML = `
+      <td>${{t.label}}</td>
+      <td>${{t.listenPort}}</td>
+      <td>${{t.category}}${{t.isFree ? ' (免费)' : ''}}</td>
+      <td><input type="checkbox" ${{t.isFree ? 'checked' : ''}} onchange="setIsFree('${{t.label}}', this.checked)"></td>
+      <td>${{t.secretSet ? t.secretMasked : '<span style="color:red">缺失</span>'}}
+          <input id="secret-${{t.label}}" type="password" placeholder="新 token">
+          <button onclick="saveSecret('${{t.label}}')">保存</button></td>
+      <td>${{t.category === 'crack' && t.crackTool ? `<button onclick="recrack('${{t.label}}')">重新破解</button>` : ''}}</td>`;
+    tbody.appendChild(tr);
+  }}
+}}
+async function saveSecret(label) {{
+  const v = document.getElementById('secret-' + label).value;
+  const resp = await fetch('/api/secrets/' + label, {{
+    method: 'PUT', headers: {{'Content-Type': 'application/json'}},
+    body: JSON.stringify({{value: v}})
+  }});
+  const r = await resp.json();
+  document.getElementById('admin-msg').textContent = JSON.stringify(r);
+  loadAdmin();
+}}
+async function setIsFree(label, val) {{
+  const resp = await fetch('/api/targets/' + label, {{
+    method: 'PUT', headers: {{'Content-Type': 'application/json'}},
+    body: JSON.stringify({{isFree: val}})
+  }});
+  document.getElementById('admin-msg').textContent = JSON.stringify(await resp.json());
+}}
+async function recrack(label) {{
+  const resp = await fetch('/api/targets/' + label + '/recrack', {{method: 'POST'}});
+  document.getElementById('admin-msg').textContent = JSON.stringify(await resp.json());
+  loadAdmin();
+}}
+async function doReload() {{
+  const resp = await fetch('/api/reload', {{method: 'POST'}});
+  document.getElementById('admin-msg').textContent = JSON.stringify(await resp.json());
+}}
+loadAdmin();
+</script>
 </body>
 </html>"""
 
