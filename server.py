@@ -506,20 +506,30 @@ async def lifespan(app):
 
     # ── 启动所有 target 驱动端口（8082 copilot, 8084 codebuddy, 8085 qclaw, 8090-8094 等）──
     # 8081 Anthropic 由 uvicorn FastAPI 处理（不在此处启动）
-    _vendor_servers = []
     for t in _TARGETS:
         if not t.get("enabled", True):
             print(f"⏭️  [{t['label']}] disabled, skip")
             continue
         srv = await _vendor_server("0.0.0.0", t["listenPort"], t)
-        _vendor_servers.append(srv)
+        _target_servers[t["listenPort"]] = srv
+
+    # ── 启动配置热重载 watcher ──
+    watcher_task = asyncio.create_task(_config_watcher())
 
     yield
 
+    # 停止配置 watcher
+    watcher_task.cancel()
+    try:
+        await watcher_task
+    except asyncio.CancelledError:
+        pass
+
     # 停掉透明反代服务器
-    for srv in _vendor_servers:
+    for srv in _target_servers.values():
         srv.close()
         await srv.wait_closed()
+    _target_servers.clear()
     # 清理连接池
     global _http_client
     if _http_client and not _http_client.is_closed:
@@ -1008,6 +1018,74 @@ def _refresh_secrets():
     global _SECRETS
     _SECRETS = _cfg.load_secrets()
     logger.info(f"🔑 secrets.json reloaded ({len(_SECRETS)} keys)")
+
+
+# ── 热重载：mtime 轮询 + 端口 diff ──
+_target_servers: Dict[int, asyncio.Server] = {}
+_config_mtimes: Dict[str, float] = {}
+
+
+async def _reload_targets() -> list:
+    """重载 targets.json / secrets.json，diff 端口并动态增删 server。"""
+    global _TARGETS, _SECRETS, _ANTHROPIC_FORWARD_PORT
+    changes = []
+    cfg = _cfg.load_targets()
+    errors = _cfg.validate_targets(cfg)
+    if errors:
+        logger.error(f"配置校验失败，拒绝重载: {errors}")
+        return [f"❌ 校验失败: {errors}"]
+    _TARGETS = cfg.get("targets", [])
+    _ANTHROPIC_FORWARD_PORT = cfg.get("anthropicForwardPort", 8082)
+    _SECRETS = _cfg.load_secrets()
+
+    # 统计表补新 target
+    for t in _TARGETS:
+        if t["label"] not in _TARGET_STATS:
+            _TARGET_STATS[t["label"]] = {
+                "totalRequests": 0, "translated429": 0,
+                "passthroughOk": 0, "passthroughError": 0,
+                "startedAt": datetime.now().isoformat(),
+            }
+
+    # diff 端口
+    wanted = {t["listenPort"]: t for t in _TARGETS if t.get("enabled", True)}
+    for port in list(_target_servers.keys()):
+        if port not in wanted:
+            _target_servers[port].close()
+            await _target_servers[port].wait_closed()
+            del _target_servers[port]
+            changes.append(f"移除端口 {port}")
+    for port, t in wanted.items():
+        if port not in _target_servers:
+            try:
+                srv = await _vendor_server("0.0.0.0", port, t)
+                _target_servers[port] = srv
+                changes.append(f"新增端口 {port} ({t['label']})")
+            except OSError as e:
+                logger.error(f"无法监听端口 {port}: {e}")
+    logger.info(f"♻️  配置热重载完成: {changes if changes else '无端口变化'}")
+    return changes
+
+
+async def _config_watcher():
+    """每 2s 轮询 targets.json / secrets.json mtime，变更即重载。"""
+    while True:
+        await asyncio.sleep(2)
+        try:
+            for path in (_cfg.TARGETS_PATH, _cfg.SECRETS_PATH):
+                try:
+                    mtime = path.stat().st_mtime
+                except FileNotFoundError:
+                    mtime = 0
+                if _config_mtimes.get(str(path)) is None:
+                    _config_mtimes[str(path)] = mtime
+                elif mtime != _config_mtimes[str(path)]:
+                    _config_mtimes[str(path)] = mtime
+                    logger.info(f"♻️  检测到 {path.name} 变更")
+                    await _reload_targets()
+                    break
+        except Exception as e:
+            logger.warning(f"config watcher error: {e}")
 
 
 def _run_crack_tool(crack_tool: str) -> bool:
