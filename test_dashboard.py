@@ -1,13 +1,15 @@
-"""Dashboard 增强验收测试（TDD Red-Green）
+"""Dashboard 验收测试（多端口架构）
 
-验证管理页面 (/dashboard) 两个新能力：
+验证管理页面 (/dashboard) + API 端点：
 1. 模型列表详细展示：不再是纯 <li><code> 列表，而是带美化名的表格
 2. 流量统计信息：请求总数 / 成功率 / 运行时长 + 可视化（进度条）
+3. /api/targets 端点：返回所有 target 的 label/isFree/enabled 等
 
-运行前提：claude-code-proxy 服务运行中（8082 端口，dashboard 代理自 8081 FastAPI）。
+运行前提：claude-code-proxy 服务运行中（8081 FastAPI 端口）。
 用法: python test_dashboard.py
 """
 import http.client
+import json
 import sys
 
 HOST = "127.0.0.1"
@@ -66,6 +68,23 @@ def test_vendor_stats_breakdown():
     """vendor 卡片应显示 ok / 429 / error 明细。"""
     _, body = _get_dashboard()
     assert "429" in body, "应显示 429 翻译计数"
+
+
+def test_api_targets_endpoint():
+    """GET /api/targets 应返回所有 target 的 label 列表（含 8 个 label）。"""
+    conn = http.client.HTTPConnection("127.0.0.1", 8081, timeout=15)
+    conn.request("GET", "/api/targets")
+    resp = conn.getresponse()
+    body = resp.read().decode("utf-8", errors="replace")
+    conn.close()
+    assert resp.status == 200, f"/api/targets HTTP {resp.status}"
+    data = json.loads(body)
+    targets = data.get("targets", [])
+    assert isinstance(targets, list), "/api/targets 返回的 targets 应为 JSON 数组"
+    labels = {t.get("label", "") for t in targets}
+    for expected in ("copilot", "codebuddy", "qclaw", "trae-work",
+                     "openrouter", "nvidia", "gemini-openai", "opencode-zen"):
+        assert expected in labels, f"/api/targets 缺少 label: {expected}"
 
 
 def main():

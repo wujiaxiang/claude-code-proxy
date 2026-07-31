@@ -63,3 +63,6 @@ _*.vbs
 
 # 临时调研目录（以 _ 开头的目录）
 _*/
+
+# 私密 key/token（dashboard 热更新，不入库）
+secrets.json

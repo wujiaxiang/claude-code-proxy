@@ -157,6 +157,42 @@ def test_apply_model_mapping_no_mapping():
     assert mapped["model"] == "gpt-4.1"
 
 
+# ─── API 路由存在性测试（inspect 源码，不需服务运行） ───
+
+import ast as _ast
+import inspect as _inspect
+
+
+def test_api_targets_shape():
+    """通过 inspect 源码确认 server.py 路由中定义了 /api/targets GET 函数。"""
+    # 加载 server.py 的 AST
+    with open(Path(__file__).parent / "server.py", "r", encoding="utf-8") as f:
+        tree = _ast.parse(f.read())
+    # 遍历顶层函数定义（含 async def）
+    found = False
+    for node in _ast.walk(tree):
+        if isinstance(node, (_ast.FunctionDef, _ast.AsyncFunctionDef)):
+            for decorator in node.decorator_list:
+                # 找 @app.get(...) 装饰器
+                if isinstance(decorator, _ast.Call) and hasattr(decorator.func, "attr"):
+                    if decorator.func.attr == "get":
+                        for arg in decorator.args:
+                            if isinstance(arg, _ast.Constant) and arg.value == "/api/targets":
+                                found = True
+                                break
+    assert found, "server.py 中应有 @app.get('/api/targets') 路由"
+
+
+def test_targets_json_top_level_object():
+    """仓库 targets.json 应为顶层对象（含 anthropicForwardPort + targets 数组）。"""
+    with open(Path(__file__).parent / "targets.json", "r", encoding="utf-8") as f:
+        cfg = json.load(f)
+    assert isinstance(cfg, dict), "targets.json 顶层应为对象"
+    assert "anthropicForwardPort" in cfg, "应含 anthropicForwardPort"
+    assert isinstance(cfg.get("targets"), list), "targets 应为数组"
+    assert len(cfg["targets"]) >= 9, f"至少 9 个 target，实际 {len(cfg['targets'])}"
+
+
 def main():
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for t in tests:

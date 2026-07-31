@@ -29,18 +29,19 @@ PROXY = os.environ.get("PROXY_HOST", "127.0.0.1")
 PORT = int(os.environ.get("PROXY_PORT", "8082"))
 TIMEOUT = 60
 
-# ─── 根据 provider 选择测试模型名 ───
-# 翻译链路（/v1/messages）用别名（sonnet/opus/haiku），代理自动映射
-# 透传链路（/v1/chat/completions）用真实模型名，直接透传给上游
-_PROVIDER = os.environ.get("PREFERRED_PROVIDER", "qclaw").lower()
+# ─── 8082 固定为 copilot target（横向扩展模式）───
+# 模型名：Anthropic 别名经 copilot target 的 modelMapping 映射
+_PROVIDER = os.environ.get("PREFERRED_PROVIDER", "copilot").lower()
 if _PROVIDER == "qclaw":
+    # 直接打 8085（qclaw 端口）时用 pool-* 模型
     OAI_MODEL_BIG = os.environ.get("BIG_MODEL", "pool-glm-5.2")
     OAI_MODEL_MED = os.environ.get("MEDIUM_MODEL", "pool-deepseek-v4-pro")
     OAI_MODEL_SMALL = os.environ.get("SMALL_MODEL", "pool-deepseek-v4-flash")
 else:
-    OAI_MODEL_BIG = "claude-opus-4-20250514"
-    OAI_MODEL_MED = "claude-sonnet-4.6"
-    OAI_MODEL_SMALL = "claude-haiku-4.5"
+    # 默认：8082 = copilot，经 modelMapping 映射
+    OAI_MODEL_BIG = "opus"
+    OAI_MODEL_MED = "sonnet"
+    OAI_MODEL_SMALL = "haiku"
 
 # ─── 统计 ───
 passed = 0
