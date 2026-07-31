@@ -758,7 +758,17 @@ _VENDOR_RETRY_AFTER = int(os.environ.get("VENDOR_RETRY_AFTER_SECONDS", "3"))
 _TARGETS: list = []
 _SECRETS: dict = {}
 _TARGET_STATS: Dict[str, dict] = {}
+# 模型级统计：{ label: { model_name: {"requests": N, "ok": N, "err": N, "translated429": N} } }
+_MODEL_STATS: Dict[str, Dict[str, Dict[str, int]]] = {}
 _ANTHROPIC_FORWARD_PORT = 8082
+
+def _bump_model_stats(label: str, model: str, outcome: str):
+    """记录模型级统计。outcome: 'ok' | 'err' | 'translated429'"""
+    models = _MODEL_STATS.setdefault(label, {})
+    s = models.setdefault(model, {"requests": 0, "ok": 0, "err": 0, "translated429": 0})
+    s["requests"] += 1
+    if outcome in s:
+        s[outcome] += 1
 
 _VENDOR_ERROR_PATTERNS = [
     re.compile(r'"ResourceExhausted"'),
@@ -1410,7 +1420,11 @@ async def _handle_target_request(reader, writer, target):
             await writer.drain(); writer.close(); return
 
         if path == "/__proxy_stats__":
-            payload = json.dumps({"label": label, "listenPort": target["listenPort"], **stats})
+            payload = json.dumps({
+                "label": label, "listenPort": target["listenPort"],
+                **stats,
+                "modelStats": _MODEL_STATS.get(label, {}),
+            })
             writer.write(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: %d\r\n\r\n%s" % (len(payload.encode()), payload.encode()))
             await writer.drain(); writer.close(); return
 
@@ -1444,6 +1458,15 @@ async def _handle_target_request(reader, writer, target):
         upstream_url = f"{transport}://{target['targetHost']}:{target.get('targetPort', 443)}{upstream_path}"
 
         body_bytes, body_json = _handler_prepare_body(target, body)
+        # 模型级统计：解析请求模型名（映射后真实模型）
+        _req_model = None
+        if body_json and isinstance(body_json, dict):
+            _req_model = body_json.get("model")
+        elif body:
+            try:
+                _req_model = json.loads(body).get("model")
+            except Exception:
+                pass
         fwd_headers = _resolve_auth(headers, target=target)
         fwd_headers["host"] = target["targetHost"]
         fwd_headers = _handler_prepare_headers(target, fwd_headers, body_json)
@@ -1457,6 +1480,8 @@ async def _handle_target_request(reader, writer, target):
 
             if is_stream:
                 status, _ = await _write_response(writer, resp, stats=stats)
+                if _req_model:
+                    _bump_model_stats(label, _req_model, "ok" if (status or 0) < 400 else "err")
                 if status and status >= 400:
                     logger.warning(f"[{label}] stream returned HTTP {status}")
                 return
@@ -1471,6 +1496,8 @@ async def _handle_target_request(reader, writer, target):
 
             if _vendor_body_retryable(body_text):
                 stats["translated429"] += 1
+                if _req_model:
+                    _bump_model_stats(label, _req_model, "translated429")
                 logger.info(f"[{label}] translated HTTP {status} → 429 (rate_limit_error)")
                 err_payload = json.dumps({
                     "error": {
@@ -1489,6 +1516,8 @@ async def _handle_target_request(reader, writer, target):
                 await writer.drain()
                 writer.close()
             else:
+                if _req_model:
+                    _bump_model_stats(label, _req_model, "ok" if resp.status_code < 400 else "err")
                 await _write_response(writer, resp, stats=stats)
     except Exception:
         stats["passthroughError"] += 1
@@ -4251,6 +4280,9 @@ DASHBOARD_STYLE = """
   .model-table tbody tr:hover { background: #1e2140; }
   ul { list-style: none; padding: 0; margin: 8px 0 0 0; display: flex; flex-wrap: wrap; gap: 6px; }
   li { background: #151827; border: 1px solid #2a2d3e; border-radius: 6px; padding: 5px 9px; font-size: 12.5px; }
+  .mstat { text-align: center; padding: 4px 8px; }
+  .mstat.err { color: #f87171; }
+  .mstat.warn { color: #fbbf24; }
 """
 
 
@@ -4341,14 +4373,16 @@ def _format_uptime(started_at_str):
         return "—"
 
 
-def _model_details_html(models):
+def _model_details_html(models, model_stats=None):
     """模型列表以带美化名的表格详细展示。
 
     支持 models 为字符串列表（vendor 卡片）和 dict 列表（含 display_name）。
+    model_stats: 模型级统计 dict，非 None 时显示请求/成功率/错误/429 列。
     """
     if not models:
         return '<div class="no-models">(暂无模型数据)</div>'
     rows = []
+    has_stats = model_stats is not None
     for i, m in enumerate(models, 1):
         if isinstance(m, dict):
             mid = m.get('id', '')
@@ -4356,22 +4390,41 @@ def _model_details_html(models):
         else:
             mid = str(m)
             display = _humanize_model_name(m)
-        rows.append(
+        row = (
             f'<tr><td class="num">{i}</td>'
             f'<td class="mid"><code>{_html_escape(mid)}</code></td>'
-            f'<td class="name">{_html_escape(display)}</td></tr>'
+            f'<td class="name">{_html_escape(display)}</td>'
         )
+        if has_stats:
+            ms = model_stats.get(mid) if mid else None
+            if ms:
+                total = ms.get("requests", 0)
+                ok = ms.get("ok", 0)
+                err = ms.get("err", 0)
+                tr429 = ms.get("translated429", 0)
+                rate = round(ok / total * 100, 1) if total > 0 else 100.0
+                row += (
+                    f'<td class="mstat">{total}</td>'
+                    f'<td class="mstat">{rate}%</td>'
+                    f'<td class="mstat err">{err}</td>'
+                    f'<td class="mstat warn">{tr429}</td>'
+                )
+            else:
+                row += '<td class="mstat">—</td><td class="mstat">—</td><td class="mstat">—</td><td class="mstat">—</td>'
+        row += '</tr>'
+        rows.append(row)
+    header_extra = '<th>请求</th><th>成功率</th><th>错误</th><th>429</th>' if has_stats else ''
     return (
         f'<details><summary>▸ 展开模型列表 <span class="model-count">{len(models)} 个</span></summary>'
         f'<table class="model-table">'
-        f'<thead><tr><th>#</th><th>模型 ID</th><th>名称</th></tr></thead>'
+        f'<thead><tr><th>#</th><th>模型 ID</th><th>名称</th>{header_extra}</tr></thead>'
         f'<tbody>{"".join(rows)}</tbody>'
         f'</table></details>'
     )
 
 
 def _build_card_html(name, note, kind_badge, status_badge, status_badge_class,
-                     kv_items, stats_detail=None, models=None, description="",
+                     kv_items, stats_detail=None, models=None, model_stats=None, description="",
                      accent_class=""):
     """统一卡片渲染：透传目标和定制服务用同一套视觉风格。
 
@@ -4424,7 +4477,7 @@ def _build_card_html(name, note, kind_badge, status_badge, status_badge_class,
             f'</div>'
         )
 
-    model_html = _model_details_html(models) if models is not None else ""
+    model_html = _model_details_html(models, model_stats) if models is not None else ""
     card_class = f'card {accent_class}'.strip()
 
     return f"""<div class="{card_class}">
@@ -4567,9 +4620,10 @@ async def dashboard():
                     "err": stats.get("passthroughError", 0),
                     "alive": info_r.status_code == 200,
                     "startedAt": stats.get("startedAt", ""),
+                    "modelStats": stats.get("modelStats", {}),
                 }
         except Exception:
-            return {"label": f"port-{port}", "listenPort": port, "upstream": "?", "models": [], "total": 0, "ok": 0, "translated": 0, "err": 0, "alive": False, "startedAt": ""}
+            return {"label": f"port-{port}", "listenPort": port, "upstream": "?", "models": [], "total": 0, "ok": 0, "translated": 0, "err": 0, "alive": False, "startedAt": "", "modelStats": {}}
 
     _dash_ports = [t["listenPort"] for t in _TARGETS if t.get("enabled", True)]
     results = await asyncio.gather(*[_fetch(p) for p in _dash_ports]) if _dash_ports else []
@@ -4611,6 +4665,7 @@ async def dashboard():
             ("systemd 服务", "claude-code-proxy"),
         ],
         models=_ANTHROPIC_PORT_MODELS,
+        model_stats=None,
         description="接收 Anthropic 客户端请求，结构化解码后转换为 OpenAI 格式，内部转发到 8082（copilot 透传）。响应译回 Anthropic 格式。",
     ))
 
@@ -4622,7 +4677,7 @@ async def dashboard():
             try:
                 r = await _fetch(port)
             except Exception:
-                r = {"label": t["label"], "listenPort": port, "upstream": "?", "models": [], "total": 0, "ok": 0, "translated": 0, "err": 0, "alive": False, "startedAt": ""}
+                r = {"label": t["label"], "listenPort": port, "upstream": "?", "models": [], "total": 0, "ok": 0, "translated": 0, "err": 0, "alive": False, "startedAt": "", "modelStats": {}}
         category = t.get("category", "free")
         badge_map = {"crack": "破解·质量高", "free": "免费·不破解", "paid": "收费·不破解"}
         badge_class_map = {"crack": "blue", "free": "green", "paid": "orange"}
@@ -4645,6 +4700,7 @@ async def dashboard():
             status_badge_class=badge_class_map.get(category, "gray") if r["alive"] else "red",
             kv_items=kv,
             models=t.get("models", []),
+            model_stats=r.get("modelStats") if r.get("alive") else None,
             stats_detail=_make_stats_detail(r),
             description=f"category={category} · handler={t.get('handler','passthrough')} · isFree={t.get('isFree')}",
             accent_class=f"accent-{port}",

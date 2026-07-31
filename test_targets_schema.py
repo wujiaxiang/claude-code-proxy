@@ -227,5 +227,16 @@ def test_repo_targets_file_valid():
     assert tw.get("enabled") is False, "trae-work 应 enabled=false"
 
 
+def test_model_stats_structure():
+    """模型级统计结构：label → model → 四计数。"""
+    import server as _srv
+    _srv._MODEL_STATS.clear()
+    _srv._bump_model_stats("copilot", "claude-opus-4.8", "ok")
+    _srv._bump_model_stats("copilot", "claude-opus-4.8", "translated429")
+    s = _srv._MODEL_STATS["copilot"]["claude-opus-4.8"]
+    assert s["requests"] == 2 and s["ok"] == 1 and s["translated429"] == 1 and s["err"] == 0, f"统计错误: {s}"
+    print(f"PASS test_model_stats_structure: model stats structure correct")
+
+
 if __name__ == "__main__":
     sys.exit(main())
