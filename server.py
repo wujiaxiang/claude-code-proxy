@@ -4028,13 +4028,26 @@ async def root():
 # ─── 统一管理面板（所有 LLM 相关服务一览）─────────────────────────────
 
 DASHBOARD_STYLE = """
-  body { font-family: -apple-system, "Segoe UI", sans-serif; background: #0f1117; color: #e0e0e0; margin: 0; padding: 32px; }
-  h1 { font-size: 20px; margin-bottom: 4px; }
-  .sub { color: #8b8fa3; font-size: 13px; margin-bottom: 28px; }
+  body { font-family: -apple-system, "Segoe UI", ui-monospace, sans-serif; background: #0f1117; color: #e0e0e0; margin: 0; padding: 32px; }
+  h1 { font-size: 20px; margin-bottom: 2px; }
+  .sub { color: #8b8fa3; font-size: 13px; margin-bottom: 20px; }
+  .sub .refresh-time { font-size: 12px; color: #6b7280; }
+  .overview-bar { display: flex; gap: 24px; flex-wrap: wrap; background: #12142a; border: 1px solid #2a2d3e; border-radius: 10px; padding: 14px 22px; margin-bottom: 22px; align-items: center; font-size: 13px; color: #9ca3af; }
+  .overview-bar b { color: #e0e0e0; }
+  .overview-bar .divider { width: 1px; height: 24px; background: #2a2d3e; }
+  .status-dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 6px; }
+  .status-dot.green { background: #4ade80; box-shadow: 0 0 6px rgba(74,222,128,0.5); }
+  .status-dot.yellow { background: #fbbf24; box-shadow: 0 0 6px rgba(251,191,36,0.5); }
+  .status-dot.red { background: #f87171; box-shadow: 0 0 6px rgba(248,113,113,0.5); }
   .section { margin-bottom: 28px; }
   .section-title { font-size: 14px; font-weight: 600; color: #9ca3af; text-transform: uppercase; letter-spacing: 1px; margin-bottom: 10px; padding-bottom: 6px; border-bottom: 1px solid #1f2233; }
-  .card { background: #1a1c2e; border: 1px solid #2a2d3e; border-radius: 10px; padding: 18px 22px; margin-bottom: 14px; }
-  .card:hover { border-color: #3b4060; }
+  .card-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(480px, 1fr)); gap: 14px; }
+  .card { background: #1a1c2e; border: 1px solid #2a2d3e; border-radius: 10px; padding: 18px 22px; transition: border-color 0.2s, transform 0.15s, box-shadow 0.2s; }
+  .card:hover { border-color: #3b4060; transform: translateY(-2px); box-shadow: 0 4px 20px rgba(0,0,0,0.3); }
+  .card.accent-8082 { border-top: 3px solid #3b82f6; }
+  .card.accent-8090 { border-top: 3px solid #f59e0b; }
+  .card.accent-8091 { border-top: 3px solid #4ade80; }
+  .card.accent-8084 { border-top: 3px solid #a78bfa; }
   .card-header { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 10px; margin-bottom: 12px; }
   .card-name { font-size: 16px; font-weight: 600; }
   .card-note { font-weight: 400; color: #6b7280; font-size: 13px; }
@@ -4045,15 +4058,39 @@ DASHBOARD_STYLE = """
   .badge.blue { background: #16213e; color: #60a5fa; }
   .badge.purple { background: #2a1e3e; color: #c084fc; }
   .badge.red { background: #2e1a1a; color: #f87171; }
+  .badge.offline { background: #2e1a1a; color: #f87171; }
   .kv { display: grid; grid-template-columns: 130px 1fr; gap: 6px 16px; font-size: 13px; margin-bottom: 10px; }
   .kv div:nth-child(odd) { color: #8b8fa3; }
   code { color: #60a5fa; }
   a { color: #6c8cff; }
+  .card-desc { font-size: 12.5px; color: #8b8fa3; margin-bottom: 8px; }
+  /* ── 流量统计块 ── */
+  .stats-block { display: flex; gap: 18px; flex-wrap: wrap; margin: 12px 0 10px 0; }
+  .stat-item { display: flex; flex-direction: column; gap: 2px; }
+  .stat-label { font-size: 11px; color: #6b7280; text-transform: uppercase; letter-spacing: 0.5px; }
+  .stat-value { font-size: 24px; font-weight: 700; color: #e0e0e0; font-family: ui-monospace, monospace; }
+  /* ── 进度条 ── */
+  .rate-bar { display: flex; height: 8px; border-radius: 4px; overflow: hidden; background: #151827; margin: 10px 0; }
+  .rate-bar-seg { transition: width 0.6s ease; }
+  .rate-bar-seg.ok { background: linear-gradient(90deg, #22c55e, #4ade80); }
+  .rate-bar-seg.tr429 { background: linear-gradient(90deg, #eab308, #fbbf24); }
+  .rate-bar-seg.err { background: linear-gradient(90deg, #ef4444, #f87171); }
   .mini-stats { display: flex; gap: 18px; flex-wrap: wrap; font-size: 12.5px; color: #9ca3af; margin-top: 4px; }
   .mini-stats b { color: #e0e0e0; }
+  /* ── 模型表格 ── */
   details { margin-top: 10px; }
   summary { cursor: pointer; font-size: 13px; color: #6c8cff; user-select: none; padding: 4px 0; }
   summary:hover { color: #8ba3ff; }
+  .model-count { display: inline-block; background: #16213e; color: #60a5fa; font-size: 11px; padding: 2px 8px; border-radius: 4px; margin-left: 6px; font-weight: 600; }
+  .no-models { font-size: 12px; color: #6b7280; margin-top: 6px; }
+  .model-table { width: 100%; border-collapse: collapse; margin-top: 8px; font-size: 12.5px; }
+  .model-table th { text-align: left; padding: 6px 10px; color: #6b7280; font-weight: 600; font-size: 11px; text-transform: uppercase; letter-spacing: 0.5px; border-bottom: 1px solid #2a2d3e; }
+  .model-table td { padding: 5px 10px; border-bottom: 1px solid #1f2233; }
+  .model-table td.num { color: #6b7280; font-family: ui-monospace, monospace; width: 32px; }
+  .model-table td.mid { font-family: ui-monospace, monospace; }
+  .model-table td.name { color: #c0c4d0; }
+  .model-table tbody tr:nth-child(even) { background: #151827; }
+  .model-table tbody tr:hover { background: #1e2140; }
   ul { list-style: none; padding: 0; margin: 8px 0 0 0; display: flex; flex-wrap: wrap; gap: 6px; }
   li { background: #151827; border: 1px solid #2a2d3e; border-radius: 6px; padding: 5px 9px; font-size: 12.5px; }
 """
@@ -4063,29 +4100,184 @@ def _html_escape(s):
     return str(s).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;")
 
 
+_WORD_FIXES = {
+    # Model families / brands
+    'glm': 'GLM', 'deepseek': 'DeepSeek', 'minimax': 'MiniMax', 'kimi': 'Kimi',
+    'hunyuan': 'Hunyuan', 'qwen': 'Qwen', 'nemotron': 'Nemotron', 'llama': 'Llama',
+    'gpt': 'GPT', 'claude': 'Claude', 'mai': 'Mai', 'hy3': 'Hy3',
+    # Descriptors / suffixes
+    'codex': 'Codex', 'pro': 'Pro', 'flash': 'Flash', 'mini': 'Mini',
+    'ultra': 'Ultra', 'super': 'Super', 'turbo': 'Turbo', 'coder': 'Coder',
+    'thinking': 'Thinking', 'instruct': 'Instruct', 'chat': 'Chat',
+    'modelroute': 'Model Route', 'default': 'Default',
+    'image': 'Image', 'art': 'Art', 'text': 'Text', 'embedding': 'Embedding',
+    'small': 'Small', 'large': 'Large', 'picker': 'Picker',
+    'compaction': 'Compaction', 'trajectory': 'Trajectory',
+    'maverick': 'Maverick', 'oss': 'OSS', 'sonnet': 'Sonnet',
+    'haiku': 'Haiku', 'opus': 'Opus', 'night': 'Night',
+    'volc': 'Volc', 'highspeed': 'HighSpeed',
+}
+
+
+def _humanize_model_name(mid):
+    """模型 id → 人类可读名。
+
+    规则：去 'pool-' / 'provider/' 前缀、':free' 尾缀转 '(free)'，
+    '-'/'_' 转空格，已知品牌词做专名修正，版本号保持原样。
+    """
+    s = str(mid)
+    # Strip provider/ prefix (e.g., nvidia/nemotron → nemotron)
+    if '/' in s:
+        s = s.split('/')[-1]
+    # Strip pool- prefix (e.g., pool-deepseek-v4-pro → deepseek-v4-pro)
+    if s.startswith('pool-'):
+        s = s[5:]
+    # Handle :free suffix
+    free_note = ''
+    if s.endswith(':free'):
+        s = s[:-5]
+        free_note = ' (free)'
+    # Replace separators with space
+    s = s.replace('-', ' ').replace('_', ' ')
+    # Apply word fixes
+    words = []
+    for w in s.split():
+        w_lower = w.lower()
+        if w_lower in _WORD_FIXES:
+            words.append(_WORD_FIXES[w_lower])
+        elif w and w[0].isdigit():
+            # Version-like: uppercase trailing letter-suffixes (e.g., "550b" → "550B", "a55b" → "A55B", "4v" → "4V")
+            result = w.upper() if any(c.isalpha() for c in w[-3:]) else w
+            words.append(result)
+        else:
+            words.append(w[0].upper() + w[1:] if w else w)
+    return ' '.join(words) + free_note
+
+
+def _format_uptime(started_at_str):
+    """ISO 时间串 → 人类可读运行时长（如 '1天2小时' / '35分钟' / '12秒'）。"""
+    if not started_at_str:
+        return "—"
+    try:
+        started = datetime.fromisoformat(started_at_str)
+        now = datetime.now()
+        # Handle naive datetime (no tzinfo) — assume local time
+        if started.tzinfo is not None and hasattr(started.tzinfo, 'utcoffset'):
+            now = datetime.now(started.tzinfo)
+        delta = now - started
+        total_seconds = int(delta.total_seconds())
+        if total_seconds < 0:
+            return "—"
+        days = total_seconds // 86400
+        hours = (total_seconds % 86400) // 3600
+        minutes = (total_seconds % 3600) // 60
+        seconds = total_seconds % 60
+        if days > 0:
+            return f"{days}天{hours}小时"
+        if hours > 0:
+            return f"{hours}小时{minutes}分钟"
+        if minutes > 0:
+            return f"{minutes}分钟{seconds}秒"
+        return f"{seconds}秒"
+    except Exception:
+        return "—"
+
+
 def _model_details_html(models):
+    """模型列表以带美化名的表格详细展示。
+
+    支持 models 为字符串列表（vendor 卡片）和 dict 列表（含 display_name）。
+    """
     if not models:
-        return '<div style="font-size:12px;color:#6b7280;margin-top:6px;">(暂无模型数据)</div>'
-    rows = "".join(f"<li><code>{_html_escape(m)}</code></li>" for m in models)
-    return f'<details><summary>▸ 展开模型列表（{len(models)} 个）</summary><ul>{rows}</ul></details>'
+        return '<div class="no-models">(暂无模型数据)</div>'
+    rows = []
+    for i, m in enumerate(models, 1):
+        if isinstance(m, dict):
+            mid = m.get('id', '')
+            display = m.get('display_name', '') or _humanize_model_name(mid)
+        else:
+            mid = str(m)
+            display = _humanize_model_name(m)
+        rows.append(
+            f'<tr><td class="num">{i}</td>'
+            f'<td class="mid"><code>{_html_escape(mid)}</code></td>'
+            f'<td class="name">{_html_escape(display)}</td></tr>'
+        )
+    return (
+        f'<details><summary>▸ 展开模型列表 <span class="model-count">{len(models)} 个</span></summary>'
+        f'<table class="model-table">'
+        f'<thead><tr><th>#</th><th>模型 ID</th><th>名称</th></tr></thead>'
+        f'<tbody>{"".join(rows)}</tbody>'
+        f'</table></details>'
+    )
 
 
-def _build_card_html(name, note, kind_badge, status_badge, status_badge_class, kv_items, stats_items, models, description=""):
-    """统一卡片渲染：透传目标和定制服务用同一套视觉风格。"""
+def _build_card_html(name, note, kind_badge, status_badge, status_badge_class,
+                     kv_items, stats_detail=None, models=None, description="",
+                     accent_class=""):
+    """统一卡片渲染：透传目标和定制服务用同一套视觉风格。
+
+    stats_detail: dict with total/ok/err/translated/success_rate/uptime
+    accent_class: CSS class for port-specific accent (e.g., 'accent-8082')
+    """
     badges = f'<span class="badge {kind_badge}">{_html_escape(kind_badge)}</span>'
     if status_badge:
         badges += f' <span class="badge {status_badge_class}">{_html_escape(status_badge)}</span>'
-    kv = "".join(f"<div>{_html_escape(k)}</div><div><code>{_html_escape(str(v))}</code></div>" for k, v in kv_items)
-    stats = "".join(f"<div>{_html_escape(k)} <b>{_html_escape(str(v))}</b></div>" for k, v in stats_items) if stats_items else ""
-    return f"""<div class="card">
+    kv = "".join(
+        f"<div>{_html_escape(k)}</div><div><code>{_html_escape(str(v))}</code></div>"
+        for k, v in kv_items
+    )
+
+    # ── 流量统计块（含进度条）──
+    stats_html = ""
+    if stats_detail and stats_detail.get('alive'):
+        ok = stats_detail.get('ok', 0)
+        err = stats_detail.get('err', 0)
+        tr = stats_detail.get('translated', 0)
+        total = stats_detail.get('total', 0)
+        success_rate = stats_detail.get('success_rate', 0)
+        uptime = stats_detail.get('uptime', '—')
+
+        # 进度条
+        bar_html = ""
+        if total > 0:
+            ok_pct = round(ok / total * 100, 1)
+            tr_pct = round(tr / total * 100, 1)
+            err_pct = round(err / total * 100, 1)
+            bar_html = (
+                f'<div class="rate-bar">'
+                + (f'<div class="rate-bar-seg ok" style="width:{ok_pct}%" title="成功 {ok}"></div>' if ok_pct > 0 else '')
+                + (f'<div class="rate-bar-seg tr429" style="width:{tr_pct}%" title="429 翻译 {tr}"></div>' if tr_pct > 0 else '')
+                + (f'<div class="rate-bar-seg err" style="width:{err_pct}%" title="错误 {err}"></div>' if err_pct > 0 else '')
+                + f'</div>'
+            )
+
+        stats_html = (
+            f'<div class="stats-block">'
+            f'<div class="stat-item"><span class="stat-label">总请求</span><span class="stat-value">{total}</span></div>'
+            f'<div class="stat-item"><span class="stat-label">成功率</span><span class="stat-value">{success_rate}%</span></div>'
+            f'<div class="stat-item"><span class="stat-label">运行时长</span><span class="stat-value">{uptime}</span></div>'
+            f'</div>'
+            f'{bar_html}'
+            f'<div class="mini-stats">'
+            f'  <div>正常透传 <b>{ok}</b></div>'
+            f'  <div>翻译 429 <b>{tr}</b></div>'
+            f'  <div>代理错误 <b>{err}</b></div>'
+            f'</div>'
+        )
+
+    model_html = _model_details_html(models) if models is not None else ""
+    card_class = f'card {accent_class}'.strip()
+
+    return f"""<div class="{card_class}">
   <div class="card-header">
     <div class="card-name">🔀 {_html_escape(name)} <span class="card-note">（{_html_escape(note)}）</span></div>
     <div class="badge-group">{badges}</div>
   </div>
   <div class="kv">{kv}</div>
-  {f'<div style="font-size:12.5px;color:#8b8fa3;margin-bottom:8px;">{_html_escape(description)}</div>' if description else ""}
-  {f'<div class="mini-stats">{stats}</div>' if stats_items else ""}
-  {_model_details_html(models)}
+  {f'<div class="card-desc">{_html_escape(description)}</div>' if description else ""}
+  {stats_html}
+  {model_html}
 </div>"""
 
 
@@ -4110,11 +4302,31 @@ async def dashboard():
                     "translated": stats.get("translated429", 0),
                     "err": stats.get("passthroughError", 0),
                     "alive": info_r.status_code == 200,
+                    "startedAt": stats.get("startedAt", ""),
                 }
         except Exception:
-            return {"label": f"port-{port}", "listenPort": port, "upstream": "?", "models": [], "total": 0, "ok": 0, "translated": 0, "err": 0, "alive": False}
+            return {"label": f"port-{port}", "listenPort": port, "upstream": "?", "models": [], "total": 0, "ok": 0, "translated": 0, "err": 0, "alive": False, "startedAt": ""}
 
-    results = await asyncio.gather(_fetch(8082), _fetch(8090), _fetch(8091))
+    results = await asyncio.gather(_fetch(8082), _fetch(8090), _fetch(8091), _fetch(8084))
+
+    def _make_stats_detail(r):
+        """构建增强统计字典（成功率、时长、进度条数据）。"""
+        if not r["alive"]:
+            return None
+        total = r["total"]
+        ok = r["ok"]
+        err = r["err"]
+        tr = r.get("translated", 0)
+        success_rate = round(ok / total * 100, 1) if total > 0 else 100.0
+        uptime = _format_uptime(r.get("startedAt", ""))
+        return {
+            "total": total, "ok": ok, "err": err, "translated": tr,
+            "success_rate": success_rate, "uptime": uptime, "alive": True,
+        }
+
+    # ── 总览数据 ──
+    total_requests_all = sum(r["total"] for r in results if r["alive"])
+    alive_ports = sum(1 for r in results if r["alive"])
 
     cards = []
 
@@ -4132,7 +4344,6 @@ async def dashboard():
             ("模型数量", f"{len(_ANTHROPIC_PORT_MODELS)} 个（仅 Anthropic）"),
             ("systemd 服务", "claude-code-proxy"),
         ],
-        stats_items=[],
         models=_ANTHROPIC_PORT_MODELS,
         description="接收 Anthropic 客户端请求，结构化解码后转换为 OpenAI 格式，内部转发到 8082 的多 provider 路由。响应译回 Anthropic 格式。",
     ))
@@ -4152,14 +4363,16 @@ async def dashboard():
             ("模型数量", f"{len(r82['models'])} 个"),
             ("systemd 服务", "claude-code-proxy"),
         ],
-        stats_items=[("总请求", r82["total"]), ("正常透传", r82["ok"]), ("代理错误", r82["err"])] if r82["alive"] else [],
+        stats_detail=_make_stats_detail(r82),
         models=r82["models"] if r82["alive"] else [],
         description="纯透传 + 多 provider 鉴权路由（copilot/qclaw/openai ···）。8081 翻译后的 OpenAI 请求和外部 OpenAI 客户端都走这里。",
+        accent_class="accent-8082" if r82["alive"] else "",
     ))
 
-    # ── 8090 / 8091 透明反代 ──
+    # ── 8090 / 8091 / 8084 透明反代 ──
+    port_accent_map = {8090: "accent-8090", 8091: "accent-8091", 8084: "accent-8084"}
     for r in results[1:]:
-        s = "alive" if r["alive"] else "offline"
+        port = r["listenPort"]
         cards.append(_build_card_html(
             name=r["label"],
             note="asyncio TCP · 透明反代 + 429 错误翻译",
@@ -4167,16 +4380,22 @@ async def dashboard():
             status_badge=f"已翻译 429 × {r['translated']}" if r["translated"] > 0 else "无异常",
             status_badge_class="yellow" if r["translated"] > 0 else "green",
             kv_items=[
-                ("监听地址", f"http://0.0.0.0:{r['listenPort']}"),
+                ("监听地址", f"http://0.0.0.0:{port}"),
                 ("映射上游", r["upstream"]),
                 ("模型数量", f"{len(r['models'])} 个"),
             ],
-            stats_items=[("总请求", r["total"]), ("正常透传", r["ok"]), ("翻译 429", r["translated"]), ("代理错误", r["err"])] if r["alive"] else [],
+            stats_detail=_make_stats_detail(r),
             models=r["models"],
+            accent_class=port_accent_map.get(port, ""),
         ))
 
     cards_html = "".join(cards)
     all_models = _build_models_list()
+    # 生成概览栏的状态点
+    overview_dots = "".join(
+        f'<span class="status-dot {"green" if r["alive"] else "red"}" title="端口 {r["listenPort"]}: {"在线" if r["alive"] else "离线"}"></span>'
+        for r in results
+    )
 
     return f"""<!DOCTYPE html>
 <html lang="zh-CN">
@@ -4188,10 +4407,19 @@ async def dashboard():
 </head>
 <body>
   <h1>🔀 LLM Gateway — 管理总览</h1>
-  <div class="sub">8081 Anthropic (FastAPI) → 8082 OpenAI (asyncio TCP 多 provider 路由) → 上游 · 自动 15s 刷新</div>
+  <div class="sub">8081 Anthropic (FastAPI) → 8082 OpenAI (asyncio TCP 多 provider 路由) → 上游 <span class="refresh-time">· 自动 15s 刷新 · {datetime.now().strftime("%H:%M:%S")}</span></div>
+  <div class="overview-bar">
+    <div>共 <b>{len(results)}</b> 个服务</div>
+    <div class="divider"></div>
+    <div>累计 <b>{total_requests_all}</b> 请求</div>
+    <div class="divider"></div>
+    <div>存活端口 <b>{alive_ports}</b> / {len(results)}</div>
+    <div class="divider"></div>
+    <div>{overview_dots} 8082 8090 8091 8084</div>
+  </div>
   <div class="section">
     <div class="section-title">服务架构</div>
-    {cards_html}
+    <div class="card-grid">{cards_html}</div>
   </div>
 </body>
 </html>"""

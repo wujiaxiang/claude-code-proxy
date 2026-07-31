@@ -33,5 +33,39 @@
       "z-ai/glm-5.2",
       "meta/llama-4-maverick-17b-128e-instruct"
     ]
+  },
+  {
+    "label": "codebuddy",
+    "listenPort": 8084,
+    "targetHost": "copilot.tencent.com",
+    "targetPort": 443,
+    "targetProtocol": "https",
+    "routePrefix": "/v2",
+    "apikeyEnv": "CODEBUDDY_TOKEN",
+    "models": [
+      "default",
+      "deepseek-v4-pro",
+      "deepseek-v4-flash",
+      "deepseek-v3-2-volc",
+      "minimax-m2.5",
+      "minimax-m3",
+      "minimax-m2.7",
+      "glm-5.2",
+      "glm-5.1",
+      "glm-5.0",
+      "glm-5.0-turbo",
+      "glm-5v-turbo",
+      "glm-4.7",
+      "glm-4.6",
+      "glm-4.6v",
+      "kimi-k3-1",
+      "kimi-k2.7",
+      "kimi-k2.6",
+      "kimi-k2.5",
+      "kimi-k2-thinking",
+      "hy3",
+      "hunyuan-chat",
+      "hunyuan-image-v3.0-art"
+    ]
   }
 ]
