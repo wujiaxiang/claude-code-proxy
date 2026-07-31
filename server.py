@@ -1054,79 +1054,30 @@ def _choose_openai_upstream(body_json: dict):
 
 
 async def _handle_openai_proxy_request(reader, writer):
-    """8082 OpenAI 端口：透传 /v1/chat/completions 到上游（多 provider 路由，共享 HTTP 工具函数）"""
+    """8082 OpenAI 端口：固定为 copilot target（经统一透传引擎）。
+    保留为兼容入口：若 8082 未在 targets.json 中配置，则此函数兜底转发。
+    """
+    copilot_target = next((t for t in _TARGETS if t["listenPort"] == _OPENAI_PORT), None)
+    if copilot_target:
+        await _handle_target_request(reader, writer, copilot_target)
+        return
+    # 兜底：无 target 配置时保持旧行为（透传 + 基本自检）
     try:
         method, path, raw_path, headers, body = await _parse_http_request(reader)
         if method is None:
             return
-
-        # ── 自检端点 ──
         if path == "/__proxy_info__":
             payload = json.dumps({
                 "label": "claude-code-openai", "listenPort": _OPENAI_PORT,
-                "targetHost": PREFERRED_PROVIDER, "targetPort": 443, "targetProtocol": "https",
-                "models": [m["id"] for m in _build_models_list(include_aliases=False)],
-                "retryAfterSeconds": 0, "errorPatterns": [],
+                "targetHost": "unconfigured", "targetPort": 443, "targetProtocol": "https",
+                "models": [], "retryAfterSeconds": 0, "errorPatterns": [],
                 "startedAt": _OPENAI_STATS["startedAt"],
             })
             writer.write(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: %d\r\n\r\n%s" % (len(payload.encode()), payload.encode()))
             await writer.drain(); writer.close(); return
-
-        if path == "/__proxy_stats__":
-            payload = json.dumps({"label": "claude-code-openai", "listenPort": _OPENAI_PORT, **_OPENAI_STATS})
-            writer.write(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: %d\r\n\r\n%s" % (len(payload.encode()), payload.encode()))
-            await writer.drain(); writer.close(); return
-
-        # ── /v1/models：返回真实下游模型列表（不含 Anthropic 别名）──
-        if path in ("/v1/models", "/api/v1/models", "/openai/v1/models") and method == "GET":
-            payload = json.dumps({"data": _build_models_list(include_aliases=False), "object": "list", "has_more": False})
-            writer.write(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: %d\r\n\r\n%s" % (len(payload.encode()), payload.encode()))
-            await writer.drain(); writer.close(); return
-
-        # ── /dashboard：代理到 8081 FastAPI ──
-        if path == "/dashboard" and method == "GET":
-            async with httpx.AsyncClient(timeout=httpx.Timeout(5.0), trust_env=False) as c:
-                resp = await c.get("http://127.0.0.1:8081/dashboard")
-                writer.write(b"HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: %d\r\n\r\n%s" % (len(resp.content), resp.content))
-                await writer.drain()
-            writer.close(); return
-
-        _OPENAI_STATS["totalRequests"] += 1
-
-        # ── /v1/chat/completions：多 provider 路由转发 ──
-        if path == "/v1/chat/completions" and method == "POST":
-            try:
-                body_json = json.loads(body.decode("utf-8")) if body else {}
-            except Exception:
-                await _write_error_response(writer, 400, "Invalid JSON body")
-                return
-
-            upstream_url, auth_headers = _choose_openai_upstream(body_json)
-            is_stream = body_json.get("stream", False)
-            payload = body
-
-            async with httpx.AsyncClient(timeout=httpx.Timeout(300.0, connect=10.0), trust_env=False) as client:
-                for attempt in range(3):
-                    resp = await client.post(upstream_url, headers=auth_headers, content=payload)
-                    if resp.status_code >= 500 and attempt < 2:
-                        logger.warning(f"[openai-8082] retry {attempt+1} on HTTP {resp.status_code}")
-                        await asyncio.sleep(1)
-                        continue
-                    break
-
-                await _write_response(writer, resp, stats=_OPENAI_STATS)
-            return
-
-        # ── 其余请求：透传到上游（/v1/messages 等）──
-        upstream_url, auth_headers = _choose_openai_upstream({})
-        upstream_url = upstream_url.replace("/chat/completions", raw_path)
-        merged_headers = {**auth_headers, **{k: v for k, v in headers.items() if k not in ("host", "connection", "content-length", "transfer-encoding")}}
-        async with httpx.AsyncClient(timeout=httpx.Timeout(300.0, connect=10.0), trust_env=False) as client:
-            resp = await client.request(method, upstream_url, headers=merged_headers, content=body)
-            await _write_response(writer, resp, stats=_OPENAI_STATS)
+        await _write_error_response(writer, 503, "8082 target not configured in targets.json")
     except Exception:
         _OPENAI_STATS["passthroughError"] += 1
-        logger.exception("[openai-8082] proxy exception")
         try:
             await _write_error_response(writer, 503, "OpenAI proxy error")
         except Exception:
@@ -1213,7 +1164,7 @@ async def _handle_anthropic_proxy_request(reader, writer):
 
             fwd_headers = {
                 "content-type": "application/json",
-                "host": "127.0.0.1:8082",
+                "host": f"127.0.0.1:{_ANTHROPIC_FORWARD_PORT}",
                 "content-length": str(len(openai_payload)),
             }
             if headers.get("authorization"):
@@ -1221,7 +1172,7 @@ async def _handle_anthropic_proxy_request(reader, writer):
             if headers.get("x-api-key"):
                 fwd_headers["x-api-key"] = headers["x-api-key"]
 
-            upstream_url = "http://127.0.0.1:8082/v1/chat/completions"
+            upstream_url = f"http://127.0.0.1:{_ANTHROPIC_FORWARD_PORT}/v1/chat/completions"
 
             async with httpx.AsyncClient(timeout=httpx.Timeout(300.0, connect=10.0), trust_env=False) as client:
                 req = client.build_request("POST", upstream_url, headers=fwd_headers, content=openai_payload)
@@ -1261,10 +1212,10 @@ async def _handle_anthropic_proxy_request(reader, writer):
                 writer.close(); return
             return
 
-        # ── 其余请求：透传到 127.0.0.1:8082 ──
-        upstream_url = f"http://127.0.0.1:8082{raw_path}"
+        # ── 其余请求：透传到 _ANTHROPIC_FORWARD_PORT ──
+        upstream_url = f"http://127.0.0.1:{_ANTHROPIC_FORWARD_PORT}{raw_path}"
         fwd_headers = {k: v for k, v in headers.items() if k not in ("host", "connection")}
-        fwd_headers["host"] = "127.0.0.1:8082"
+        fwd_headers["host"] = f"127.0.0.1:{_ANTHROPIC_FORWARD_PORT}"
 
         async with httpx.AsyncClient(timeout=httpx.Timeout(300.0, connect=10.0), trust_env=False) as client:
             req = client.build_request(method, upstream_url, headers=fwd_headers, content=body if body else None)
@@ -1298,7 +1249,7 @@ async def _handle_anthropic_proxy_request(reader, writer):
 
 async def _anthropic_server(host="0.0.0.0", port=8081):
     srv = await asyncio.start_server(_handle_anthropic_proxy_request, host=host, port=port)
-    print(f"🔀 [claude-code-anthropic] 0.0.0.0:{port} -> http://127.0.0.1:8082 (Anthropic protocol, /v1/models isolated)")
+    print(f"🔀 [claude-code-anthropic] 0.0.0.0:{port} -> http://127.0.0.1:{_ANTHROPIC_FORWARD_PORT} (Anthropic protocol, /v1/models isolated)")
     return srv
 
 
