@@ -494,14 +494,15 @@ async def lifespan(app):
         except Exception as _me:
             logger.warning(f"startup: failed to preload downstream models: {_me}")
 
-    # ── 启动 asyncio TCP 服务器（8082 OpenAI, 8090 openrouter, 8091 nvidia）──
+    # ── 启动所有 target 驱动端口（8082 copilot, 8084 codebuddy, 8085 qclaw, 8090-8094 等）──
     # 8081 Anthropic 由 uvicorn FastAPI 处理（不在此处启动）
     _vendor_servers = []
-    for t in _VENDOR_TARGETS:
+    for t in _TARGETS:
+        if not t.get("enabled", True):
+            print(f"⏭️  [{t['label']}] disabled, skip")
+            continue
         srv = await _vendor_server("0.0.0.0", t["listenPort"], t)
         _vendor_servers.append(srv)
-    _openai_srv = await _openai_server("0.0.0.0", _OPENAI_PORT)
-    _vendor_servers.append(_openai_srv)
 
     yield
 
@@ -730,11 +731,14 @@ BIG_MODEL = os.environ.get("BIG_MODEL", "gpt-4.1")
 MEDIUM_MODEL = os.environ.get("MEDIUM_MODEL", os.environ.get("BIG_MODEL", "gpt-4.1"))
 SMALL_MODEL = os.environ.get("SMALL_MODEL", "gpt-4.1-mini")
 
-# ─── 透明反代目标（vendor passthrough proxy，本进程内嵌） ───
+import config_store as _cfg
 
-_VENDOR_TARGETS: list = []
-_VENDOR_STATS: Dict[str, dict] = {}
+# ─── 统一透传引擎配置（targets.json 驱动）───
 _VENDOR_RETRY_AFTER = int(os.environ.get("VENDOR_RETRY_AFTER_SECONDS", "3"))
+_TARGETS: list = []
+_SECRETS: dict = {}
+_TARGET_STATS: Dict[str, dict] = {}
+_ANTHROPIC_FORWARD_PORT = 8082
 
 _VENDOR_ERROR_PATTERNS = [
     re.compile(r'"ResourceExhausted"'),
@@ -921,23 +925,70 @@ def _resolve_auth(headers: dict, target: dict = None, provider: str = None) -> d
     return fwd
 
 
-def _load_vendor_targets():
-    global _VENDOR_TARGETS, _VENDOR_STATS
-    import pathlib
-    cfg_path = pathlib.Path(__file__).parent / "targets.json"
+def _apply_model_mapping(target: dict, body_json: dict) -> dict:
+    """按 target.modelMapping 将 Anthropic 别名（opus/sonnet/haiku）替换为真实模型。"""
+    mapping = target.get("modelMapping") or {}
+    model = body_json.get("model")
+    if model and model in mapping:
+        body_json["model"] = mapping[model]
+    return body_json
+
+
+def _handler_prepare_body(target: dict, body_bytes: bytes):
+    """按 handler 类型处理请求体：模型映射 + qclaw body 清理。
+    返回 (new_body_bytes, body_json_or_None)。
+    """
+    handler = target.get("handler", "passthrough")
+    if handler == "passthrough":
+        return body_bytes, None
     try:
-        with open(cfg_path) as f:
-            raw = json.load(f)
-        _VENDOR_TARGETS = [t for t in raw if t.get("listenPort") and t.get("targetHost")]
-        for t in _VENDOR_TARGETS:
-            _VENDOR_STATS[t["label"]] = {
+        body_json = json.loads(body_bytes.decode("utf-8")) if body_bytes else {}
+    except Exception:
+        return body_bytes, None
+    if target.get("modelMapping"):
+        body_json = _apply_model_mapping(target, body_json)
+    if handler == "qclaw":
+        body_json = _clean_qclaw_body(body_json)
+    return json.dumps(body_json, ensure_ascii=False).encode("utf-8"), body_json
+
+
+def _handler_prepare_headers(target: dict, fwd_headers: dict, body_json: dict) -> dict:
+    """按 handler 类型注入认证与补充 header。"""
+    handler = target.get("handler", "passthrough")
+    # 认证：crack 类注入 secrets token（secrets.json > apikeyEnv）
+    if target.get("category") == "crack":
+        token = _cfg.resolve_secret(target, _SECRETS)
+        if token:
+            fwd_headers["authorization"] = f"Bearer {token}"
+    # 补充 header（如 copilot 的 Copilot-Integration-Id）
+    for k, v in (target.get("extraHeaders") or {}).items():
+        fwd_headers[k] = v
+    # qclaw 上游要求 UA
+    if handler == "qclaw":
+        fwd_headers["User-Agent"] = "OpenAI/JS 6.39.1"
+    return fwd_headers
+
+
+def _load_vendor_targets():
+    """加载 targets.json + secrets.json，规范化并初始化统计。"""
+    global _TARGETS, _SECRETS, _ANTHROPIC_FORWARD_PORT
+    cfg = _cfg.load_targets()
+    errors = _cfg.validate_targets(cfg)
+    if errors:
+        for e in errors:
+            logger.warning(f"targets.json 配置错误: {e}")
+    _TARGETS = cfg.get("targets", [])
+    _ANTHROPIC_FORWARD_PORT = cfg.get("anthropicForwardPort", 8082)
+    _SECRETS = _cfg.load_secrets()
+    for t in _TARGETS:
+        label = t["label"]
+        if label not in _TARGET_STATS:
+            _TARGET_STATS[label] = {
                 "totalRequests": 0, "translated429": 0,
                 "passthroughOk": 0, "passthroughError": 0,
                 "startedAt": datetime.now().isoformat(),
             }
-        print(f"🔀 Vendor targets loaded: {len(_VENDOR_TARGETS)} targets")
-    except Exception as e:
-        print(f"⚠️  Failed to load vendor targets.json: {e}")
+    print(f"🔀 Targets loaded: {len(_TARGETS)} targets, anthropicForwardPort={_ANTHROPIC_FORWARD_PORT}")
 
 _load_vendor_targets()
 
@@ -1251,9 +1302,16 @@ async def _anthropic_server(host="0.0.0.0", port=8081):
     return srv
 
 
-async def _handle_vendor_request(reader, writer, target):
-    """单个透明反代连接处理：解析 HTTP → forward → 429 翻译"""
-    stats = _VENDOR_STATS[target["label"]]
+async def _handle_target_request(reader, writer, target):
+    """统一透传引擎：处理单个 target 端口的全部请求。
+    与原 _handle_vendor_request 兼容，新增 handler 分发 / 鉴权注入 / 401 缺 token。
+    """
+    label = target["label"]
+    stats = _TARGET_STATS.setdefault(label, {
+        "totalRequests": 0, "translated429": 0,
+        "passthroughOk": 0, "passthroughError": 0,
+        "startedAt": datetime.now().isoformat(),
+    })
     try:
         method, path, raw_path, headers, body = await _parse_http_request(reader)
         if method is None:
@@ -1262,36 +1320,62 @@ async def _handle_vendor_request(reader, writer, target):
         # ── 内建 JSON 端点 ──
         if path == "/__proxy_info__":
             payload = json.dumps({
-                "label": target["label"], "listenPort": target["listenPort"],
+                "label": label, "listenPort": target["listenPort"],
+                "category": target.get("category", ""),
+                "handler": target.get("handler", "passthrough"),
+                "isFree": target.get("isFree", False),
                 "targetHost": target["targetHost"], "targetPort": target.get("targetPort", 443),
                 "targetProtocol": target.get("targetProtocol", "https"),
                 "models": target.get("models", []),
                 "retryAfterSeconds": _VENDOR_RETRY_AFTER,
                 "errorPatterns": [p.pattern for p in _VENDOR_ERROR_PATTERNS],
                 "startedAt": stats["startedAt"],
+                "secretSet": bool(_cfg.resolve_secret(target, _SECRETS)),
             })
             writer.write(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: %d\r\n\r\n%s" % (len(payload.encode()), payload.encode()))
             await writer.drain(); writer.close(); return
 
         if path == "/__proxy_stats__":
-            payload = json.dumps({"label": target["label"], "listenPort": target["listenPort"], **stats})
+            payload = json.dumps({"label": label, "listenPort": target["listenPort"], **stats})
             writer.write(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: %d\r\n\r\n%s" % (len(payload.encode()), payload.encode()))
             await writer.drain(); writer.close(); return
 
+        # ── /dashboard：代理到 8081 FastAPI ──
+        if path == "/dashboard" and method == "GET":
+            async with httpx.AsyncClient(timeout=httpx.Timeout(5.0), trust_env=False) as c:
+                resp = await c.get("http://127.0.0.1:8081/dashboard")
+                writer.write(b"HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: %d\r\n\r\n%s" % (len(resp.content), resp.content))
+                await writer.drain()
+            writer.close(); return
+
         stats["totalRequests"] += 1
 
-        # ── 上游转发（含路径重写：routePrefix 解决 OpenRouter /api/v1 路径差异）──
+        # ── crack 类缺 token → 401（不转发上游）──
+        if target.get("category") == "crack" and not _cfg.resolve_secret(target, _SECRETS):
+            err_payload = json.dumps({
+                "error": {
+                    "type": "missing_token",
+                    "message": f"请到 dashboard (http://127.0.0.1:8081/dashboard) 填写 {target.get('secretRef', label)} token",
+                }
+            })
+            writer.write(b"HTTP/1.1 401 Unauthorized\r\nContent-Type: application/json\r\nContent-Length: %d\r\n\r\n%s" % (len(err_payload.encode()), err_payload.encode()))
+            await writer.drain(); writer.close(); return
+
+        # ── 上游转发（含路径重写 + handler body/header 处理）──
         transport = "https" if target.get("targetProtocol", "https") == "https" else "http"
         upstream_path = raw_path
         route_prefix = target.get("routePrefix")
         if route_prefix and upstream_path.startswith("/v1"):
             upstream_path = route_prefix + upstream_path[3:]
         upstream_url = f"{transport}://{target['targetHost']}:{target.get('targetPort', 443)}{upstream_path}"
+
+        body_bytes, body_json = _handler_prepare_body(target, body)
         fwd_headers = _resolve_auth(headers, target=target)
         fwd_headers["host"] = target["targetHost"]
+        fwd_headers = _handler_prepare_headers(target, fwd_headers, body_json)
 
         async with httpx.AsyncClient(timeout=httpx.Timeout(300.0, connect=10.0), trust_env=False) as client:
-            req = client.build_request(method, upstream_url, headers=fwd_headers, content=body if body else None)
+            req = client.build_request(method, upstream_url, headers=fwd_headers, content=body_bytes if body_bytes else None)
             resp = await client.send(req, stream=True)
 
             content_type = resp.headers.get("content-type", "")
@@ -1300,20 +1384,20 @@ async def _handle_vendor_request(reader, writer, target):
             if is_stream:
                 status, _ = await _write_response(writer, resp, stats=stats)
                 if status and status >= 400:
-                    logger.warning(f"[{target['label']}] stream returned HTTP {status}")
+                    logger.warning(f"[{label}] stream returned HTTP {status}")
                 return
 
             # 非流式：先读 body，再判断是否要翻译 429
-            body_bytes = await resp.aread()
-            body_text = body_bytes.decode("utf-8", errors="replace")
+            resp_body = await resp.aread()
+            body_text = resp_body.decode("utf-8", errors="replace")
             status = resp.status_code
 
             if status >= 400:
-                logger.warning(f"[{target['label']}] HTTP {status}: {body_text[:300]}")
+                logger.warning(f"[{label}] HTTP {status}: {body_text[:300]}")
 
             if _vendor_body_retryable(body_text):
                 stats["translated429"] += 1
-                logger.info(f"[{target['label']}] translated HTTP {status} → 429 (rate_limit_error)")
+                logger.info(f"[{label}] translated HTTP {status} → 429 (rate_limit_error)")
                 err_payload = json.dumps({
                     "error": {
                         "type": "rate_limit_error",
@@ -1334,16 +1418,16 @@ async def _handle_vendor_request(reader, writer, target):
                 await _write_response(writer, resp, stats=stats)
     except Exception:
         stats["passthroughError"] += 1
-        logger.exception(f"[{target['label']}] vendor proxy exception")
+        logger.exception(f"[{label}] target proxy exception")
         try:
-            await _write_error_response(writer, 503, f"Proxy error for {target['label']}")
+            await _write_error_response(writer, 503, f"Proxy error for {label}")
         except Exception:
             pass
 
 
 async def _vendor_server(host, port, target):
     server = await asyncio.start_server(
-        lambda r, w: _handle_vendor_request(r, w, target),
+        lambda r, w: _handle_target_request(r, w, target),
         host=host, port=port,
     )
     print(f"🔀 [{target['label']}] 0.0.0.0:{port} -> {target.get('targetProtocol','https')}://{target['targetHost']}:{target.get('targetPort', 443)}")

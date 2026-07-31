@@ -136,6 +136,27 @@ def test_resolve_secret_precedence():
     del os.environ["COPILOT_GHE_TOKEN"]
 
 
+# ─── handler 模型映射（server.py 的函数经 import 测试） ───
+import server as _srv
+
+
+def test_apply_model_mapping():
+    t = {"modelMapping": {"opus": "pool-deepseek-v4-pro", "sonnet": "pool-deepseek-v4-pro", "haiku": "pool-deepseek-v4-flash"}}
+    body = {"model": "opus", "messages": []}
+    mapped = _srv._apply_model_mapping(t, body)
+    assert mapped["model"] == "pool-deepseek-v4-pro", f"opus 应映射为 pool-deepseek-v4-pro，实际 {mapped['model']}"
+    body2 = {"model": "pool-glm-5.2", "messages": []}
+    mapped2 = _srv._apply_model_mapping(t, body2)
+    assert mapped2["model"] == "pool-glm-5.2", "非别名模型不应被映射"
+
+
+def test_apply_model_mapping_no_mapping():
+    t = {}
+    body = {"model": "gpt-4.1", "messages": []}
+    mapped = _srv._apply_model_mapping(t, body)
+    assert mapped["model"] == "gpt-4.1"
+
+
 def main():
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for t in tests:
