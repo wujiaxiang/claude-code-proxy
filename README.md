@@ -211,7 +211,7 @@ The proxy exposes **two endpoints**, both available for all providers:
 | `gemini` | LiteLLM 翻译 | LiteLLM 翻译 |
 | **`openai`** | LiteLLM 翻译 | **直接透传** |
 | **`gemini-openai`** | LiteLLM 翻译 | **直接透传** |
-| **`copilot`** | LiteLLM 翻译 | **直接透传** |
+| **`copilot`** | **httpx 直连 `/v1/messages`** | **直接透传** |
 | **`qclaw`** | LiteLLM 翻译 | **直接透传** |
 | **`qclaw-local`** | LiteLLM 翻译 | **直接透传** |
 
@@ -225,6 +225,56 @@ The proxy exposes **two endpoints**, both available for all providers:
 > 所有透传 provider 共享全局 httpx 连接池，连接错误/5xx 自动重试 3 次。
 >
 > `anthropic` 和 `gemini`（原生 API）后端不是 OpenAI 兼容格式，`/v1/chat/completions` 上仍通过 LiteLLM 进行格式翻译。
+
+## Architecture (4 Ports) 🏗️
+
+The proxy now runs **4 ports** in a single process:
+
+| Port | Protocol | Handler | Purpose |
+|------|----------|---------|---------|
+| **8081** | Anthropic | FastAPI (uvicorn) | `/v1/messages` → translates to OpenAI → internal request to 8082 |
+| **8082** | OpenAI | asyncio TCP | Multi-provider routing (qclaw/copilot/openai), `/v1/chat/completions` |
+| **8090** | OpenAI | asyncio TCP (vendor) | Transparent proxy → OpenRouter API (with `/v1`→`/api/v1` path rewrite) |
+| **8091** | OpenAI | asyncio TCP (vendor) | Transparent proxy → Nvidia API |
+
+```
+Claude Code (Anthropic)
+  ──▶ 8081 (Anthropic FastAPI)
+        └── translates to OpenAI ──▶ 8082 (OpenAI TCP)
+                                      ├─ qclaw      → httpx → QClaw upstream
+                                      ├─ copilot    → httpx → Copilot Enterprise
+                                      └─ openai     → httpx → OpenAI
+
+OpenCode / OpenAI clients
+  ├──▶ 8082 (OpenAI TCP, multi-provider routing)
+  ├──▶ 8090 (vendor proxy → OpenRouter, with key passthrough)
+  └──▶ 8091 (vendor proxy → Nvidia, with key passthrough)
+```
+
+### Vendor Proxy (8090 / 8091)
+
+Configured via [`targets.json`](targets.json). Each target specifies upstream host, route prefix, and model list:
+
+```json
+{
+  "label": "openrouter",
+  "listenPort": 8090,
+  "targetHost": "openrouter.ai",
+  "routePrefix": "/api/v1",
+  "models": ["nvidia/nemotron-3-ultra-550b-a55b:free", "..."]
+}
+```
+
+- **routePrefix**: Rewrites request path `/v1/...` → custom prefix (e.g., OpenRouter needs `/api/v1/...`)
+- **Key passthrough**: API keys are NOT stored in targets.json — the proxy forwards whatever `Authorization` header the client sends
+- **429 translation**: Upstream `ResourceExhausted` errors are translated to HTTP 429 with `Retry-After: 3` for automatic client backoff
+- **Non-200 logging**: All upstream error responses (4xx/5xx) are automatically logged with body preview (300 chars)
+- **Exception handling**: Connection errors return HTTP 503 instead of silent connection close
+
+### 8081 /v1/models Isolation
+
+8081 returns only 6 Anthropic models (`claude-sonnet-4-20250514`, etc.).  
+8082 returns the full real downstream model list (no hardcoded Anthropic aliases).
 
 ## How It Works 🧩
 
@@ -612,9 +662,9 @@ PREFERRED_PROVIDER=copilot
 COPILOT_GHE_TOKEN=github_pat_xxxxxxxxxxxxxxxxxxxx   # gh auth token --hostname <your-ghe-host>
 COPILOT_GHE_HOST=copilot-api.your-company.ghe.com  # your enterprise hostname
 COPILOT_INTEGRATION_ID=copilot-developer-cli        # default, do not change
-COPILOT_BIG_MODEL=claude-opus-4.8
-COPILOT_MEDIUM_MODEL=claude-sonnet-4.6
-COPILOT_SMALL_MODEL=claude-haiku-4.5
+COPILOT_BIG_MODEL=claude-opus-4.8                   # Opus series → this
+COPILOT_MEDIUM_MODEL=claude-sonnet-5                # Sonnet series → this
+COPILOT_SMALL_MODEL=claude-haiku-4.5                # Haiku series → this
 ```
 
 **Get your PAT:**
@@ -622,15 +672,19 @@ COPILOT_SMALL_MODEL=claude-haiku-4.5
 gh auth token --hostname your-company.ghe.com
 ```
 
-**Available models** (from Copilot Enterprise `/models` API):
+**Available models** (from Copilot Enterprise `/models` API, verified 2026-07):
 
-| Category | Model IDs |
-|----------|-----------|
-| Claude | `claude-haiku-4.5` · `claude-sonnet-4.5` · `claude-sonnet-4.6` · `claude-opus-4.5` · `claude-opus-4.6` · `claude-opus-4.8` |
-| GPT | `gpt-5.5` · `gpt-5.4` · `gpt-5.3-codex` · `gpt-5-mini` · `gpt-4.1` · `gpt-4o-mini` · `gpt-3.5-turbo` |
-| Gemini | `gemini-2.5-pro` |
+| Category | Model IDs | Context Window |
+|----------|----------|----------------|
+| Claude | `claude-opus-4.8` · `claude-opus-4.6` · `claude-sonnet-5` · `claude-sonnet-4.6` · `claude-sonnet-4.5` · `claude-opus-4.5` · `claude-haiku-4.5` | Copilot gate-limited 200K~264K |
+| GPT | `gpt-5.5` · `gpt-5.4` · `gpt-5.3-codex` · `gpt-5-mini` · `gpt-4.1` · `gpt-4o-mini` · `gpt-3.5-turbo` | — |
+| Gemini | `gemini-2.5-pro` | 128K |
 
 > ⚠️ `gpt-5.4-mini` appears in `/models` but is rejected at inference time — do not set it as `COPILOT_SMALL_MODEL`.
+
+> **Dual-endpoint passthrough**: The downstream Copilot API natively supports both `/v1/messages` and `/chat/completions` endpoints. The proxy routes both via httpx directly — `/v1/messages` → downstream `/v1/messages` (native Anthropic SSE, zero translation), `/chat/completions` → downstream `/chat/completions` (OpenAI SSE). Both paths bypass LiteLLM entirely, preserving thinking/tool_use/signatures and other complex structures intact.
+>
+> **Context window**: The `max_context_window_tokens` values above are from the Copilot gateway `/models` API response — these are gateway-level policy limits, not the model's native capability (e.g. `claude-opus-4.8` has a 1M native window, gated at 264K by Copilot).
 
 ---
 

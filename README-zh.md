@@ -110,24 +110,26 @@ COPILOT_SMALL_MODEL=claude-haiku-4.5          # Haiku 系列 → 此模型
 gh auth token --hostname bmw.ghe.com
 ```
 
-**可用模型**（企业 Copilot `/models` API 实际返回，18 个 chat 模型）：
+**可用模型**（企业 Copilot `/models` API 实际返回，2026-07 实测）：
 
-| 分类 | 模型 ID |
-|------|---------|
-| Claude | `claude-haiku-4.5` · `claude-sonnet-4.5` · `claude-sonnet-4.6` · `claude-opus-4.5` · `claude-opus-4.6` · `claude-opus-4.8` |
-| GPT | `gpt-5.5` · `gpt-5.4` · `gpt-5.4-mini` · `gpt-5.3-codex` · `gpt-5-mini` · `gpt-4.1` · `gpt-4.1-2025-04-14` · `gpt-4o-mini` · `gpt-4o-mini-2024-07-18` · `gpt-3.5-turbo` · `gpt-3.5-turbo-0613` |
-| Gemini | `gemini-2.5-pro` |
+| 分类 | 模型 ID | 上下文窗口 |
+|------|---------|-----------|
+| Claude | `claude-opus-4.8` · `claude-opus-4.6` · `claude-sonnet-5` · `claude-sonnet-4.6` · `claude-sonnet-4.5` · `claude-opus-4.5` · `claude-haiku-4.5` | Copilot 网关限制 200K～264K |
+| GPT | `gpt-5.5` · `gpt-5.4` · `gpt-5.4-mini` · `gpt-5.3-codex` · `gpt-5-mini` · `gpt-4.1` · `gpt-4.1-2025-04-14` · `gpt-4o-mini` · `gpt-4o-mini-2024-07-18` · `gpt-3.5-turbo` · `gpt-3.5-turbo-0613` | — |
+| Gemini | `gemini-2.5-pro` | 128K |
 
 > ⚠️ `gpt-5.4-mini` 在 `/models` 列表中出现，但实际调用 `/chat/completions` 会被拒绝，不建议设为 SMALL_MODEL。
 
-> **推理文本透传**：Claude 模型（如 `claude-sonnet-4.6`）会在流式响应中下发 `reasoning_text`，proxy 将其追加到正文 content 中输出，客户端可直接看到推理过程。
+> **上下文窗口**：以上 `max_context_window_tokens` 来自 Copilot 网关 `/models` API 返回值，是网关层面的策略限制，非模型原生能力（如 `claude-opus-4.8` 原生 1M 窗口，网关卡在 264K）。
+
+> **双端点透传**：Copilot 下游原生支持 `/v1/messages` 和 `/chat/completions` 两个端点。proxy 的 `/v1/messages` 走 **httpx 直接透传**下游的 `/v1/messages`，零协议转换，thinking/tool_use/signature 等复杂结构完整保留。`/v1/chat/completions` 同样走 httpx 直接透传下游的 `/chat/completions`。两条链路均绕过 LiteLLM。
 
 **双端点**：所有 provider 均开放两个端点：
 
 | 端点 | 格式 | 适合 | 路由方式 |
 |------|------|------|---------|
-| `:8082/v1/messages` | Anthropic | Claude Code / Cline | LiteLLM（所有 provider 统一路径） |
-| `:8082/v1/chat/completions` | OpenAI | 任意 Agent / 自定义工具 | LiteLLM（所有 provider 统一路径） |
+| `:8082/v1/messages` | Anthropic | Claude Code / Cline | copilot→httpx 直连下游 `/v1/messages`；其他→LiteLLM |
+| `:8082/v1/chat/completions` | OpenAI | 任意 Agent / 自定义工具 | qclaw/openai/copilot/gemini-openai→httpx 透传；其他→LiteLLM |
 
 ```bash
 # Anthropic 格式（Claude Code 默认）
@@ -196,6 +198,57 @@ tail -f /tmp/proxy.log
 
 ---
 
+## 四端口架构
+
+单进程运行 **4 个端口**：
+
+| 端口 | 协议 | 处理方式 | 用途 |
+|------|------|---------|------|
+| **8081** | Anthropic | FastAPI (uvicorn) | `/v1/messages` → 翻译成 OpenAI → 内部请求 8082 |
+| **8082** | OpenAI | asyncio TCP | 多 provider 路由（qclaw/copilot/openai），共用 HTTP 工具函数 |
+| **8090** | OpenAI | asyncio TCP（透明代理） | 透传 → OpenRouter（自动 `/v1`→`/api/v1` 路径重写） |
+| **8091** | OpenAI | asyncio TCP（透明代理） | 透传 → Nvidia API |
+
+```
+Claude Code (Anthropic)
+  ──▶ 8081 (Anthropic FastAPI)
+        └── 翻译成 OpenAI ──▶ 8082 (OpenAI TCP)
+                              ├─ qclaw      → httpx → QClaw 上游
+                              ├─ copilot    → httpx → Copilot Enterprise
+                              └─ openai     → httpx → OpenAI
+
+OpenCode / OpenAI 客户端
+  ├──▶ 8082 (OpenAI TCP，多 provider 路由)
+  ├──▶ 8090 (透明代理 → OpenRouter，key 透传)
+  └──▶ 8091 (透明代理 → Nvidia，key 透传)
+```
+
+### 透明代理（8090 / 8091）
+
+通过 [`targets.json`](targets.json) 配置：
+
+```json
+{
+  "label": "openrouter",
+  "listenPort": 8090,
+  "targetHost": "openrouter.ai",
+  "routePrefix": "/api/v1",
+  "models": ["nvidia/nemotron-3-ultra-550b-a55b:free"]
+}
+```
+
+- **routePrefix**：客户端发 `/v1/...`，代理自动重写为上游实际路径（OpenRouter 需 `/api/v1`）
+- **Key 透传**：不硬编码 API Key，客户端发什么 `Authorization` 就透传什么
+- **429 翻译**：上游 `ResourceExhausted` 自动转为 HTTP 429 + `Retry-After: 3`，客户端自动退避
+- **非 200 日志**：所有 4xx/5xx 错误自动记录响应 body（前 300 字符）
+- **异常保护**：连接错误返回 HTTP 503，不会静默断连
+
+### 模型列表隔离
+
+- **8081** `/v1/models`：只返回 6 个 Anthropic 模型（`claude-sonnet-4-20250514` 等）
+- **8082** `/v1/models`：返回完整的真实下游模型列表（不含 Anthropic 别名）
+- **8090/8091** `/v1/models`：透传上游的完整模型列表
+
 ## 测试
 
 统一测试套件 [test_suite.py](test_suite.py)，整合自历史三个文件（`test_claude_api.py` / `test_messages_endpoint.py` / `tests.py`），覆盖翻译链路 `/v1/messages` 和透传链路 `/v1/chat/completions`。
@@ -231,12 +284,12 @@ python test_suite.py
 Claude Code / Cline
   ──Anthropic 格式──▶ :8082/v1/messages
                          │
+                         ├─ copilot       → httpx 透传 → Copilot Enterprise /v1/messages（零转换）
                          ├─ anthropic     → LiteLLM → DeepSeek / Anthropic
                          ├─ gemini        → LiteLLM → Gemini 原生
                          ├─ gemini-openai → httpx   → Gemini OpenAI 端点
                          ├─ openai        → LiteLLM → OpenAI / 兼容
-                         ├─ qclaw         → LiteLLM → mmgrcalltoken.3g.qq.com（上游直连）
-                         └─ copilot       → LiteLLM → Copilot Enterprise ──▶ Claude/GPT
+                         └─ qclaw         → LiteLLM → mmgrcalltoken.3g.qq.com（上游直连）
 
 任意 Agent / 自定义工具
   ──OpenAI 格式──▶ :8082/v1/chat/completions
@@ -245,7 +298,7 @@ Claude Code / Cline
                          └─ qclaw / openai / copilot / gemini-openai → httpx（透传模式，直连上游）
 ```
 
-> **注：** `/v1/chat/completions` 在 qclaw/openai/copilot/gemini-openai 模式下走 httpx 透传（绕过 LiteLLM），其余走 LiteLLM 翻译。
+> **注：** Copilot provider 在两个端点上均使用 httpx 直连下游对应端点。`/v1/messages` → 下游 `/v1/messages`（Anthropic 原生 SSE），`/v1/chat/completions` → 下游 `/chat/completions`（OpenAI SSE）。完全绕过 LiteLLM，无协议翻译损耗。其他 provider 的 `/v1/messages` 仍走 LiteLLM 翻译。
 
 完整配置参考 `.env.example`
 
