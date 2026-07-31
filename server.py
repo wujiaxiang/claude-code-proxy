@@ -4611,50 +4611,8 @@ async def dashboard():
             ("systemd 服务", "claude-code-proxy"),
         ],
         models=_ANTHROPIC_PORT_MODELS,
-        description="接收 Anthropic 客户端请求，结构化解码后转换为 OpenAI 格式，内部转发到 8082 的多 provider 路由。响应译回 Anthropic 格式。",
+        description="接收 Anthropic 客户端请求，结构化解码后转换为 OpenAI 格式，内部转发到 8082（copilot 透传）。响应译回 Anthropic 格式。",
     ))
-
-    # ── 8082 OpenAI（asyncio TCP，多 provider 路由） ──
-    r82 = _result_map.get(8082, {"label": "port-8082", "listenPort": 8082, "upstream": "?", "models": [], "total": 0, "ok": 0, "translated": 0, "err": 0, "alive": False, "startedAt": ""})
-    cards.append(_build_card_html(
-        name="OpenAI Proxy (8082)",
-        note="asyncio TCP · OpenAI 协议 · 多 provider 路由",
-        kind_badge="透传路由",
-        status_badge=f"{r82['total']} 请求" if r82["alive"] else "离线",
-        status_badge_class="blue" if r82["alive"] else "red",
-        kv_items=[
-            ("监听地址", "http://0.0.0.0:8082"),
-            ("映射后端", f"按 PREFERRED_PROVIDER 动态切换（当前: {_html_escape(PREFERRED_PROVIDER)}）"),
-            ("协议", "OpenAI /v1/chat/completions 直接透传"),
-            ("模型数量", f"{len(r82['models'])} 个"),
-            ("systemd 服务", "claude-code-proxy"),
-        ],
-        stats_detail=_make_stats_detail(r82),
-        models=r82["models"] if r82["alive"] else [],
-        description="纯透传 + 多 provider 鉴权路由（copilot/qclaw/openai ···）。8081 翻译后的 OpenAI 请求和外部 OpenAI 客户端都走这里。",
-        accent_class="accent-8082" if r82["alive"] else "",
-    ))
-
-    # ── 8090 / 8091 / 8084 透明反代 ──
-    port_accent_map = {8090: "accent-8090", 8091: "accent-8091", 8084: "accent-8084"}
-    _vendor_ports = {8090, 8091, 8084}
-    for r in (x for x in results if x["listenPort"] in _vendor_ports):
-        port = r["listenPort"]
-        cards.append(_build_card_html(
-            name=r["label"],
-            note="asyncio TCP · 透明反代 + 429 错误翻译",
-            kind_badge="透传代理" if r["alive"] else "offline",
-            status_badge=f"已翻译 429 × {r['translated']}" if r["translated"] > 0 else "无异常",
-            status_badge_class="yellow" if r["translated"] > 0 else "green",
-            kv_items=[
-                ("监听地址", f"http://0.0.0.0:{port}"),
-                ("映射上游", r["upstream"]),
-                ("模型数量", f"{len(r['models'])} 个"),
-            ],
-            stats_detail=_make_stats_detail(r),
-            models=r["models"],
-            accent_class=port_accent_map.get(port, ""),
-        ))
 
     # ── 动态 target 卡片（targets.json 驱动）──
     for t in _TARGETS:
@@ -4704,13 +4662,12 @@ async def dashboard():
 <html lang="zh-CN">
 <head>
 <meta charset="utf-8">
-<meta http-equiv="refresh" content="15">
 <title>LLM Gateway — 管理总览</title>
 <style>{DASHBOARD_STYLE}</style>
 </head>
 <body>
   <h1>🔀 LLM Gateway — 管理总览</h1>
-  <div class="sub">8081 Anthropic (FastAPI) → 8082 OpenAI (asyncio TCP 多 provider 路由) → 上游 <span class="refresh-time">· 自动 15s 刷新 · {datetime.now().strftime("%H:%M:%S")}</span></div>
+  <div class="sub">8081 Anthropic (FastAPI) → 8082 copilot (透传) → 上游 · 统一 targets.json 驱动 <span class="refresh-time">· 手动刷新 · {datetime.now().strftime("%H:%M:%S")}</span></div>
   <div class="overview-bar">
     <div>共 <b>{len(results)}</b> 个服务</div>
     <div class="divider"></div>
@@ -4719,12 +4676,14 @@ async def dashboard():
     <div>存活端口 <b>{alive_ports}</b> / {len(results)}</div>
     <div class="divider"></div>
     <div>{overview_dots} {" ".join(str(p) for p in _dash_ports)}</div>
+    <div class="divider"></div>
+    <button onclick="location.reload()" style="background:#16213e;color:#60a5fa;border:1px solid #2a3a5e;border-radius:6px;padding:6px 14px;cursor:pointer;font-size:13px;font-weight:600;transition:background 0.2s" onmouseover="this.style.background='#1e3058'" onmouseout="this.style.background='#16213e'">🔄 刷新状态</button>
   </div>
   <div class="section">
     <div class="section-title">服务架构</div>
     <div class="card-grid">{cards_html}</div>
   </div>
-  <div class="admin-panel">
+  <div class="admin-panel" style="border-top:2px solid #60a5fa;background:#12142a;position:sticky;bottom:0;padding:16px 22px">
   <h3>⚙️ 管理操作</h3>
   <div id="admin-msg"></div>
   <table class="model-table" id="admin-table">
@@ -4761,7 +4720,15 @@ async function saveSecret(label) {{
   }});
   const r = await resp.json();
   document.getElementById('admin-msg').textContent = JSON.stringify(r);
-  loadAdmin();
+  await loadAdmin();
+  const rows = document.querySelectorAll('#admin-tbody tr');
+  for (const tr of rows) {{
+    if (tr.cells[0].textContent === label) {{
+      tr.style.background = '#1a2e3e';
+      setTimeout(() => {{ tr.style.background = ''; }}, 2000);
+      break;
+    }}
+  }}
 }}
 async function setIsFree(label, val) {{
   const resp = await fetch('/api/targets/' + label, {{
