@@ -13,9 +13,30 @@
       "crackTool": "crack_copilot.py",
       "secretRef": "copilot_token",
       "apikeyEnv": "COPILOT_GHE_TOKEN",
-      "models": ["claude-opus-4.8", "claude-sonnet-5", "claude-haiku-4.5", "gpt-5.5", "gpt-4.1", "gemini-2.5-pro"],
-      "extraHeaders": { "Copilot-Integration-Id": "copilot-developer-cli" },
-      "modelMapping": { "opus": "claude-opus-4.8", "sonnet": "claude-sonnet-5", "haiku": "claude-haiku-4.5" }
+      "models": [
+        "claude-opus-4.8",
+        "claude-opus-4.6",
+        "claude-sonnet-5",
+        "claude-sonnet-4.6",
+        "claude-sonnet-4.5",
+        "claude-opus-4.5",
+        "claude-haiku-4.5",
+        "gpt-5.5",
+        "gpt-5.4",
+        "gpt-5.3-codex",
+        "gpt-5-mini",
+        "gpt-4.1",
+        "gpt-4o-mini",
+        "gemini-2.5-pro"
+      ],
+      "extraHeaders": {
+        "Copilot-Integration-Id": "copilot-developer-cli"
+      },
+      "modelMapping": {
+        "opus": "claude-opus-4.8",
+        "sonnet": "claude-sonnet-5",
+        "haiku": "claude-haiku-4.5"
+      }
     },
     {
       "label": "codebuddy",
@@ -29,7 +50,31 @@
       "crackTool": "crack_codebuddy.py",
       "secretRef": "codebuddy_token",
       "apikeyEnv": "CODEBUDDY_TOKEN",
-      "models": ["deepseek-v4-pro", "deepseek-v4-flash", "glm-5.2", "glm-5.1", "kimi-k2.7", "kimi-k2.6", "minimax-m3", "minimax-m2.7"]
+      "models": [
+        "default",
+        "deepseek-v4-pro",
+        "deepseek-v4-flash",
+        "deepseek-v3-2-volc",
+        "minimax-m2.5",
+        "minimax-m3",
+        "minimax-m2.7",
+        "glm-5.2",
+        "glm-5.1",
+        "glm-5.0",
+        "glm-5.0-turbo",
+        "glm-5v-turbo",
+        "glm-4.7",
+        "glm-4.6",
+        "glm-4.6v",
+        "kimi-k3-1",
+        "kimi-k2.7",
+        "kimi-k2.6",
+        "kimi-k2.5",
+        "kimi-k2-thinking",
+        "hy3",
+        "hunyuan-chat",
+        "hunyuan-image-v3.0-art"
+      ]
     },
     {
       "label": "qclaw",
@@ -43,9 +88,29 @@
       "crackTool": "crack_qclaw.py",
       "secretRef": "qclaw_api_key",
       "apikeyEnv": "QCLAW_API_KEY",
-      "models": ["pool-deepseek-v4-pro", "pool-deepseek-v4-flash", "pool-glm-5.2", "pool-glm-5.1", "pool-kimi-k2.7-code-highspeed", "pool-kimi-k2.6", "pool-minimax-m3", "pool-minimax-m2.7"],
-      "modelMapping": { "opus": "pool-deepseek-v4-pro", "sonnet": "pool-deepseek-v4-pro", "haiku": "pool-deepseek-v4-flash" },
-      "reasoning": { "big": "high", "medium": "low", "small": "low" }
+      "models": [
+        "modelroute",
+        "pool-hy3-preview",
+        "pool-deepseek-v4-pro",
+        "pool-deepseek-v4-flash",
+        "pool-glm-5.2",
+        "pool-glm-5.2-night",
+        "pool-glm-5.1",
+        "pool-kimi-k2.7-code-highspeed",
+        "pool-kimi-k2.6",
+        "pool-minimax-m3",
+        "pool-minimax-m2.7"
+      ],
+      "modelMapping": {
+        "opus": "pool-deepseek-v4-pro",
+        "sonnet": "pool-deepseek-v4-pro",
+        "haiku": "pool-deepseek-v4-flash"
+      },
+      "reasoning": {
+        "big": "high",
+        "medium": "low",
+        "small": "low"
+      }
     },
     {
       "label": "trae-work",
@@ -71,7 +136,22 @@
       "targetPort": 443,
       "targetProtocol": "https",
       "routePrefix": "/api/v1",
-      "models": ["nvidia/nemotron-3-ultra-550b-a55b:free", "openai/gpt-oss-20b:free", "google/gemma-4-26b-a4b-it:free"]
+      "models": [
+        "cohere/north-mini-code:free",
+        "google/gemma-4-26b-a4b-it:free",
+        "google/gemma-4-31b-it:free",
+        "inclusionai/ling-3.0-flash:free",
+        "nvidia/nemotron-3-nano-30b-a3b:free",
+        "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free",
+        "nvidia/nemotron-3-super-120b-a12b:free",
+        "nvidia/nemotron-3-ultra-550b-a55b:free",
+        "nvidia/nemotron-3.5-content-safety:free",
+        "nvidia/nemotron-nano-12b-v2-vl:free",
+        "nvidia/nemotron-nano-9b-v2:free",
+        "openai/gpt-oss-20b:free",
+        "poolside/laguna-s-2.1:free",
+        "poolside/laguna-xs-2.1:free"
+      ]
     },
     {
       "label": "nvidia",
@@ -83,7 +163,13 @@
       "targetPort": 443,
       "targetProtocol": "https",
       "routePrefix": "/v1",
-      "models": ["deepseek-ai/deepseek-v4-flash", "deepseek-ai/deepseek-v4-pro", "qwen/qwen3-coder-480b-a35b-instruct", "meta/llama-4-maverick-17b-128e-instruct"]
+      "models": [
+        "deepseek-ai/deepseek-v4-flash",
+        "deepseek-ai/deepseek-v4-pro",
+        "qwen/qwen3-coder-480b-a35b-instruct",
+        "z-ai/glm-5.2",
+        "meta/llama-4-maverick-17b-128e-instruct"
+      ]
     },
     {
       "label": "gemini-openai",
@@ -95,7 +181,10 @@
       "targetPort": 443,
       "targetProtocol": "https",
       "routePrefix": "/v1beta/openai",
-      "models": ["gemini-2.5-pro", "gemini-2.5-flash"]
+      "models": [
+        "gemini-2.5-pro",
+        "gemini-2.5-flash"
+      ]
     },
     {
       "label": "opencode-zen",
@@ -107,7 +196,12 @@
       "targetPort": 443,
       "targetProtocol": "https",
       "routePrefix": "/zen/v1",
-      "models": ["deepseek-v4-flash-free", "mimo-v2.5-free", "big-pickle", "north-mini-code-free"]
+      "models": [
+        "deepseek-v4-flash-free",
+        "mimo-v2.5-free",
+        "big-pickle",
+        "north-mini-code-free"
+      ]
     },
     {
       "label": "open-go",
@@ -119,7 +213,11 @@
       "targetPort": 443,
       "targetProtocol": "https",
       "routePrefix": "/zen/go/v1",
-      "models": ["deepseek-v4-pro", "kimi-k2.7", "glm-5.2"]
+      "models": [
+        "deepseek-v4-pro",
+        "kimi-k2.7",
+        "glm-5.2"
+      ]
     }
   ]
 }
