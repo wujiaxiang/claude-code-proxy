@@ -4283,6 +4283,15 @@ DASHBOARD_STYLE = """
   .mstat { text-align: center; padding: 4px 8px; }
   .mstat.err { color: #f87171; }
   .mstat.warn { color: #fbbf24; }
+  /* ── 卡片内联 token 编辑 ── */
+  .token-edit { margin-top: 8px; padding-top: 8px; border-top: 1px dashed #2a2d3e; }
+  .te-status { font-size: 12px; color: #9ca3af; margin-bottom: 6px; }
+  .te-row { display: flex; gap: 6px; align-items: center; }
+  .te-input { flex: 1; background: #0f1117; border: 1px solid #2a2d3e; border-radius: 6px; color: #e0e0e0; padding: 6px 8px; font-size: 13px; }
+  .te-input:focus { outline: none; border-color: #60a5fa; }
+  .te-save, .te-recrack { background: #1d4ed8; color: #fff; border: none; border-radius: 6px; padding: 6px 10px; cursor: pointer; font-size: 13px; }
+  .te-recrack { background: #7c3aed; }
+  .te-save:hover { background: #2563eb; }
 """
 
 
@@ -4425,7 +4434,7 @@ def _model_details_html(models, model_stats=None):
 
 def _build_card_html(name, note, kind_badge, status_badge, status_badge_class,
                      kv_items, stats_detail=None, models=None, model_stats=None, description="",
-                     accent_class=""):
+                     accent_class="", raw_html=""):
     """统一卡片渲染：透传目标和定制服务用同一套视觉风格。
 
     stats_detail: dict with total/ok/err/translated/success_rate/uptime
@@ -4489,6 +4498,7 @@ def _build_card_html(name, note, kind_badge, status_badge, status_badge_class,
   {f'<div class="card-desc">{_html_escape(description)}</div>' if description else ""}
   {stats_html}
   {model_html}
+  {raw_html}
 </div>"""
 
 
@@ -4686,12 +4696,31 @@ async def dashboard():
             ("分类", badge_map.get(category, category)),
             ("handler", t.get("handler", "passthrough")),
             ("上游", f"{t.get('targetProtocol','https')}://{t['targetHost']}:{t.get('targetPort',443)}{t.get('routePrefix','')}"),
-            ("token", ("已配置 " + _cfg.mask_secret(secret)) if secret else "⚠️ 缺失（点击卡片编辑/破解）"),
         ]
         if t.get("isFree") is not None:
             kv.append(("isFree", "是（免费）" if t["isFree"] else "否（收费）"))
         if t.get("enabled") is False:
             kv.append(("状态", "预留（未监听）"))
+
+        # ── 卡片内联 token 编辑块 ──
+        sec_ref = t.get("secretRef", "")
+        esc_label = t["label"].replace("'", "\\'")
+        recrack_btn = f'<button class="te-recrack" onclick="recrackCard(\'{esc_label}\', this)">重新破解</button>' if t.get('category') == 'crack' else ''
+        token_status = "✅ 已配置 " + _cfg.mask_secret(secret) if secret else "⚠️ 缺失"
+        input_placeholder = "已配置，输入新值覆盖" if secret else "填写 " + (sec_ref or "token")
+        input_value = "******" if secret else ""
+        token_edit = (
+            f'<div class="token-edit" id="te-{port}">'
+            f'  <div class="te-status">token: {token_status}</div>'
+            f'  <div class="te-row">'
+            f'    <input type="password" class="te-input" data-label="{esc_label}" data-ref="{sec_ref}"'
+            f'           placeholder="{input_placeholder}" value="{input_value}">'
+            f'    <button class="te-save" onclick="saveCardToken(\'{esc_label}\', this)">保存</button>'
+            f'    {recrack_btn}'
+            f'  </div>'
+            f'</div>'
+        )
+
         cards.append(_build_card_html(
             name=f"{t['label']} ({port})",
             note="统一透传引擎 · targets.json 驱动",
@@ -4704,6 +4733,7 @@ async def dashboard():
             stats_detail=_make_stats_detail(r),
             description=f"category={category} · handler={t.get('handler','passthrough')} · isFree={t.get('isFree')}",
             accent_class=f"accent-{port}",
+            raw_html=token_edit,
         ))
 
     cards_html = "".join(cards)
@@ -4743,7 +4773,7 @@ async def dashboard():
   <h3>⚙️ 管理操作</h3>
   <div id="admin-msg"></div>
   <table class="model-table" id="admin-table">
-    <thead><tr><th>label</th><th>端口</th><th>分类</th><th>isFree</th><th>token</th><th>操作</th></tr></thead>
+    <thead><tr><th>label</th><th>端口</th><th>分类</th><th>isFree</th></tr></thead>
     <tbody id="admin-tbody"></tbody>
   </table>
   <p><button onclick="doReload()">♻️ 手动重载配置</button></p>
@@ -4760,30 +4790,8 @@ async function loadAdmin() {{
       <td>${{t.label}}</td>
       <td>${{t.listenPort}}</td>
       <td>${{t.category}}${{t.isFree ? ' (免费)' : ''}}</td>
-      <td><input type="checkbox" ${{t.isFree ? 'checked' : ''}} onchange="setIsFree('${{t.label}}', this.checked)"></td>
-      <td>${{t.secretSet ? t.secretMasked : '<span style="color:red">缺失</span>'}}
-          <input id="secret-${{t.label}}" type="password" placeholder="新 token">
-          <button onclick="saveSecret('${{t.label}}')">保存</button></td>
-      <td>${{t.category === 'crack' && t.crackTool ? `<button onclick="recrack('${{t.label}}')">重新破解</button>` : ''}}</td>`;
+      <td><input type="checkbox" ${{t.isFree ? 'checked' : ''}} onchange="setIsFree('${{t.label}}', this.checked)"></td>`;
     tbody.appendChild(tr);
-  }}
-}}
-async function saveSecret(label) {{
-  const v = document.getElementById('secret-' + label).value;
-  const resp = await fetch('/api/secrets/' + label, {{
-    method: 'PUT', headers: {{'Content-Type': 'application/json'}},
-    body: JSON.stringify({{value: v}})
-  }});
-  const r = await resp.json();
-  document.getElementById('admin-msg').textContent = JSON.stringify(r);
-  await loadAdmin();
-  const rows = document.querySelectorAll('#admin-tbody tr');
-  for (const tr of rows) {{
-    if (tr.cells[0].textContent === label) {{
-      tr.style.background = '#1a2e3e';
-      setTimeout(() => {{ tr.style.background = ''; }}, 2000);
-      break;
-    }}
   }}
 }}
 async function setIsFree(label, val) {{
@@ -4793,10 +4801,45 @@ async function setIsFree(label, val) {{
   }});
   document.getElementById('admin-msg').textContent = JSON.stringify(await resp.json());
 }}
-async function recrack(label) {{
+async function recrackCard(label, btn) {{
+  btn.disabled = true; btn.textContent = '破解中...';
   const resp = await fetch('/api/targets/' + label + '/recrack', {{method: 'POST'}});
-  document.getElementById('admin-msg').textContent = JSON.stringify(await resp.json());
-  loadAdmin();
+  const r = await resp.json();
+  if (resp.ok) {{
+    btn.textContent = '✅ 已破解'; btn.style.background = '#4ade80';
+    setTimeout(() => {{ location.reload(); }}, 1200);
+  }} else {{
+    btn.textContent = '❌ 失败'; btn.style.background = '#ef4444';
+    document.getElementById('admin-msg').textContent = JSON.stringify(r);
+    setTimeout(() => {{ btn.disabled = false; btn.textContent = '重新破解'; btn.style.background = ''; }}, 2000);
+  }}
+}}
+async function saveCardToken(label, btn) {{
+  const row = btn.closest('.token-edit');
+  const input = row.querySelector('.te-input');
+  const ref = input.dataset.ref;
+  const val = input.value;
+  if (!ref) {{ alert('该 target 未配置 secretRef'); return; }}
+  if (!val || val === '******') {{ alert('请输入新的 token 值'); return; }}
+  btn.disabled = true; btn.textContent = '保存中...';
+  try {{
+    const resp = await fetch('/api/secrets/' + label, {{
+      method: 'PUT', headers: {{'Content-Type': 'application/json'}},
+      body: JSON.stringify({{value: val}}),
+    }});
+    const r = await resp.json();
+    if (resp.ok) {{
+      btn.textContent = '✅ 已保存'; btn.style.background = '#4ade80';
+      input.value = '******'; input.placeholder = '已配置，输入新值覆盖';
+      setTimeout(() => {{ btn.disabled = false; btn.textContent = '保存'; btn.style.background = ''; }}, 2000);
+    }} else {{
+      alert('保存失败: ' + JSON.stringify(r.detail || r));
+      btn.disabled = false; btn.textContent = '保存';
+    }}
+  }} catch (e) {{
+    alert('保存异常: ' + e);
+    btn.disabled = false; btn.textContent = '保存';
+  }}
 }}
 async function doReload() {{
   const resp = await fetch('/api/reload', {{method: 'POST'}});
