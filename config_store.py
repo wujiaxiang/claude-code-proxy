@@ -80,13 +80,17 @@ def validate_targets(cfg: dict) -> list:
 
     for t in targets:
         label = t.get("label", "")
-        for field in _REQUIRED_FIELDS:
-            if not t.get(field):
-                errors.append(f"target '{label}' 缺少必需字段: {field}")
-        if t.get("category") not in VALID_CATEGORIES:
-            errors.append(f"target '{label}' category 非法: {t.get('category')}（合法: {VALID_CATEGORIES}）")
-        if t.get("handler") not in VALID_HANDLERS:
-            errors.append(f"target '{label}' handler 非法: {t.get('handler')}（合法: {VALID_HANDLERS}）")
+        disabled = t.get("enabled") is False
+        if not disabled:
+            for field in _REQUIRED_FIELDS:
+                if not t.get(field):
+                    errors.append(f"target '{label}' 缺少必需字段: {field}")
+            if t.get("category") not in VALID_CATEGORIES:
+                errors.append(f"target '{label}' category 非法: {t.get('category')}（合法: {VALID_CATEGORIES}）")
+            if t.get("handler") not in VALID_HANDLERS:
+                errors.append(f"target '{label}' handler 非法: {t.get('handler')}（合法: {VALID_HANDLERS}）")
+            if t.get("category") == "crack" and not t.get("crackTool"):
+                errors.append(f"crack target '{label}' 缺少 crackTool")
         if label in labels:
             errors.append(f"重复 label: '{label}'")
         labels[label] = True
@@ -94,8 +98,6 @@ def validate_targets(cfg: dict) -> list:
         if port in ports:
             errors.append(f"端口 {port} 被多个 target 占用 ({ports[port]}, {label})")
         ports[port] = label
-        if t.get("category") == "crack" and not t.get("crackTool") and t.get("enabled", True):
-            errors.append(f"crack target '{label}' 缺少 crackTool")
     return errors
 
 

@@ -1,71 +1,125 @@
-[
-  {
-    "label": "openrouter",
-    "listenPort": 8090,
-    "targetHost": "openrouter.ai",
-    "targetPort": 443,
-    "targetProtocol": "https",
-    "routePrefix": "/api/v1",
-    "models": [
-      "nvidia/nemotron-3-ultra-550b-a55b:free",
-      "nvidia/nemotron-3-super-120b-a12b:free",
-      "openai/gpt-oss-20b:free",
-      "google/gemma-4-26b-a4b-it:free",
-      "inclusionai/ling-3.0-flash:free",
-      "poolside/laguna-s-2.1:free",
-      "cohere/north-mini-code:free"
-    ]
-  },
-  {
-    "label": "nvidia",
-    "listenPort": 8091,
-    "targetHost": "integrate.api.nvidia.com",
-    "targetPort": 443,
-    "targetProtocol": "https",
-    "routePrefix": "/v1",
-    "models": [
-      "deepseek-ai/deepseek-v4-flash",
-      "deepseek-ai/deepseek-v4-pro",
-      "nvidia/nemotron-3-ultra-550b-a55b",
-      "nvidia/nemotron-3-super-120b-a12b",
-      "openai/gpt-oss-20b",
-      "qwen/qwen3-coder-480b-a35b-instruct",
-      "z-ai/glm-5.2",
-      "meta/llama-4-maverick-17b-128e-instruct"
-    ]
-  },
-  {
-    "label": "codebuddy",
-    "listenPort": 8084,
-    "targetHost": "copilot.tencent.com",
-    "targetPort": 443,
-    "targetProtocol": "https",
-    "routePrefix": "/v2",
-    "apikeyEnv": "CODEBUDDY_TOKEN",
-    "models": [
-      "default",
-      "deepseek-v4-pro",
-      "deepseek-v4-flash",
-      "deepseek-v3-2-volc",
-      "minimax-m2.5",
-      "minimax-m3",
-      "minimax-m2.7",
-      "glm-5.2",
-      "glm-5.1",
-      "glm-5.0",
-      "glm-5.0-turbo",
-      "glm-5v-turbo",
-      "glm-4.7",
-      "glm-4.6",
-      "glm-4.6v",
-      "kimi-k3-1",
-      "kimi-k2.7",
-      "kimi-k2.6",
-      "kimi-k2.5",
-      "kimi-k2-thinking",
-      "hy3",
-      "hunyuan-chat",
-      "hunyuan-image-v3.0-art"
-    ]
-  }
-]
+{
+  "anthropicForwardPort": 8082,
+  "targets": [
+    {
+      "label": "copilot",
+      "listenPort": 8082,
+      "category": "crack",
+      "handler": "copilot",
+      "targetHost": "copilot-api.bmw.ghe.com",
+      "targetPort": 443,
+      "targetProtocol": "https",
+      "routePrefix": "",
+      "crackTool": "crack_copilot.py",
+      "secretRef": "copilot_token",
+      "apikeyEnv": "COPILOT_GHE_TOKEN",
+      "models": ["claude-opus-4.8", "claude-sonnet-5", "claude-haiku-4.5", "gpt-5.5", "gpt-4.1", "gemini-2.5-pro"],
+      "extraHeaders": { "Copilot-Integration-Id": "copilot-developer-cli" },
+      "modelMapping": { "opus": "claude-opus-4.8", "sonnet": "claude-sonnet-5", "haiku": "claude-haiku-4.5" }
+    },
+    {
+      "label": "codebuddy",
+      "listenPort": 8084,
+      "category": "crack",
+      "handler": "passthrough",
+      "targetHost": "copilot.tencent.com",
+      "targetPort": 443,
+      "targetProtocol": "https",
+      "routePrefix": "/v2",
+      "crackTool": "crack_codebuddy.py",
+      "secretRef": "codebuddy_token",
+      "apikeyEnv": "CODEBUDDY_TOKEN",
+      "models": ["deepseek-v4-pro", "deepseek-v4-flash", "glm-5.2", "glm-5.1", "kimi-k2.7", "kimi-k2.6", "minimax-m3", "minimax-m2.7"]
+    },
+    {
+      "label": "qclaw",
+      "listenPort": 8085,
+      "category": "crack",
+      "handler": "qclaw",
+      "targetHost": "mmgrcalltoken.3g.qq.com",
+      "targetPort": 443,
+      "targetProtocol": "https",
+      "routePrefix": "/aizone/v1",
+      "crackTool": "crack_qclaw.py",
+      "secretRef": "qclaw_api_key",
+      "apikeyEnv": "QCLAW_API_KEY",
+      "models": ["pool-deepseek-v4-pro", "pool-deepseek-v4-flash", "pool-glm-5.2", "pool-glm-5.1", "pool-kimi-k2.7-code-highspeed", "pool-kimi-k2.6", "pool-minimax-m3", "pool-minimax-m2.7"],
+      "modelMapping": { "opus": "pool-deepseek-v4-pro", "sonnet": "pool-deepseek-v4-pro", "haiku": "pool-deepseek-v4-flash" },
+      "reasoning": { "big": "high", "medium": "low", "small": "low" }
+    },
+    {
+      "label": "trae-work",
+      "listenPort": 8086,
+      "category": "crack",
+      "handler": "passthrough",
+      "targetHost": "",
+      "targetPort": 443,
+      "targetProtocol": "https",
+      "routePrefix": "",
+      "crackTool": "crack_traework.py",
+      "secretRef": "trae_work_token",
+      "models": [],
+      "enabled": false
+    },
+    {
+      "label": "openrouter",
+      "listenPort": 8090,
+      "category": "free",
+      "handler": "passthrough",
+      "isFree": true,
+      "targetHost": "openrouter.ai",
+      "targetPort": 443,
+      "targetProtocol": "https",
+      "routePrefix": "/api/v1",
+      "models": ["nvidia/nemotron-3-ultra-550b-a55b:free", "openai/gpt-oss-20b:free", "google/gemma-4-26b-a4b-it:free"]
+    },
+    {
+      "label": "nvidia",
+      "listenPort": 8091,
+      "category": "free",
+      "handler": "passthrough",
+      "isFree": true,
+      "targetHost": "integrate.api.nvidia.com",
+      "targetPort": 443,
+      "targetProtocol": "https",
+      "routePrefix": "/v1",
+      "models": ["deepseek-ai/deepseek-v4-flash", "deepseek-ai/deepseek-v4-pro", "qwen/qwen3-coder-480b-a35b-instruct", "meta/llama-4-maverick-17b-128e-instruct"]
+    },
+    {
+      "label": "gemini-openai",
+      "listenPort": 8092,
+      "category": "free",
+      "handler": "passthrough",
+      "isFree": true,
+      "targetHost": "generativelanguage.googleapis.com",
+      "targetPort": 443,
+      "targetProtocol": "https",
+      "routePrefix": "/v1beta/openai",
+      "models": ["gemini-2.5-pro", "gemini-2.5-flash"]
+    },
+    {
+      "label": "opencode-zen",
+      "listenPort": 8093,
+      "category": "free",
+      "handler": "passthrough",
+      "isFree": true,
+      "targetHost": "opencode.ai",
+      "targetPort": 443,
+      "targetProtocol": "https",
+      "routePrefix": "/zen/v1",
+      "models": ["deepseek-v4-flash-free", "mimo-v2.5-free", "big-pickle", "north-mini-code-free"]
+    },
+    {
+      "label": "open-go",
+      "listenPort": 8094,
+      "category": "paid",
+      "handler": "passthrough",
+      "isFree": false,
+      "targetHost": "opencode.ai",
+      "targetPort": 443,
+      "targetProtocol": "https",
+      "routePrefix": "/zen/go/v1",
+      "models": ["deepseek-v4-pro", "kimi-k2.7", "glm-5.2"]
+    }
+  ]
+}

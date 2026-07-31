@@ -153,5 +153,22 @@ def main():
     return 1 if failed else 0
 
 
+def test_repo_targets_file_valid():
+    """仓库内 targets.json 应为新格式且校验通过。"""
+    cfg = config_store.load_targets(config_store.TARGETS_PATH)
+    errors = config_store.validate_targets(cfg)
+    assert errors == [], f"targets.json 校验失败: {errors}"
+    labels = {t["label"] for t in cfg["targets"]}
+    for expected in ("copilot", "codebuddy", "qclaw", "trae-work",
+                     "openrouter", "nvidia", "gemini-openai", "opencode-zen", "open-go"):
+        assert expected in labels, f"缺少 target: {expected}"
+    ports = {t["listenPort"] for t in cfg["targets"]}
+    for expected_port in (8082, 8084, 8085, 8086, 8090, 8091, 8092, 8093, 8094):
+        assert expected_port in ports, f"缺少端口: {expected_port}"
+    # trae-work 预留：enabled=false
+    tw = next(t for t in cfg["targets"] if t["label"] == "trae-work")
+    assert tw.get("enabled") is False, "trae-work 应 enabled=false"
+
+
 if __name__ == "__main__":
     sys.exit(main())
