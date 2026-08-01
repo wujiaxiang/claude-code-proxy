@@ -217,7 +217,7 @@ def test_repo_targets_file_valid():
     assert errors == [], f"targets.json 校验失败: {errors}"
     labels = {t["label"] for t in cfg["targets"]}
     for expected in ("copilot", "codebuddy", "qclaw", "trae-work",
-                     "openrouter", "nvidia", "gemini-openai", "opencode-zen", "open-go"):
+                     "openrouter", "nvidia", "gemini", "opencode-zen", "open-go"):
         assert expected in labels, f"缺少 target: {expected}"
     ports = {t["listenPort"] for t in cfg["targets"]}
     for expected_port in (8082, 8084, 8085, 8086, 8090, 8091, 8092, 8093, 8094):
