@@ -23,6 +23,12 @@ from datetime import datetime
 from pathlib import Path
 import sys
 
+# 破解网关公共能力（额度/签到/刷新状态查询 + tc 解密）
+try:
+    import crack_common
+except Exception:
+    crack_common = None
+
 # Load environment variables from .env file
 load_dotenv()
 
@@ -1327,6 +1333,266 @@ async def _handle_gemini_native(writer, target, method, path, headers, body, sta
             pass
 
 
+# ── Trae Work 协议转换（handler=trae-work）──
+# 客户端走 OpenAI 协议（/v1/chat/completions），代理内部转换为
+# Trae 的 llm_utils_chat（SSE，content 数组格式）。认证用 Cloud-IDE-JWT。
+_TRAE_API_HOST = "https://trae-api-cn.mchost.guru"
+_TRAE_APP_ID = "6eefa01c-1036-4c7e-9ca5-d891f63bfcd8"
+_TRAE_IDE_VERSION = "0.1.43"
+_TRAE_IDE_VERSION_CODE = "20260730"
+_TRAE_DEVICE_ID = "199444637423849"
+_TRAE_MACHINE_ID = "d2115a713ee587fea5d340ceb8ef1fda3ad808431c24e7fed3085693f52f4428"
+
+
+def _trae_build_headers(token: str) -> dict:
+    """构造 Trae Work API 请求头（Cloud-IDE-JWT + 设备指纹）。"""
+    return {
+        "Authorization": f"Cloud-IDE-JWT {token}",
+        "Content-Type": "application/json",
+        "x-app-id": _TRAE_APP_ID,
+        "x-app-version": "default",
+        "x-app-version-code": _TRAE_IDE_VERSION_CODE,
+        "x-ide-version-code": _TRAE_IDE_VERSION_CODE,
+        "x-ide-version": _TRAE_IDE_VERSION,
+        "x-ide-version-type": "stable",
+        "x-device-id": _TRAE_DEVICE_ID,
+        "x-machine-id": _TRAE_MACHINE_ID,
+        "x-device-type": "windows",
+        "x-os-version": "Windows 10",
+        "x-device-brand": "Standard PC (Q35 + ICH9, 2009)",
+        "x-device-cpu": "KVM",
+        "x-trae-authorized-services": "feishu",
+        "request-traffic-type": "prod",
+        "X-Trae-Client-Type": "lite",
+    }
+
+
+def _openai_to_trae_body(body: dict) -> dict:
+    """OpenAI chat.completions 请求体 → Trae llm_utils_chat 请求体。"""
+    trae_messages = []
+    for m in body.get("messages", []):
+        content = m.get("content")
+        if isinstance(content, list):
+            # 已数组化（OpenAI 多模态），转成 Trae 的 {type,text} 列表
+            parts = []
+            for c in content:
+                if isinstance(c, dict):
+                    if c.get("type") in ("text", "input_text"):
+                        parts.append({"type": "text", "text": c.get("text", "")})
+                    elif c.get("type") == "image_url":
+                        parts.append({"type": "image", "image": c.get("image_url", {}).get("url", "")})
+                    else:
+                        parts.append({"type": "text", "text": str(c)})
+                else:
+                    parts.append({"type": "text", "text": str(c)})
+            trae_messages.append({"role": m.get("role", "user"), "content": parts, "role_type": 0})
+        else:
+            trae_messages.append({"role": m.get("role", "user"),
+                                  "content": [{"type": "text", "text": str(content or "")}],
+                                  "role_type": 0})
+    out = {
+        "messages": trae_messages,
+        "function": "chat_v3",
+        "stream": bool(body.get("stream", False)),
+    }
+    model = body.get("model", "glm-5.2")
+    if model and model not in ("auto", "trae-work"):
+        # 去掉可能的 "trae/" 前缀
+        clean = model.split("/")[-1]
+        out["model"] = clean
+        out["config_name"] = clean
+    return out
+
+
+def _trae_chunk_to_openai(chunk: dict, model: str) -> dict:
+    """Trae output 事件 → OpenAI chat.completion.chunk。"""
+    content = chunk.get("response", "") or ""
+    reasoning = chunk.get("reasoning_content") or ""
+    delta = {}
+    if content:
+        delta["content"] = content
+    if reasoning:
+        delta["reasoning_content"] = reasoning
+    if chunk.get("tool_calls"):
+        delta["tool_calls"] = chunk["tool_calls"]
+    return {
+        "id": f"chatcmpl-{abs(hash(str(chunk.get('session_id', ''))))}",
+        "object": "chat.completion.chunk",
+        "created": int(time.time()),
+        "model": model,
+        "choices": [{"index": 0, "delta": delta, "finish_reason": None}],
+    }
+
+
+def _trae_final_to_openai(model: str) -> dict:
+    """流结束标记（OpenAI 兼容 finish）。"""
+    return {
+        "id": "chatcmpl-final",
+        "object": "chat.completion.chunk",
+        "created": int(time.time()),
+        "model": model,
+        "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+    }
+
+
+def _trae_nonstream_to_openai(model: str, content_parts: list, reasoning_parts: list) -> dict:
+    """非流式：把累积的 response/reasoning 拼成 OpenAI 完成响应。"""
+    return {
+        "id": "chatcmpl-trae",
+        "object": "chat.completion",
+        "created": int(time.time()),
+        "model": model,
+        "choices": [{
+            "index": 0,
+            "message": {
+                "role": "assistant",
+                "content": "".join(content_parts),
+                "reasoning_content": "".join(reasoning_parts) or None,
+            },
+            "finish_reason": "stop",
+        }],
+        "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+    }
+
+
+async def _handle_traework(writer, target, method, path, headers, body, stats, label):
+    """Trae Work 协议代理：OpenAI 请求 → llm_utils_chat → OpenAI 响应。
+
+    覆盖 /v1/chat/completions（含流式）。
+    认证：Cloud-IDE-JWT（secrets.json 的 trae_work_token）。
+    """
+    import json as _json
+    token = _cfg.resolve_secret(target, _SECRETS) or os.environ.get("TRAE_WORK_TOKEN", "")
+    if not token:
+        await _write_error_response(writer, 401, "Trae Work token 缺失，请到 dashboard 填写 trae_work_token")
+        return
+    api_headers = _trae_build_headers(token)
+
+    try:
+        # ── /v1/models：静态模型列表（与 get_detail_param 对齐）──
+        if path == "/v1/models" and method == "GET":
+            models = [
+                {"id": "glm-5.2", "object": "model", "created": 1700000000, "owned_by": "trae"},
+                {"id": "glm-5.1", "object": "model", "created": 1700000000, "owned_by": "trae"},
+                {"id": "glm-5", "object": "model", "created": 1700000000, "owned_by": "trae"},
+                {"id": "glm-4.7", "object": "model", "created": 1700000000, "owned_by": "trae"},
+                {"id": "glm-4.6", "object": "model", "created": 1700000000, "owned_by": "trae"},
+                {"id": "DeepSeek-V4-Pro", "object": "model", "created": 1700000000, "owned_by": "trae"},
+                {"id": "DeepSeek-V4-Flash", "object": "model", "created": 1700000000, "owned_by": "trae"},
+                {"id": "Doubao-Seed-2.1-Pro", "object": "model", "created": 1700000000, "owned_by": "trae"},
+                {"id": "kimi-k3", "object": "model", "created": 1700000000, "owned_by": "trae"},
+                {"id": "kimi-k2.7-code", "object": "model", "created": 1700000000, "owned_by": "trae"},
+                {"id": "minimax-m3", "object": "model", "created": 1700000000, "owned_by": "trae"},
+                {"id": "qwen-3.7-plus", "object": "model", "created": 1700000000, "owned_by": "trae"},
+                {"id": "qwen-3.5", "object": "model", "created": 1700000000, "owned_by": "trae"},
+                {"id": "qwen3-coder", "object": "model", "created": 1700000000, "owned_by": "trae"},
+            ]
+            payload = _json.dumps({"data": models, "object": "list", "has_more": False}).encode()
+            writer.write(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: %d\r\n\r\n%s" % (len(payload), payload))
+            await writer.drain()
+            writer.close(); return
+
+        # ── /v1/chat/completions：转换 + 转发 ──
+        if path == "/v1/chat/completions" and method == "POST":
+            try:
+                body_json = _json.loads(body.decode("utf-8"))
+            except Exception:
+                await _write_error_response(writer, 400, "invalid json"); return
+            model = (body_json.get("model") or "glm-5.2").split("/")[-1]
+            is_stream = bool(body_json.get("stream", False))
+            stats["totalRequests"] += 1
+            _bump_model_stats(label, model, "ok")
+
+            trae_body = _openai_to_trae_body(body_json)
+            endpoint = f"{_TRAE_API_HOST}/api/agent/v3/llm_utils_chat"
+            async with httpx.AsyncClient(timeout=httpx.Timeout(300.0, connect=10.0), trust_env=False) as c:
+                req = c.build_request("POST", endpoint, headers=api_headers,
+                                      content=_json.dumps(trae_body).encode())
+                resp = await c.send(req, stream=True)
+
+                if resp.status_code >= 400:
+                    resp_body = await resp.aread()
+                    await _write_error_response(writer, resp.status_code,
+                                                f"Trae upstream HTTP {resp.status_code}: {resp_body.decode('utf-8', errors='replace')[:300]}")
+                    return
+
+                # ── 流式：Trae SSE → OpenAI SSE ──
+                if is_stream:
+                    writer.write(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: keep-alive\r\n\r\n")
+                    async for chunk in resp.aiter_bytes():
+                        line = chunk.decode("utf-8", errors="replace")
+                        for raw in line.split("\n"):
+                            raw = raw.strip()
+                            if not raw.startswith("data:"):
+                                continue
+                            data_str = raw[5:].strip()
+                            if not data_str:
+                                continue
+                            try:
+                                trae_chunk = _json.loads(data_str)
+                            except Exception:
+                                continue
+                            # 上游 SSE 有非对象 data 行（如 "Processing_xxx" 字符串），跳过
+                            if not isinstance(trae_chunk, dict):
+                                continue
+                            # 只转换 output 事件
+                            if "response" in trae_chunk or "reasoning_content" in trae_chunk:
+                                oai = _trae_chunk_to_openai(trae_chunk, model)
+                                writer.write(("data: " + _json.dumps(oai, ensure_ascii=False) + "\n\n").encode())
+                                await writer.drain()
+                    writer.write(("data: " + _json.dumps(_trae_final_to_openai(model), ensure_ascii=False) + "\n\n").encode())
+                    writer.write(b"data: [DONE]\n\n")
+                    await writer.drain()
+                    stats["passthroughOk"] += 1
+                    writer.close(); return
+
+                # ── 非流式：累积 output 事件 ──
+                resp_body = await resp.aread()
+                content_parts, reasoning_parts = [], []
+                for raw in resp_body.decode("utf-8", errors="replace").split("\n"):
+                    raw = raw.strip()
+                    if not raw.startswith("data:"):
+                        continue
+                    data_str = raw[5:].strip()
+                    if not data_str:
+                        continue
+                    try:
+                        trae_chunk = _json.loads(data_str)
+                    except Exception:
+                        continue
+                    # 上游 SSE 有非对象 data 行（如 "Processing_xxx" 字符串），跳过
+                    if not isinstance(trae_chunk, dict):
+                        continue
+                    if trae_chunk.get("response"):
+                        content_parts.append(trae_chunk["response"])
+                    if trae_chunk.get("reasoning_content"):
+                        reasoning_parts.append(trae_chunk["reasoning_content"])
+                out = _trae_nonstream_to_openai(model, content_parts, reasoning_parts)
+                payload = _json.dumps(out, ensure_ascii=False).encode()
+                writer.write(f"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {len(payload)}\r\n\r\n".encode())
+                writer.write(payload)
+                await writer.drain()
+                stats["passthroughOk"] += 1
+                writer.close(); return
+
+        # ── 其他路径：透传原生端点 ──
+        upstream_url = f"{_TRAE_API_HOST}{path}"
+        async with httpx.AsyncClient(timeout=httpx.Timeout(60.0, connect=10.0), trust_env=False) as c:
+            req = c.build_request(method, upstream_url, headers=api_headers, content=body if body else None)
+            resp = await c.send(req, stream=True)
+            status, _ = await _write_response(writer, resp, stats=stats)
+            if status and status >= 400:
+                logger.warning(f"[{label}] trae-work {path} HTTP {status}")
+            return
+    except Exception as e:
+        stats["passthroughError"] += 1
+        logger.exception(f"[{label}] trae-work proxy exception")
+        try:
+            await _write_error_response(writer, 503, f"Trae Work proxy error: {e}")
+        except Exception:
+            pass
+
+
 def _handler_prepare_headers(target: dict, fwd_headers: dict, body_json: dict) -> dict:
     """按 handler 类型注入认证与补充 header。
 
@@ -1566,7 +1832,23 @@ def _crack_env_check(target: dict) -> dict:
         return {"available": False, "reason": "未检测到 QClaw 客户端（app-store.json 缺失），无法本地提取 API Key"}
 
     if "traework" in tool or "trae" in tool:
-        return {"available": False, "reason": "Trae Work 破解逻辑尚未实现（预留）"}
+        # Trae Work 认证数据在 %APPDATA%\\TRAE SOLO CN\\User\\globalStorage\\storage.json
+        # （iCubeAuthInfo://icube.cloudide，tc 加密）；token 已在 secrets.json 时无需本地客户端
+        env_dir = os.environ.get("TRAE_WORK_DATA_DIR", "")
+        appdata = os.environ.get("APPDATA", "")
+        candidates = []
+        if env_dir:
+            candidates.append(Path(env_dir))
+        if appdata:
+            candidates.append(Path(appdata) / "TRAE SOLO CN")
+        storage_json = next(
+            (d / "User" / "globalStorage" / "storage.json" for d in candidates
+             if (d / "User" / "globalStorage" / "storage.json").exists()),
+            None,
+        )
+        if storage_json:
+            return {"available": True, "reason": f"检测到 Trae Work 登录数据（{storage_json.parent}）"}
+        return {"available": False, "reason": "未检测到 Trae Work 客户端登录数据（storage.json 缺失）；可在 dashboard 手动填写 trae_work_token"}
 
     # 兜底：无法判断时视为可用（不阻止用户手动尝试）
     return {"available": True, "reason": "无法判断依赖，允许尝试"}
@@ -1929,6 +2211,11 @@ async def _handle_target_request(reader, writer, target):
         # ── Gemini 原生协议代理（OpenAI 请求 ↔ generateContent）──
         if target.get("handler") == "gemini-native":
             await _handle_gemini_native(writer, target, method, path, headers, body, stats, label)
+            return
+
+        # ── Trae Work 协议代理（OpenAI 请求 → llm_utils_chat）──
+        if target.get("handler") == "trae-work":
+            await _handle_traework(writer, target, method, path, headers, body, stats, label)
             return
 
         # ── 上游转发（含路径重写 + handler body/header 处理）──
@@ -4740,54 +5027,104 @@ async def root():
 # ─── 统一管理面板（所有 LLM 相关服务一览）─────────────────────────────
 
 DASHBOARD_STYLE = """
+  /* ── 设计 Token（OpenRouter 风格：深色近黑 + 品牌青蓝渐变）── */
+  :root {
+    --bg-page: #0a0a0f;
+    --bg-elev: #10101a;
+    --bg-card: #13131d;
+    --bg-card-hi: #171724;
+    --bg-inset: #0d0d14;
+    --border: rgba(148, 163, 184, 0.14);
+    --border-strong: rgba(148, 163, 184, 0.28);
+    --border-focus: rgba(34, 211, 238, 0.55);
+    --brand-cyan: #22d3ee;
+    --brand-blue: #3b82f6;
+    --brand-grad: linear-gradient(135deg, #22d3ee 0%, #3b82f6 100%);
+    --brand-glow: rgba(34, 211, 238, 0.35);
+    --text-primary: #eceef4;
+    --text-secondary: #9aa3b2;
+    --text-tertiary: #6b7280;
+    --success: #34d399;
+    --warning: #fbbf24;
+    --danger: #f87171;
+    --radius-lg: 14px;
+    --radius-md: 10px;
+    --radius-sm: 7px;
+    --font-mono: ui-monospace, "SF Mono", "Cascadia Mono", monospace;
+  }
+
   /* ── 全局 ── */
   *, *::before, *::after { box-sizing: border-box; }
-  body { font-family: -apple-system, "Segoe UI", ui-monospace, sans-serif; background: #0f1117; color: #e0e0e0; margin: 0; padding: 32px; }
-  h1 { font-size: 20px; font-weight: 600; margin: 0 0 2px 0; }
+  body { font-family: -apple-system, "Segoe UI", ui-monospace, sans-serif; background-color: var(--bg-page); color: var(--text-primary); margin: 0; padding: 32px; min-height: 100vh; background-image: radial-gradient(1000px 500px at 85% -10%, rgba(59, 130, 246, 0.10), transparent 60%), radial-gradient(900px 460px at -10% 0%, rgba(34, 211, 238, 0.07), transparent 55%), radial-gradient(2px 2px at 20% 30%, rgba(148,163,184,0.10), transparent 100%), radial-gradient(2px 2px at 70% 60%, rgba(148,163,184,0.08), transparent 100%); background-attachment: fixed; }
+  h1 { font-size: 21px; font-weight: 700; margin: 0 0 2px 0; letter-spacing: -0.3px; }
   h3 { font-size: 14px; font-weight: 600; margin: 0 0 10px 0; }
-  .sub { color: #8b8fa3; font-size: 13px; margin-bottom: 20px; }
-  .sub .refresh-time { font-size: 12px; color: #6b7280; }
-  code { color: #60a5fa; }
-  a { color: #6c8cff; }
+  .sub { color: var(--text-secondary); font-size: 13px; margin-bottom: 22px; }
+  .sub .refresh-time { font-size: 12px; color: var(--text-tertiary); }
+  code { color: var(--brand-cyan); }
+  a { color: #7aa2ff; }
 
-  /* ── 总览栏 ── */
-  .overview-bar { display: flex; gap: 24px; flex-wrap: wrap; background: #12142a; border: 1px solid #2a2d3e; border-radius: 10px; padding: 14px 22px; margin-bottom: 22px; align-items: center; font-size: 13px; color: #9ca3af; }
-  .overview-bar b { color: #e0e0e0; }
-  .overview-bar .divider { width: 1px; height: 24px; background: #2a2d3e; }
-  .status-dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 4px; }
-  .status-dot.green { background: #4ade80; box-shadow: 0 0 6px rgba(74,222,128,0.5); }
-  .status-dot.yellow { background: #fbbf24; box-shadow: 0 0 6px rgba(251,191,36,0.5); }
-  .status-dot.red { background: #f87171; box-shadow: 0 0 6px rgba(248,113,113,0.5); }
+  /* ── 总览栏：KPI 统计卡（OpenRouter 大数字风格）── */
+  .overview-bar { display: flex; gap: 20px; flex-wrap: wrap; align-items: stretch; background: linear-gradient(180deg, rgba(22,22,36,0.9) 0%, rgba(13,13,20,0.9) 100%); border: 1px solid var(--border); border-radius: var(--radius-lg); padding: 16px; margin-bottom: 26px; box-shadow: 0 10px 40px rgba(0,0,0,0.45), inset 0 1px 0 rgba(255,255,255,0.05); backdrop-filter: blur(4px); }
+  .kpi-grid { display: grid; grid-template-columns: repeat(4, minmax(150px, 1fr)); gap: 14px; flex: 1 1 auto; min-width: 0; }
+  .kpi-card { position: relative; display: flex; flex-direction: column; gap: 6px; background: linear-gradient(180deg, rgba(255,255,255,0.045) 0%, rgba(255,255,255,0.015) 100%), var(--bg-card); border: 1px solid var(--border); border-radius: var(--radius-md); padding: 14px 18px 16px; overflow: hidden; transition: border-color 0.2s, transform 0.2s, box-shadow 0.2s; }
+  .kpi-card::before { content: ""; position: absolute; top: 0; left: 12%; right: 12%; height: 1px; background: linear-gradient(90deg, transparent, rgba(34,211,238,0.7), transparent); }
+  .kpi-card::after { content: ""; position: absolute; inset: 0; background: radial-gradient(120% 90% at 100% 0%, rgba(34,211,238,0.09), transparent 55%); pointer-events: none; }
+  .kpi-card:hover { border-color: rgba(34,211,238,0.4); transform: translateY(-2px); box-shadow: 0 8px 28px rgba(34,211,238,0.10), 0 4px 16px rgba(0,0,0,0.35); }
+  .kpi-label { font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: 1.2px; color: var(--text-tertiary); }
+  .kpi-value { font-family: var(--font-mono); font-variant-numeric: tabular-nums; font-size: 32px; font-weight: 700; line-height: 1.05; color: var(--text-primary); letter-spacing: -0.5px; }
+  .kpi-value small { font-size: 16px; font-weight: 600; color: var(--text-secondary); margin-left: 3px; }
+  .kpi-value.accent { background: var(--brand-grad); -webkit-background-clip: text; background-clip: text; -webkit-text-fill-color: transparent; }
+  .kpi-sub { font-size: 11px; color: var(--text-tertiary); margin-top: 2px; }
+  .kpi-sub .kpi-dot { display: inline-block; width: 7px; height: 7px; border-radius: 50%; margin-right: 5px; vertical-align: 1px; }
+  .ov-side { display: flex; flex-direction: column; align-items: flex-end; justify-content: space-between; gap: 12px; flex-shrink: 0; }
+  .ov-dots { display: flex; align-items: center; gap: 5px; flex-wrap: wrap; }
+  .ov-actions { display: flex; gap: 10px; align-items: center; }
+  .status-dot { display: inline-block; width: 9px; height: 9px; border-radius: 50%; }
+  .status-dot.green { background: var(--success); box-shadow: 0 0 8px rgba(52,211,153,0.6); }
+  .status-dot.yellow { background: var(--warning); box-shadow: 0 0 8px rgba(251,191,36,0.5); }
+  .status-dot.red { background: var(--danger); box-shadow: 0 0 8px rgba(248,113,113,0.5); }
+
+  /* ── 卡片头启动状态灯（呼吸动画）── */
+  .ct-lamp { width: 10px; height: 10px; border-radius: 50%; flex-shrink: 0; transition: background 0.3s, box-shadow 0.3s; }
+  .ct-lamp.on { background: var(--success); box-shadow: 0 0 10px rgba(52,211,153,0.7); animation: lampPulse 2.2s ease-in-out infinite; }
+  .ct-lamp.off { background: var(--danger); box-shadow: 0 0 8px rgba(248,113,113,0.6); }
+  .ct-lamp.idle { background: #9aa3b2; box-shadow: 0 0 6px rgba(154,163,178,0.4); }
+  @keyframes lampPulse { 0%, 100% { box-shadow: 0 0 6px rgba(52,211,153,0.4); } 50% { box-shadow: 0 0 14px rgba(52,211,153,0.9); } }
 
   /* ── 区块 ── */
   .section { margin-bottom: 28px; }
-  .section-title { font-size: 14px; font-weight: 600; color: #9ca3af; text-transform: uppercase; letter-spacing: 1px; margin-bottom: 10px; padding-bottom: 6px; border-bottom: 1px solid #1f2233; }
-  .section-title .sec-count { display: inline-block; font-size: 11px; font-weight: 600; color: #6b7280; background: #151827; border: 1px solid #2a2d3e; border-radius: 999px; padding: 1px 8px; margin-left: 8px; vertical-align: middle; letter-spacing: 0; }
+  .section-title { font-size: 14px; font-weight: 700; color: var(--text-secondary); text-transform: uppercase; letter-spacing: 1.4px; margin-bottom: 12px; padding-bottom: 10px; border-bottom: 1px solid rgba(148,163,184,0.10); display: flex; align-items: center; gap: 8px; }
+  .section-title::before { content: ""; width: 3px; height: 15px; border-radius: 3px; background: var(--brand-grad); flex-shrink: 0; box-shadow: 0 0 8px var(--brand-glow); }
+  .section-title .sec-count { display: inline-flex; align-items: center; justify-content: center; min-width: 22px; height: 20px; font-size: 11px; font-weight: 700; color: var(--brand-cyan); background: rgba(34,211,238,0.10); border: 1px solid rgba(34,211,238,0.25); border-radius: 999px; padding: 0 8px; margin-left: 2px; vertical-align: middle; letter-spacing: 0; }
 
   /* ── 卡片纵向排列（单列，不做自适应 flow）── */
   .card-grid { display: flex; flex-direction: column; gap: 14px; }
 
-  /* ── 卡片容器 ── */
-  .card { background: #1a1c2e; border: 1px solid #2a2d3e; border-radius: 10px; overflow: hidden; transition: border-color 0.2s, transform 0.15s, box-shadow 0.2s; }
-  .card:hover { border-color: #3b4060; transform: translateY(-2px); box-shadow: 0 4px 20px rgba(0,0,0,0.3); }
+  /* ── 卡片容器：深色渐变底 + 顶部高光线 + hover 品牌光晕 ── */
+  .card { position: relative; background: linear-gradient(180deg, rgba(255,255,255,0.035) 0%, rgba(255,255,255,0.008) 40%, rgba(255,255,255,0) 100%), var(--bg-card); border: 1px solid var(--border); border-radius: var(--radius-lg); overflow: hidden; transition: border-color 0.25s, transform 0.2s, box-shadow 0.25s; box-shadow: inset 0 1px 0 rgba(255,255,255,0.05), 0 1px 4px rgba(0,0,0,0.3); }
+  .card::before { content: ""; position: absolute; top: 0; left: 8%; right: 8%; height: 1px; background: linear-gradient(90deg, transparent, rgba(34,211,238,0.45), transparent); z-index: 1; pointer-events: none; }
+  .card:hover { border-color: rgba(34,211,238,0.35); transform: translateY(-3px); box-shadow: inset 0 1px 0 rgba(255,255,255,0.06), 0 12px 40px rgba(34,211,238,0.10), 0 6px 20px rgba(0,0,0,0.4); }
   /* 端口强调条：左 3px 彩色 border */
   .card.accent-8082 { border-left: 3px solid #3b82f6; }
   .card.accent-8084 { border-left: 3px solid #a78bfa; }
   .card.accent-8090 { border-left: 3px solid #f59e0b; }
-  .card.accent-8091 { border-left: 3px solid #4ade80; }
-  .card.accent-8092 { border-left: 3px solid #60a5fa; }
+  .card.accent-8091 { border-left: 3px solid #34d399; }
+  .card.accent-8092 { border-left: 3px solid #22d3ee; }
   .card.accent-8093 { border-left: 3px solid #c084fc; }
   .card.accent-8094 { border-left: 3px solid #fbbf24; }
+  .card.accent-8083 { border-left: 3px solid #38bdf8; }
+  .card.accent-8085 { border-left: 3px solid #f472b6; }
+  .card.accent-8086 { border-left: 3px solid #34d399; }
 
   /* ── 卡片头（可点击 toggle）── */
   .card-toggle { display: flex; align-items: center; gap: 10px; width: 100%; padding: 14px 22px; background: none; border: none; color: inherit; font: inherit; cursor: pointer; text-align: left; user-select: none; transition: background 0.2s; }
-  .card-toggle:hover { background: #1e2140; }
-  .card-toggle:focus-visible { outline: 2px solid #60a5fa; outline-offset: -2px; }
+  .card-toggle:hover { background: rgba(255,255,255,0.03); }
+  .card-toggle:focus-visible { outline: 2px solid var(--brand-cyan); outline-offset: -2px; }
   .card-toggle:active { transform: scale(0.98); }
   .card-toggle .ct-name { font-size: 16px; font-weight: 600; flex-shrink: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .card-toggle .ct-port { font-size: 13px; color: #8b8fa3; font-family: ui-monospace, monospace; white-space: nowrap; margin-left: 2px; }
-  .card-toggle .ct-summary { font-size: 12px; color: #6b7280; white-space: nowrap; margin-left: auto; }
-  .card-toggle .ct-arrow { font-size: 12px; color: #6b7280; transition: transform 0.25s ease; flex-shrink: 0; margin-left: 4px; }
+  .card-toggle .ct-port { font-size: 13px; color: var(--text-secondary); font-family: var(--font-mono); white-space: nowrap; margin-left: 2px; }
+  .card-toggle .ct-summary { font-size: 12px; color: var(--text-tertiary); font-family: var(--font-mono); font-variant-numeric: tabular-nums; white-space: nowrap; margin-left: auto; }
+  .card-toggle .ct-arrow { font-size: 12px; color: var(--text-tertiary); transition: transform 0.25s ease; flex-shrink: 0; margin-left: 4px; }
   .card-toggle .ct-arrow.open { transform: rotate(180deg); }
   .card-toggle .badge-group { display: flex; gap: 6px; flex-wrap: wrap; flex-shrink: 0; }
 
@@ -4795,107 +5132,120 @@ DASHBOARD_STYLE = """
   .card-detail { max-height: 0; overflow: hidden; opacity: 0; transition: max-height 0.25s ease, opacity 0.2s ease, padding 0.25s ease; padding: 0 22px; }
   .card-detail.open { max-height: 4000px; opacity: 1; padding: 0 22px 18px 22px; }
   .card-detail > *:first-child { margin-top: 0; }
+  /* 内嵌子容器：把 kv/统计/模型/凭据 分成独立视觉区块，避免展开后"杂货铺"感 */
+  .card-detail > .kv, .card-detail > .card-desc, .card-detail > .stats-block, .card-detail > .model-section, .card-detail > .token-edit { background: linear-gradient(180deg, rgba(255,255,255,0.02), rgba(255,255,255,0.004)), var(--bg-inset); border: 1px solid rgba(148,163,184,0.10); border-radius: var(--radius-sm); }
+  .card-detail > .kv { padding: 12px 14px; margin: 12px 0 0 0; }
+  .card-detail > .card-desc { padding: 10px 14px; margin: 10px 0 0 0; }
+  .card-detail > .stats-block { padding: 12px 14px; margin: 10px 0 0 0; }
+  .card-detail > .model-section { padding: 12px 14px; margin: 10px 0 0 0; }
+  .card-detail > .token-edit { padding: 12px 14px; margin: 10px 0 0 0; }
 
-  /* ── badge（分类 + 状态，渐变底 + 图标点）── */
-  .badge { display: inline-flex; align-items: center; gap: 6px; font-size: 11px; padding: 3px 10px; border-radius: 999px; font-weight: 600; white-space: nowrap; letter-spacing: 0.02em; }
+  /* ── badge（分类 + 状态）：低饱和半透明底 + 细边框，品牌青蓝为主，状态色仅语义用 ── */
+  .badge { display: inline-flex; align-items: center; gap: 6px; font-size: 11px; padding: 3px 10px; border-radius: 999px; font-weight: 600; white-space: nowrap; letter-spacing: 0.02em; backdrop-filter: blur(2px); }
   .badge-dot { width: 6px; height: 6px; border-radius: 50%; flex-shrink: 0; }
-  /* 分类 badge：crack（蓝紫渐变）/ free（绿）/ paid（橙） */
-  .badge.b-crack { background: linear-gradient(135deg, #1b2345, #2a1e45); color: #93b4ff; border: 1px solid #2f3a6e; }
-  .badge.b-crack .badge-dot { background: #7c9dff; box-shadow: 0 0 6px rgba(124,157,255,0.7); }
-  .badge.b-free { background: linear-gradient(135deg, #14241c, #16281f); color: #5ee08a; border: 1px solid #24513a; }
-  .badge.b-free .badge-dot { background: #4ade80; box-shadow: 0 0 6px rgba(74,222,128,0.6); }
-  .badge.b-paid { background: linear-gradient(135deg, #2a1f10, #2e2313); color: #fbbf24; border: 1px solid #5a4420; }
+  /* 分类 badge：crack（品牌青蓝）/ free（语义绿）/ paid（语义橙）/ generic（中性灰） */
+  .badge.b-crack { background: rgba(34,211,238,0.10); color: #7dd3fc; border: 1px solid rgba(34,211,238,0.28); }
+  .badge.b-crack .badge-dot { background: var(--brand-cyan); box-shadow: 0 0 6px rgba(34,211,238,0.7); }
+  .badge.b-free { background: rgba(52,211,153,0.09); color: #6ee7b7; border: 1px solid rgba(52,211,153,0.26); }
+  .badge.b-free .badge-dot { background: var(--success); box-shadow: 0 0 6px rgba(52,211,153,0.6); }
+  .badge.b-paid { background: rgba(251,191,36,0.09); color: #fcd34d; border: 1px solid rgba(251,191,36,0.26); }
   .badge.b-paid .badge-dot { background: #f59e0b; box-shadow: 0 0 6px rgba(245,158,11,0.6); }
-  .badge.b-generic { background: linear-gradient(135deg, #1b2130, #202636); color: #9ca3af; border: 1px solid #2f3a4e; }
-  .badge.b-generic .badge-dot { background: #9ca3af; }
+  .badge.b-generic { background: rgba(148,163,184,0.09); color: #aab4c5; border: 1px solid rgba(148,163,184,0.24); }
+  .badge.b-generic .badge-dot { background: #9aa3b2; }
   /* 状态 badge：细底 + 状态点 */
-  .badge.b-st-green { background: #14241c; color: #4ade80; border: 1px solid #24513a; }
-  .badge.b-st-green::before { content: ''; width: 6px; height: 6px; border-radius: 50%; background: #4ade80; box-shadow: 0 0 6px rgba(74,222,128,0.6); flex-shrink: 0; }
-  .badge.b-st-blue { background: #16213e; color: #60a5fa; border: 1px solid #2a3a5e; }
-  .badge.b-st-blue::before { content: ''; width: 6px; height: 6px; border-radius: 50%; background: #60a5fa; box-shadow: 0 0 6px rgba(96,165,250,0.6); flex-shrink: 0; }
-  .badge.b-st-red { background: #2e1a1a; color: #f87171; border: 1px solid #5a2a2a; }
-  .badge.b-st-red::before { content: ''; width: 6px; height: 6px; border-radius: 50%; background: #f87171; box-shadow: 0 0 6px rgba(248,113,113,0.6); flex-shrink: 0; }
-  .badge.b-st-yellow { background: #2a1f10; color: #fbbf24; border: 1px solid #5a4420; }
-  .badge.b-st-yellow::before { content: ''; width: 6px; height: 6px; border-radius: 50%; background: #fbbf24; flex-shrink: 0; }
-  .badge.b-st-purple { background: #2a1e3e; color: #c084fc; border: 1px solid #4a2a6e; }
+  .badge.b-st-green { background: rgba(52,211,153,0.09); color: #6ee7b7; border: 1px solid rgba(52,211,153,0.26); }
+  .badge.b-st-green::before { content: ''; width: 6px; height: 6px; border-radius: 50%; background: var(--success); box-shadow: 0 0 6px rgba(52,211,153,0.6); flex-shrink: 0; }
+  .badge.b-st-blue { background: rgba(59,130,246,0.10); color: #93c5fd; border: 1px solid rgba(59,130,246,0.30); }
+  .badge.b-st-blue::before { content: ''; width: 6px; height: 6px; border-radius: 50%; background: var(--brand-blue); box-shadow: 0 0 6px rgba(59,130,246,0.6); flex-shrink: 0; }
+  .badge.b-st-red { background: rgba(248,113,113,0.09); color: #fca5a5; border: 1px solid rgba(248,113,113,0.26); }
+  .badge.b-st-red::before { content: ''; width: 6px; height: 6px; border-radius: 50%; background: var(--danger); box-shadow: 0 0 6px rgba(248,113,113,0.6); flex-shrink: 0; }
+  .badge.b-st-yellow { background: rgba(251,191,36,0.09); color: #fcd34d; border: 1px solid rgba(251,191,36,0.26); }
+  .badge.b-st-yellow::before { content: ''; width: 6px; height: 6px; border-radius: 50%; background: var(--warning); flex-shrink: 0; }
+  .badge.b-st-purple { background: rgba(192,132,252,0.09); color: #d8b4fe; border: 1px solid rgba(192,132,252,0.26); }
   .badge.b-st-purple::before { content: ''; width: 6px; height: 6px; border-radius: 50%; background: #c084fc; flex-shrink: 0; }
-  .badge.b-st-orange { background: #2a1f10; color: #f59e0b; border: 1px solid #5a4420; }
+  .badge.b-st-orange { background: rgba(251,146,60,0.09); color: #fdba74; border: 1px solid rgba(251,146,60,0.26); }
   .badge.b-st-orange::before { content: ''; width: 6px; height: 6px; border-radius: 50%; background: #f59e0b; flex-shrink: 0; }
-  .badge.b-st-gray { background: #1b2130; color: #8b8fa3; border: 1px solid #2f3a4e; }
-  .badge.b-st-gray::before { content: ''; width: 6px; height: 6px; border-radius: 50%; background: #8b8fa3; flex-shrink: 0; }
+  .badge.b-st-gray { background: rgba(148,163,184,0.09); color: #aab4c5; border: 1px solid rgba(148,163,184,0.24); }
+  .badge.b-st-gray::before { content: ''; width: 6px; height: 6px; border-radius: 50%; background: #9aa3b2; flex-shrink: 0; }
   /* 元数据标签：破解/非破解、免费/收费、稳定性 */
-  .badge.b-meta-crack { background: #1a1e38; color: #7c9dff; border: 1px solid #2a3260; }
-  .badge.b-meta-normal { background: #1b2130; color: #9ca3af; border: 1px solid #2f3a4e; }
-  .badge.b-meta-free { background: #14241c; color: #5ee08a; border: 1px solid #24513a; }
-  .badge.b-meta-paid { background: #2a1f10; color: #fbbf24; border: 1px solid #5a4420; }
-  .badge.b-meta-stable { background: #14241c; color: #4ade80; border: 1px solid #24513a; }
-  .badge.b-meta-stable::before { content: '●'; font-size: 8px; margin-right: 3px; color: #4ade80; }
-  .badge.b-meta-unstable { background: #2a1f10; color: #f59e0b; border: 1px solid #5a4420; }
-  .badge.b-meta-unstable::before { content: '◐'; font-size: 9px; margin-right: 3px; color: #f59e0b; }
-  .badge.b-meta-agg { background: linear-gradient(135deg, #1b2345, #2a1e45); color: #93b4ff; border: 1px solid #2f3a6e; }
-  .badge.b-meta-agg::before { content: '◎'; font-size: 9px; margin-right: 3px; color: #7c9dff; }
-  .badge.b-meta-gemini { background: linear-gradient(135deg, #142038, #1a2e4a); color: #7dd3fc; border: 1px solid #25618a; }
+  .badge.b-meta-crack { background: rgba(34,211,238,0.08); color: #7dd3fc; border: 1px solid rgba(34,211,238,0.24); }
+  .badge.b-meta-normal { background: rgba(148,163,184,0.09); color: #aab4c5; border: 1px solid rgba(148,163,184,0.24); }
+  .badge.b-meta-free { background: rgba(52,211,153,0.08); color: #6ee7b7; border: 1px solid rgba(52,211,153,0.24); }
+  .badge.b-meta-paid { background: rgba(251,191,36,0.08); color: #fcd34d; border: 1px solid rgba(251,191,36,0.24); }
+  .badge.b-meta-stable { background: rgba(52,211,153,0.08); color: #6ee7b7; border: 1px solid rgba(52,211,153,0.24); }
+  .badge.b-meta-stable::before { content: '●'; font-size: 8px; margin-right: 3px; color: var(--success); }
+  .badge.b-meta-unstable { background: rgba(251,191,36,0.08); color: #fcd34d; border: 1px solid rgba(251,191,36,0.24); }
+  .badge.b-meta-unstable::before { content: '◐'; font-size: 9px; margin-right: 3px; color: var(--warning); }
+  .badge.b-meta-agg { background: rgba(34,211,238,0.08); color: #7dd3fc; border: 1px solid rgba(34,211,238,0.24); }
+  .badge.b-meta-agg::before { content: '◎'; font-size: 9px; margin-right: 3px; color: var(--brand-cyan); }
+  .badge.b-meta-gemini { background: rgba(56,189,248,0.08); color: #7dd3fc; border: 1px solid rgba(56,189,248,0.24); }
   .badge.b-meta-gemini::before { content: '◆'; font-size: 8px; margin-right: 3px; color: #38bdf8; }
+  .badge.b-meta-oa { background: rgba(129,140,248,0.08); color: #a5b4fc; border: 1px solid rgba(129,140,248,0.24); }
+  .badge.b-meta-oa::before { content: '◈'; font-size: 8px; margin-right: 3px; color: #818cf8; }
 
   /* ── kv 元信息 ── */
   .kv { display: grid; grid-template-columns: 130px 1fr; gap: 6px 16px; font-size: 13px; margin-bottom: 10px; }
-  .kv div:nth-child(odd) { color: #8b8fa3; }
-  .card-desc { font-size: 12.5px; color: #9ca3af; margin-bottom: 8px; }
+  .kv div:nth-child(odd) { color: var(--text-secondary); }
+  .card-desc { font-size: 12.5px; color: var(--text-secondary); margin-bottom: 8px; }
 
   /* ── 流量统计块 ── */
-  .stats-block { display: flex; gap: 18px; flex-wrap: wrap; margin: 12px 0 10px 0; }
-  .stat-item { display: flex; flex-direction: column; gap: 2px; }
-  .stat-label { font-size: 11px; color: #6b7280; text-transform: uppercase; letter-spacing: 0.5px; }
-  .stat-value { font-size: 24px; font-weight: 700; color: #e0e0e0; font-family: ui-monospace, monospace; font-variant-numeric: tabular-nums; }
+  .stats-block { display: flex; gap: 22px; flex-wrap: wrap; margin: 12px 0 10px 0; }
+  .stat-item { display: flex; flex-direction: column; gap: 3px; }
+  .stat-label { font-size: 11px; color: var(--text-tertiary); text-transform: uppercase; letter-spacing: 0.8px; font-weight: 600; }
+  .stat-value { font-size: 28px; font-weight: 700; color: var(--text-primary); font-family: var(--font-mono); font-variant-numeric: tabular-nums; letter-spacing: -0.5px; line-height: 1.1; text-shadow: 0 0 20px rgba(34,211,238,0.25); }
 
   /* ── 进度条 ── */
-  .rate-bar { display: flex; height: 8px; border-radius: 4px; overflow: hidden; background: #151827; margin: 10px 0; }
+  .rate-bar { display: flex; height: 9px; border-radius: 5px; overflow: hidden; background: rgba(148,163,184,0.08); border: 1px solid rgba(148,163,184,0.10); margin: 10px 0; box-shadow: inset 0 1px 2px rgba(0,0,0,0.3); }
   .rate-bar-seg { transition: width 0.6s ease; }
-  .rate-bar-seg.ok { background: linear-gradient(90deg, #22c55e, #4ade80); }
-  .rate-bar-seg.tr429 { background: linear-gradient(90deg, #eab308, #fbbf24); }
-  .rate-bar-seg.err { background: linear-gradient(90deg, #ef4444, #f87171); }
-  .mini-stats { display: flex; gap: 18px; flex-wrap: wrap; font-size: 12.5px; color: #9ca3af; margin-top: 4px; }
-  .mini-stats b { color: #e0e0e0; }
+  .rate-bar-seg.ok { background: linear-gradient(90deg, #10b981, #34d399); box-shadow: 0 0 8px rgba(52,211,153,0.4); }
+  .rate-bar-seg.tr429 { background: linear-gradient(90deg, #d97706, #fbbf24); box-shadow: 0 0 8px rgba(251,191,36,0.35); }
+  .rate-bar-seg.err { background: linear-gradient(90deg, #dc2626, #f87171); box-shadow: 0 0 8px rgba(248,113,113,0.35); }
+  .mini-stats { display: flex; gap: 18px; flex-wrap: wrap; font-size: 12.5px; color: var(--text-secondary); margin-top: 6px; }
+  .mini-stats b { color: var(--text-primary); font-family: var(--font-mono); font-variant-numeric: tabular-nums; }
 
   /* ── 模型表格 ── */
-  .model-count { display: inline-block; background: #16213e; color: #60a5fa; font-size: 11px; padding: 2px 8px; border-radius: 6px; margin-left: 6px; font-weight: 600; }
-  .no-models { font-size: 12.5px; color: #6b7280; margin-top: 6px; font-style: italic; }
+  .model-count { display: inline-block; background: rgba(59,130,246,0.12); color: #93c5fd; font-size: 11px; padding: 2px 8px; border-radius: 999px; margin-left: 6px; font-weight: 600; border: 1px solid rgba(59,130,246,0.28); }
+  .no-models { font-size: 12.5px; color: var(--text-tertiary); margin-top: 6px; font-style: italic; }
   .model-table { width: 100%; border-collapse: collapse; margin-top: 8px; font-size: 12.5px; }
-  .model-table th { text-align: left; padding: 6px 10px; color: #6b7280; font-weight: 600; font-size: 11px; text-transform: uppercase; letter-spacing: 0.5px; border-bottom: 1px solid #2a2d3e; }
-  .model-table td { padding: 5px 10px; border-bottom: 1px solid #1f2233; }
-  .model-table td.num { color: #6b7280; font-family: ui-monospace, monospace; width: 32px; }
-  .model-table td.mid { font-family: ui-monospace, monospace; }
-  .model-table td.name { color: #c0c4d0; }
+  .model-table th { text-align: left; padding: 8px 12px; color: var(--text-tertiary); font-weight: 600; font-size: 11px; text-transform: uppercase; letter-spacing: 0.5px; border-bottom: 1px solid var(--border); }
+  .model-table td { padding: 7px 12px; border-bottom: 1px solid rgba(148,163,184,0.10); }
+  .model-table td.num { color: var(--text-tertiary); font-family: var(--font-mono); width: 32px; }
+  .model-table td.mid { font-family: var(--font-mono); }
+  .model-table td.name { color: #c9cedd; }
   .model-table td.act { width: 36px; text-align: center; }
-  .model-table tbody tr:nth-child(even) { background: #151827; }
-  .model-table tbody tr:hover { background: #1e2140; }
+  .model-table tbody tr:nth-child(even) { background: rgba(255,255,255,0.02); }
+  .model-table tbody tr:hover { background: rgba(34,211,238,0.05); }
+  .model-table tbody tr:hover { background: rgba(34,211,238,0.06); }
   .mstat { text-align: center; padding: 4px 8px; }
   .mstat.err { color: #f87171; }
   .mstat.warn { color: #fbbf24; }
 
   /* ── 模型编辑操作行（编辑态切换 + 保存）── */
   .model-ops { display: flex; gap: 8px; margin-top: 8px; align-items: center; flex-wrap: wrap; }
-  .model-edit-toggle, .model-save-btn { border-radius: 6px; padding: 5px 12px; cursor: pointer; font-size: 12.5px; font-weight: 600; white-space: nowrap; transition: background 0.2s, transform 0.15s; }
-  .model-edit-toggle { background: #16213e; color: #60a5fa; border: 1px solid #2a3a5e; }
-  .model-edit-toggle:hover { background: #1e3058; transform: translateY(-1px); }
+  .model-edit-toggle, .model-save-btn { border-radius: var(--radius-sm); padding: 5px 12px; cursor: pointer; font-size: 12.5px; font-weight: 600; white-space: nowrap; transition: background 0.2s, border-color 0.2s, transform 0.15s, box-shadow 0.2s; }
+  .model-edit-toggle { background: transparent; color: var(--brand-cyan); border: 1px solid rgba(34,211,238,0.28); }
+  .model-edit-toggle:hover { background: rgba(34,211,238,0.10); border-color: rgba(34,211,238,0.5); transform: translateY(-1px); }
   .model-edit-toggle:active, .model-save-btn:active { transform: scale(0.98); }
-  .model-save-btn { background: #1d4ed8; color: #fff; border: none; }
-  .model-save-btn:hover { background: #2563eb; transform: translateY(-1px); }
+  .model-prune-btn { border-radius: var(--radius-sm); padding: 5px 12px; cursor: pointer; font-size: 12.5px; font-weight: 600; white-space: nowrap; transition: background 0.2s, transform 0.15s; background: transparent; color: #fca5a5; border: 1px solid rgba(248,113,113,0.30); }
+  .model-prune-btn:hover { background: rgba(248,113,113,0.10); border-color: rgba(248,113,113,0.55); transform: translateY(-1px); }
+  .model-prune-btn:disabled { opacity: 0.6; cursor: wait; }
+  .model-save-btn { background: var(--brand-grad); color: #fff; border: none; box-shadow: 0 4px 14px rgba(59,130,246,0.35); }
+  .model-save-btn:hover { filter: brightness(1.1); box-shadow: 0 6px 20px rgba(34,211,238,0.4); transform: translateY(-1px); }
 
   /* ── 展示开关（iOS 风格滑动 switch）── */
   .switch { position: relative; display: inline-block; width: 44px; height: 26px; vertical-align: middle; cursor: pointer; flex-shrink: 0; }
   .switch input { opacity: 0; width: 0; height: 0; }
   .switch-slider { position: absolute; inset: 0; background: linear-gradient(135deg, #3a4158, #2c3148); border-radius: 999px; transition: background 0.25s ease; box-shadow: inset 0 1px 3px rgba(0,0,0,0.35), 0 1px 0 rgba(255,255,255,0.04); }
   .switch-slider::before { content: ''; position: absolute; width: 20px; height: 20px; left: 3px; top: 3px; background: radial-gradient(circle at 35% 30%, #f5f7fb, #c7ccd8); border-radius: 50%; transition: transform 0.25s cubic-bezier(0.34, 1.56, 0.64, 1), background 0.25s ease; box-shadow: 0 2px 5px rgba(0,0,0,0.4); }
-  .switch input:checked + .switch-slider { background: linear-gradient(135deg, #34d399, #10b981); box-shadow: inset 0 1px 2px rgba(0,0,0,0.15), 0 0 10px rgba(16,185,129,0.25); }
-  .switch input:checked + .switch-slider::before { transform: translateX(18px); background: radial-gradient(circle at 35% 30%, #ffffff, #e6f7ef); }
-  .switch input:focus-visible + .switch-slider { outline: 2px solid #60a5fa; outline-offset: 2px; }
+  .switch input:checked + .switch-slider { background: var(--brand-grad); box-shadow: inset 0 1px 2px rgba(0,0,0,0.15), 0 0 12px rgba(34,211,238,0.30); }
+  .switch input:checked + .switch-slider::before { transform: translateX(18px); background: radial-gradient(circle at 35% 30%, #ffffff, #d5f4fc); }
+  .switch input:focus-visible + .switch-slider { outline: 2px solid var(--brand-cyan); outline-offset: 2px; }
   .switch input:disabled + .switch-slider { opacity: 0.5; cursor: not-allowed; }
 
   /* ── 模型编辑 modal ── */
-  .modal-overlay { position: fixed; inset: 0; background: rgba(10, 12, 20, 0.72); backdrop-filter: blur(3px); display: none; align-items: center; justify-content: center; z-index: 100; padding: 20px; }
+  .modal-overlay { position: fixed; inset: 0; background: rgba(5, 6, 10, 0.8); backdrop-filter: blur(6px); display: none; align-items: center; justify-content: center; z-index: 100; padding: 20px; }
   .modal-overlay.open { display: flex; }
-  .modal { background: #171a2c; border: 1px solid #2a2d3e; border-radius: 12px; width: 100%; max-width: 640px; max-height: 82vh; display: flex; flex-direction: column; box-shadow: 0 20px 60px rgba(0,0,0,0.5); animation: modalIn 0.22s ease; }
+  .modal { background: linear-gradient(180deg, #17172a 0%, #101019 100%); border: 1px solid var(--border-strong); border-radius: 16px; width: 100%; max-width: 640px; max-height: 82vh; display: flex; flex-direction: column; box-shadow: 0 24px 70px rgba(0,0,0,0.65), 0 0 0 1px rgba(34,211,238,0.05), inset 0 1px 0 rgba(255,255,255,0.06); animation: modalIn 0.22s ease; }
   @keyframes modalIn { from { opacity: 0; transform: translateY(14px) scale(0.98); } to { opacity: 1; transform: none; } }
   .modal-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 16px 20px; border-bottom: 1px solid #23263a; }
   .modal-head h3 { margin: 0; font-size: 15px; font-weight: 600; }
@@ -4910,10 +5260,10 @@ DASHBOARD_STYLE = """
   .mrow .mrow-info { flex: 1; min-width: 0; }
   .mrow .mrow-id { font-family: ui-monospace, monospace; font-size: 13px; color: #e0e0e0; overflow-wrap: anywhere; }
   .mrow .mrow-name { font-size: 12px; color: #8b8fa3; margin-top: 2px; }
-  .modal-btn { border-radius: 6px; padding: 7px 16px; cursor: pointer; font-size: 13px; font-weight: 600; white-space: nowrap; transition: background 0.2s, transform 0.15s; border: 1px solid #2a3a5e; background: #16213e; color: #60a5fa; }
-  .modal-btn:hover { background: #1e3058; transform: translateY(-1px); }
-  .modal-btn-primary { background: #1d4ed8; color: #fff; border: none; }
-  .modal-btn-primary:hover { background: #2563eb; }
+  .modal-btn { border-radius: var(--radius-sm); padding: 7px 16px; cursor: pointer; font-size: 13px; font-weight: 600; white-space: nowrap; transition: background 0.2s, border-color 0.2s, transform 0.15s; border: 1px solid rgba(148,163,184,0.28); background: transparent; color: var(--text-secondary); }
+  .modal-btn:hover { border-color: rgba(34,211,238,0.5); background: rgba(34,211,238,0.08); color: #fff; transform: translateY(-1px); }
+  .modal-btn-primary { background: var(--brand-grad); color: #fff; border: none; box-shadow: 0 4px 14px rgba(59,130,246,0.35); }
+  .modal-btn-primary:hover { filter: brightness(1.1); box-shadow: 0 6px 20px rgba(34,211,238,0.4); }
   .modal-btn:active { transform: scale(0.98); }
   .modal-msg { font-size: 12.5px; color: #9ca3af; margin-right: auto; align-self: center; }
   .modal-msg.success { color: #4ade80; }
@@ -4921,36 +5271,38 @@ DASHBOARD_STYLE = """
   .mrow-all-hint { font-size: 12px; color: #6b7280; margin: 4px 0 8px 0; }
   /* modal 内搜索框 */
   .model-search-wrap { margin-bottom: 10px; }
-  .model-search { width: 100%; padding: 8px 12px; background: #151827; border: 1px solid #2a2d3e; border-radius: 6px; color: #e0e0e0; font-size: 13px; transition: border-color 0.2s; }
-  .model-search::placeholder { color: #6b7280; }
-  .model-search:focus { outline: 2px solid #60a5fa; border-color: #3b4060; }
+  .model-search { width: 100%; padding: 8px 12px; background: var(--bg-inset); border: 1px solid var(--border); border-radius: var(--radius-sm); color: var(--text-primary); font-size: 13px; transition: border-color 0.2s; }
+  .model-search::placeholder { color: var(--text-tertiary); }
+  .model-search:focus { outline: 2px solid rgba(34,211,238,0.35); border-color: var(--border-focus); }
 
   .model-msg { font-size: 12px; color: #9ca3af; margin-top: 4px; min-height: 18px; }
+  .model-msg.ok { color: #4ade80; }
+  .model-msg.err { color: #f87171; }
 
   /* ── 卡片内联 token 编辑 ── */
-  .token-edit { margin-top: 8px; padding-top: 8px; border-top: 1px dashed #2a2d3e; }
-  .te-status { font-size: 12px; color: #9ca3af; margin-bottom: 6px; }
+  .token-edit { margin-top: 8px; padding-top: 8px; border-top: 1px dashed rgba(148,163,184,0.16); }
+  .te-status { font-size: 12px; color: var(--text-secondary); margin-bottom: 6px; }
   .te-row { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; }
-  .te-input { flex: 1; min-width: 120px; background: #0f1117; border: 1px solid #2a2d3e; border-radius: 6px; color: #e0e0e0; padding: 6px 8px; font-size: 13px; }
-  .te-input:focus { outline: none; border-color: #60a5fa; }
-  .te-save, .te-recrack { background: #1d4ed8; color: #fff; border: none; border-radius: 6px; padding: 6px 10px; cursor: pointer; font-size: 13px; white-space: nowrap; transition: background 0.2s, transform 0.15s; }
-  .te-recrack { background: #7c3aed; }
-  .te-recrack:disabled { background: #2a2d3e; color: #6b7280; cursor: not-allowed; border: 1px solid #3a3e52; transform: none !important; }
-  .te-recrack:disabled:hover { background: #2a2d3e; transform: none; }
-  .te-save:hover { background: #2563eb; transform: translateY(-1px); }
-  .te-recrack:hover { background: #8b5cf6; transform: translateY(-1px); }
+  .te-input { flex: 1; min-width: 120px; background: var(--bg-inset); border: 1px solid var(--border); border-radius: var(--radius-sm); color: var(--text-primary); padding: 6px 8px; font-size: 13px; }
+  .te-input:focus { outline: none; border-color: var(--brand-cyan); box-shadow: 0 0 0 2px rgba(34,211,238,0.15); }
+  .te-save, .te-recrack { background: var(--brand-grad); color: #fff; border: none; border-radius: var(--radius-sm); padding: 6px 12px; cursor: pointer; font-size: 13px; font-weight: 600; white-space: nowrap; transition: filter 0.2s, transform 0.15s, box-shadow 0.2s; box-shadow: 0 3px 12px rgba(59,130,246,0.30); }
+  .te-recrack { background: transparent; color: #b6bdd0; border: 1px solid rgba(148,163,184,0.28); box-shadow: none; }
+  .te-recrack:disabled { background: transparent; color: var(--text-tertiary); cursor: not-allowed; border-color: rgba(148,163,184,0.16); transform: none !important; box-shadow: none; }
+  .te-recrack:disabled:hover { background: transparent; transform: none; }
+  .te-save:hover { filter: brightness(1.1); box-shadow: 0 5px 18px rgba(34,211,238,0.4); transform: translateY(-1px); }
+  .te-recrack:hover { border-color: rgba(34,211,238,0.5); background: rgba(34,211,238,0.08); color: #fff; transform: translateY(-1px); }
   .te-save:active, .te-recrack:active { transform: scale(0.98); }
 
   /* ── 总览栏操作按钮 + 消息 ── */
-  .ov-btn { background: #16213e; color: #60a5fa; border: 1px solid #2a3a5e; border-radius: 6px; padding: 6px 14px; cursor: pointer; font-size: 13px; font-weight: 600; transition: background 0.2s, transform 0.15s; }
-  .ov-btn:hover { background: #1e3058; transform: translateY(-1px); }
+  .ov-btn { background: transparent; color: #c2cbdc; border: 1px solid rgba(148,163,184,0.28); border-radius: var(--radius-sm); padding: 7px 16px; cursor: pointer; font-size: 13px; font-weight: 600; transition: background 0.2s, border-color 0.2s, transform 0.15s, box-shadow 0.2s; }
+  .ov-btn:hover { background: rgba(34,211,238,0.08); border-color: rgba(34,211,238,0.5); color: #fff; transform: translateY(-1px); }
   .ov-btn:active { transform: scale(0.98); }
-  .ov-btn-primary { background: #1d4ed8; color: #fff; border: none; }
-  .ov-btn-primary:hover { background: #2563eb; }
+  .ov-btn-primary { background: var(--brand-grad); color: #fff; border: none; box-shadow: 0 4px 16px rgba(59,130,246,0.35); }
+  .ov-btn-primary:hover { background: var(--brand-grad); filter: brightness(1.1); border: none; color: #fff; box-shadow: 0 6px 24px rgba(34,211,238,0.45); }
   .ov-btn:disabled { opacity: 0.6; cursor: not-allowed; transform: none; }
-  .ov-msg { font-size: 12.5px; color: #9ca3af; margin-left: 4px; }
-  .ov-msg.success { color: #4ade80; }
-  .ov-msg.danger { color: #f87171; }
+  .ov-msg { font-size: 12.5px; color: var(--text-secondary); margin-left: 4px; flex-basis: 100%; text-align: right; }
+  .ov-msg.success { color: var(--success); }
+  .ov-msg.danger { color: var(--danger); }
 
   /* ── 响应式：窄屏 ≤ 768px ── */
   @media (max-width: 768px) {
@@ -4961,8 +5313,10 @@ DASHBOARD_STYLE = """
     .card-toggle .ct-summary { display: none; }
     .card-detail { padding: 0 16px; }
     .card-detail.open { padding: 0 16px 14px 16px; }
-    .overview-bar { gap: 12px; padding: 12px 16px; }
-    .overview-bar .divider { display: none; }
+    .overview-bar { gap: 14px; padding: 14px; flex-direction: column; }
+    .kpi-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
+    .kpi-value { font-size: 26px; }
+    .ov-side { flex-direction: row; align-items: center; justify-content: space-between; width: 100%; }
     .kv { grid-template-columns: 1fr 2fr; }
     .stats-block { gap: 12px; }
     .model-table { display: block; overflow-x: auto; -webkit-overflow-scrolling: touch; }
@@ -4975,6 +5329,54 @@ DASHBOARD_STYLE = """
   @media (prefers-reduced-motion: reduce) {
     *, *::before, *::after { transition: none !important; animation: none !important; }
   }
+
+  /* ── 破解网关：额度/签到状态展示 ── */
+  .crack-status { margin-top: 8px; padding: 8px 10px; background: var(--bg-inset); border: 1px solid rgba(148,163,184,0.12); border-radius: var(--radius-sm); font-size: 12px; line-height: 1.6; }
+  .cs-loading { color: #8b93a7; }
+  .cs-err { color: #f87171; }
+  .cs-head { color: #9aa3b8; margin-bottom: 4px; font-weight: 600; }
+  .cs-row { display: flex; justify-content: space-between; gap: 8px; color: #c9d1e3; }
+  .cs-row .k { color: #8b93a7; }
+  .cs-checkin-ok { color: #34d399; }
+  .cs-checkin-no { color: #fbbf24; }
+  .cs-never { color: #6b7280; font-style: italic; }
+  .cs-quota { border-top: 1px dashed #262a3a; margin-top: 6px; padding-top: 6px; }
+  .cs-qrow { display: flex; justify-content: space-between; gap: 8px; color: #b6bfd4; }
+  .cs-qrow .qname { color: #8b93a7; }
+  .cs-qrow .qexp { color: #6b7280; font-size: 11px; }
+
+  /* ── 凭据管理按钮 ── */
+  .te-cred-btn { background: transparent; color: #c2cbdc; border: 1px solid rgba(148,163,184,0.28); border-radius: var(--radius-sm); padding: 7px 14px; cursor: pointer; font-size: 13px; font-weight: 600; transition: background 0.2s, border-color 0.2s, transform 0.15s; }
+  .te-cred-btn:hover { border-color: rgba(34,211,238,0.5); color: var(--brand-cyan); background: rgba(34,211,238,0.08); transform: translateY(-1px); }
+
+  /* ── 凭据管理弹窗（表单/JSON 双模式）── */
+  .cred-modal { position: fixed; inset: 0; background: rgba(5,6,10,0.78); backdrop-filter: blur(5px); display: none; align-items: center; justify-content: center; z-index: 1000; }
+  .cred-modal.open { display: flex; }
+  .cred-box { background: linear-gradient(180deg, #17172a 0%, #101019 100%); border: 1px solid var(--border-strong); border-radius: 14px; padding: 18px 22px; width: 560px; max-width: 92vw; max-height: 80vh; overflow-y: auto; box-shadow: 0 24px 70px rgba(0,0,0,0.6), inset 0 1px 0 rgba(255,255,255,0.05); }
+  .cred-head { display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; }
+  .cred-head h3 { margin: 0; color: var(--text-primary); font-size: 16px; font-weight: 600; }
+  .cred-close { background: none; border: none; color: var(--text-secondary); font-size: 20px; cursor: pointer; line-height: 1; }
+  .cred-tabs { display: flex; gap: 4px; border-bottom: 1px solid var(--border); margin-bottom: 14px; }
+  .cred-tab { background: none; border: none; color: var(--text-secondary); padding: 8px 16px; cursor: pointer; border-bottom: 2px solid transparent; font-size: 13px; transition: color 0.2s; }
+  .cred-tab.active { color: var(--brand-cyan); border-bottom-color: var(--brand-cyan); }
+  .cred-field { margin-bottom: 12px; }
+  .cred-field label { display: block; color: var(--text-primary); font-size: 13px; margin-bottom: 4px; }
+  .cred-field input { width: 100%; background: var(--bg-inset); color: #d5dcea; border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 8px 10px; font-size: 13px; box-sizing: border-box; }
+  .cred-field input:focus { outline: 2px solid rgba(34,211,238,0.30); border-color: var(--border-focus); }
+  .cred-field .cred-hint { display: block; color: var(--text-tertiary); font-size: 11px; margin-top: 3px; }
+  .cred-field .cred-field-err { display: block; color: var(--danger); font-size: 11px; min-height: 14px; }
+  .cred-req { color: var(--danger); }
+  .cred-readonly { color: var(--text-tertiary); font-size: 11px; margin-top: 8px; padding: 6px 8px; background: var(--bg-inset); border-radius: var(--radius-sm); }
+  .cred-foot { display: flex; justify-content: flex-end; align-items: center; gap: 8px; margin-top: 14px; }
+  .cred-msg { flex: 1; font-size: 12px; }
+  .cred-msg.ok { color: #4ade80; }
+  .cred-msg.err { color: #f87171; }
+  .cred-msg.warn { color: #fbbf24; }
+  .cred-cancel { background: transparent; color: #c2cbdc; border: 1px solid rgba(148,163,184,0.28); border-radius: var(--radius-sm); padding: 7px 16px; cursor: pointer; font-weight: 600; transition: border-color 0.2s, background 0.2s; }
+  .cred-cancel:hover { border-color: rgba(34,211,238,0.5); background: rgba(34,211,238,0.08); color: #fff; }
+  .cred-save { background: var(--brand-grad); color: #fff; border: none; border-radius: var(--radius-sm); padding: 7px 16px; cursor: pointer; font-weight: 600; box-shadow: 0 4px 14px rgba(59,130,246,0.35); transition: filter 0.2s, transform 0.15s; }
+  .cred-save:hover { filter: brightness(1.1); transform: translateY(-1px); }
+  .cred-pane textarea { width: 100%; height: 150px; background: var(--bg-inset); color: #d5dcea; border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 10px; font-family: monospace; font-size: 12px; box-sizing: border-box; resize: vertical; }
 """
 
 
@@ -5115,12 +5517,14 @@ def _format_uptime(started_at_str):
         return "—"
 
 
-def _model_details_html(models, model_stats=None, label=None, edit_mode=False):
+def _model_details_html(models, model_stats=None, label=None, edit_mode=False, can_prune=False):
     """模型列表表格（正常态）+ 模型编辑 modal 内容（edit_mode）。
 
     支持 models 为字符串列表（默认启用）、dict 列表（含 id/display_name/enabled）。
     label: target label，用于编辑入口按钮的 data-label；为 None 时无编辑能力（如 8081 卡片）。
     edit_mode: True 时返回 modal 编辑界面 HTML：全部模型 + 每个模型的 iOS 风格滑动开关（无删除按钮）。
+    can_prune: 该网关上游是否支持 /models（copilot 系支持；codebuddy/qclaw/trae-work 不支持，
+               不显示"清理过期模型"按钮，避免点击报"上游不可达"）。
     """
     editable = label is not None
     # 规范化：统一为 [{id, display, enabled}]
@@ -5247,10 +5651,18 @@ def _model_details_html(models, model_stats=None, label=None, edit_mode=False):
     edit_toggle = (
         f'<button class="model-edit-toggle" data-label="{esc_label}" onclick="openModelEditor(this)">✏️ 编辑模型</button>'
     )
+    prune_toggle = ""
+    if can_prune:
+        prune_toggle = (
+            f'<button class="model-prune-btn" data-label="{esc_label}" onclick="pruneModels(this)" '
+            f'title="对照上游最新模型列表，删除已下线的过期模型（同步配置与内存）">'
+            f'🧹 清理过期模型</button>'
+        )
     return (
         f'{table_html}'
         f'<div class="model-ops">'
         f'  {edit_toggle}'
+        f'  {prune_toggle}'
         f'</div>'
         f'<div class="model-msg" data-label="{esc_label}"></div>'
     )
@@ -5258,7 +5670,8 @@ def _model_details_html(models, model_stats=None, label=None, edit_mode=False):
 
 def _build_card_html(name, note, kind_badge, status_badge, status_badge_class,
                      kv_items, stats_detail=None, models=None, model_stats=None, description="",
-                     accent_class="", raw_html="", label=None, port=None, meta_badges=None):
+                     accent_class="", raw_html="", label=None, port=None, meta_badges=None,
+                     can_prune=False):
     """统一卡片渲染（手风琴折叠）：透传目标和定制服务用同一套视觉风格。
 
     stats_detail: dict with total/ok/err/translated/success_rate/uptime
@@ -5266,9 +5679,10 @@ def _build_card_html(name, note, kind_badge, status_badge, status_badge_class,
     label: target label，传递给模型编辑组件；None 时不显示编辑按钮
     port: 端口号，显示在卡片头
     meta_badges: 额外的分类标签列表 [("文本", "样式类"), ...]，如 [("破解", "b-crack"), ("免费", "b-free")...]
+    can_prune: 上游是否支持 /models 清理（copilot 系 true；codebuddy/qclaw/trae-work false 不显示清理按钮）
     """
     # ── 卡片头 badges（分类 badge 带图标点 + 渐变底；状态 badge 带状态点）──
-    kind_badge_class = {"破解·质量高": "b-crack", "免费·不破解": "b-free", "收费·不破解": "b-paid"}.get(str(kind_badge), "b-generic")
+    kind_badge_class = {"破解": "b-crack", "免费": "b-free", "收费": "b-paid"}.get(str(kind_badge), "b-generic")
     badges = f'<span class="badge {kind_badge_class}"><span class="badge-dot"></span>{_html_escape(str(kind_badge))}</span>'
     # 元数据标签：破解/非破解、免费/收费、稳定性
     for meta_text, meta_cls in (meta_badges or []):
@@ -5288,8 +5702,12 @@ def _build_card_html(name, note, kind_badge, status_badge, status_badge_class,
 
     # ── 卡片头 HTML ──
     port_str = f'<span class="ct-port">:{port}</span>' if port else ''
+    # 启动状态灯：绿=运行中/红=离线/黄=未监听，带呼吸动画
+    lamp_cls = {"blue": "on", "green": "on", "purple": "on", "orange": "on", "red": "off", "gray": "idle", "yellow": "idle"}.get(str(status_badge_class), "idle")
+    lamp = f'<span class="ct-lamp {lamp_cls}" title="{_html_escape(str(status_badge))}"></span>'
     header_html = (
         f'<div class="card-toggle" role="button" tabindex="0" aria-expanded="false">'
+        f'  {lamp}'
         f'  <span class="ct-name">{_html_escape(name)}</span>{port_str}'
         f'  <span class="badge-group">{badges}</span>'
         f'{summary}'
@@ -5341,7 +5759,7 @@ def _build_card_html(name, note, kind_badge, status_badge, status_badge_class,
             f'</div>'
         )
 
-    model_html = _model_details_html(models, model_stats, label, edit_mode=False) if models is not None else ""
+    model_html = _model_details_html(models, model_stats, label, edit_mode=False, can_prune=can_prune) if models is not None else ""
     card_class = f'card {accent_class}'.strip()
 
     return f"""<div class="{card_class}" data-label="{_html_escape(label or '')}">
@@ -5425,6 +5843,60 @@ async def api_update_target(label: str, update: TargetUpdate):
     return {"ok": True, "label": label}
 
 
+@app.post("/api/targets/{label}/prune-models")
+async def api_prune_models(label: str):
+    """清理过期模型：拉取下游最新模型列表，删除 targets.json 中不在最新列表的模型。
+
+    对照最新模型列表（_fetch_live_models 优先，失败则返回 422），把配置中
+    「最新列表不存在」的模型从 targets.json 移除并热重载（含内存 _TARGETS）。
+    返回删除的模型列表。
+    """
+    target = next((t for t in _TARGETS if t["label"] == label), None)
+    if target is None:
+        raise HTTPException(status_code=404, detail=f"target '{label}' 不存在")
+    live = await _fetch_live_models(target)
+    if not live:
+        raise HTTPException(status_code=422, detail="无法拉取下游最新模型列表（上游不可达），无法清理")
+    live_set = set(live)
+    cfg = _cfg.load_targets()
+    cfg_target = next((t for t in cfg["targets"] if t["label"] == label), None)
+    if cfg_target is None:
+        raise HTTPException(status_code=404, detail=f"target '{label}' 不存在")
+    # modelMapping 保护：映射目标在上游存在则保留对应模型；上游不存在的映射目标
+    # 不能保留（会映射到死模型导致请求失败），把映射修正为上游存在的同族模型。
+    mm = cfg_target.get("modelMapping") or {}
+    # 映射目标 → 上游存在性
+    for role, target_model in list(mm.items()):
+        if target_model and target_model not in live_set:
+            # 尝试同族回退：把 role 映射到上游存在的模型（优先 sonnet/haiku 等稳定模型）
+            fallback = None
+            if "haiku" in role and any("haiku" in m for m in live_set):
+                fallback = next((m for m in live_set if "haiku" in m), None)
+            elif any("sonnet" in m for m in live_set):
+                fallback = next((m for m in live_set if "sonnet" in m), None)
+            if fallback:
+                mm[role] = fallback
+    removed = []
+    kept = []
+    for m in cfg_target.get("models", []):
+        mid = m.get("id") if isinstance(m, dict) else str(m)
+        if mid and mid in live_set:
+            kept.append(m)
+        elif mid and mid in set(mm.values()):
+            # 修正后的映射目标：保留（上游存在）
+            kept.append(m)
+        else:
+            removed.append(mid)
+    if removed:
+        cfg_target["models"] = kept
+        errors = _cfg.validate_targets(cfg)
+        if errors:
+            raise HTTPException(status_code=422, detail=errors)
+        _cfg.save_targets(cfg)
+        await _reload_targets()
+    return {"ok": True, "label": label, "removed": removed, "keptCount": len(kept)}
+
+
 class SecretUpdate(BaseModel):
     value: str = ""
 
@@ -5447,6 +5919,97 @@ async def api_update_secret(label: str, update: SecretUpdate):
     _cfg.save_secrets(secrets)
     _refresh_secrets()
     return {"ok": True, "label": label, "secretRef": ref, "secretSet": bool(update.value)}
+
+
+class SecretBulkUpdate(BaseModel):
+    """批量导入私密数据（破解网关多字段：token/refreshToken/userId 等）。"""
+    data: Dict[str, str] = Field(default_factory=dict)
+
+
+@app.put("/api/secrets/{label}/bulk")
+async def api_update_secret_bulk(label: str, update: SecretBulkUpdate):
+    """批量导入破解网关凭据（dashboard 表单/JSON 双模式提交），按 schema 校验。
+
+    校验规则（来自 crack_common.CREDENTIAL_SCHEMAS）：
+      - 字段映射：原始名（token/refreshToken/...）→ secrets 名，或直接 secrets 名
+      - pattern 校验：字段定义了正则则必须匹配，否则 422
+      - 未知字段：报错（避免"保存了但没生效"的困惑）
+      - 只读字段（readonlyFields）：忽略不写入
+    """
+    import re as _re
+    target = next((t for t in _TARGETS if t["label"] == label), None)
+    if target is None:
+        raise HTTPException(status_code=404, detail=f"target '{label}' 不存在")
+    schema = crack_common.CREDENTIAL_SCHEMAS.get(label) if crack_common else None
+    if schema is None:
+        raise HTTPException(status_code=422, detail=f"网关 '{label}' 无凭据 schema")
+
+    field_keys = {f["key"] for f in schema["fields"]}
+    import_mapping = schema.get("jsonImportMapping", {})
+    readonly = set(schema.get("readonlyFields", []))
+    patterns = {f["key"]: f.get("pattern") for f in schema["fields"]}
+    required_keys = {f["key"] for f in schema["fields"] if f.get("required")}
+
+    secrets = _cfg.load_secrets()
+    errors: list[str] = []
+    count = 0
+    for k, v in update.data.items():
+        if not isinstance(v, str) or not v.strip():
+            continue
+        v = v.strip()
+        # 字段映射：直接 secrets 名，或原始名 → secrets 名
+        secret_key = k if k in field_keys else import_mapping.get(k)
+        if secret_key is None:
+            errors.append(f"未知字段 '{k}'（该网关 schema 无此字段）")
+            continue
+        if secret_key in readonly:
+            continue  # 只读字段（查询结果）忽略
+        pat = patterns.get(secret_key)
+        if pat:
+            try:
+                if not _re.match(pat, v):
+                    errors.append(f"字段 '{secret_key}' 格式不符")
+                    continue
+            except _re.error:
+                pass  # pattern 非法则跳过校验
+        secrets[secret_key] = v
+        count += 1
+
+    if errors:
+        raise HTTPException(status_code=422, detail="; ".join(errors))
+    if count == 0:
+        raise HTTPException(status_code=422, detail="未识别到有效字段（token/refreshToken 等）")
+    _cfg.save_secrets(secrets)
+    _refresh_secrets()
+    # 判定主 token 是否已配置（优先必填字段第一个）
+    main_key = next(iter(sorted(required_keys)), f"{label.replace('-', '_')}_token")
+    return {"ok": True, "label": label, "imported": count, "secretSet": bool(secrets.get(main_key))}
+
+
+@app.get("/api/crack/{label}/status")
+async def api_crack_status(label: str):
+    """破解网关状态查询：额度明细（含过期时间）+ 签到状态 + token 有效期。
+
+    由 crack_common.CRACK_STATUS_HANDLERS 按 label 分发（trae-work 已实现，
+    codebuddy/qclaw 待接入）。
+    """
+    if crack_common is None:
+        raise HTTPException(status_code=503, detail="crack_common 模块不可用")
+    target = next((t for t in _TARGETS if t["label"] == label), None)
+    if target is None:
+        raise HTTPException(status_code=404, detail=f"target '{label}' 不存在")
+    return crack_common.get_crack_status(label, _SECRETS)
+
+
+@app.get("/api/crack/{label}/schema")
+async def api_crack_schema(label: str):
+    """返回该网关的凭据 schema（供 dashboard 凭据弹窗动态渲染表单）。"""
+    if crack_common is None:
+        raise HTTPException(status_code=503, detail="crack_common 模块不可用")
+    schema = crack_common.CREDENTIAL_SCHEMAS.get(label)
+    if schema is None:
+        raise HTTPException(status_code=404, detail=f"网关 '{label}' 无凭据 schema")
+    return schema
 
 
 @app.post("/api/targets/{label}/recrack")
@@ -5613,6 +6176,8 @@ async def dashboard():
     # ── 总览数据 ──
     total_requests_all = sum(r["total"] for r in results if r["alive"])
     alive_ports = sum(1 for r in results if r["alive"])
+    alive_rate = round(alive_ports / len(results) * 100) if results else 0
+    _alive_color = "#34d399" if alive_rate == 100 else ("#fbbf24" if alive_rate >= 50 else "#f87171")
 
     # ── 局域网 IP（可粘贴 base_url 用）──
     _lan_ip = _get_lan_ip()
@@ -5662,19 +6227,23 @@ async def dashboard():
             except Exception:
                 r = {"label": t["label"], "listenPort": port, "upstream": "?", "models": [], "total": 0, "ok": 0, "translated": 0, "err": 0, "alive": False, "startedAt": "", "modelStats": {}}
         category = t.get("category", "free")
-        badge_map = {"crack": "破解·质量高", "free": "免费·不破解", "paid": "收费·不破解"}
+        badge_map = {"crack": "破解", "free": "免费", "paid": "收费"}
         badge_class_map = {"crack": "blue", "free": "green", "paid": "orange"}
-        # ── 模型标签分类：破解/非破解 · 免费/收费（破解都免费）· 稳定性（破解/收费高，免费低）──
+        # ── 模型标签分类：破解/非破解 · 免费/收费（破解默认免费，可被 isFree 覆盖）· 稳定性（破解/收费高，免费低）──
         is_crack = category == "crack"
-        is_free = category != "paid"
+        # 显式设置 isFree 时以配置为准（如企业版 Copilot isFree=false → 收费）；
+        # 未设置时按 category 推断：paid=收费，其余免费
+        is_free = t.get("isFree") if t.get("isFree") is not None else (category != "paid")
         is_stable = category in ("crack", "paid")  # 破解与收费服务稳定性高
+        # 元数据标签：kind_badge 已显示"破解/免费/收费"，这里只保留稳定性 + 协议，避免语义重复
         meta_badges = [
-            ("破解" if is_crack else "非破解", "b-meta-crack" if is_crack else "b-meta-normal"),
-            ("免费" if is_free else "收费", "b-meta-free" if is_free else "b-meta-paid"),
             ("稳定性高" if is_stable else "稳定性低", "b-meta-stable" if is_stable else "b-meta-unstable"),
         ]
+        # 协议标签：gemini-native 是 OpenAI↔Gemini 转换；其余 target（crack/透传/trae-work）客户端均走 OpenAI 协议
         if t.get("handler") == "gemini-native":
-            meta_badges.append(("gemini 协议", "b-meta-gemini"))
+            meta_badges.append(("OpenAI↔Gemini", "b-meta-gemini"))
+        else:
+            meta_badges.append(("OpenAI 协议", "b-meta-oa"))
         secret = _cfg.resolve_secret(t, _SECRETS)
         # 可粘贴 base_url：局域网 IP + 本机端口 + 后缀（客户端直接可用）
         # - crack 类：我们自己定义 base_url 规范，客户端统一 /v1，代理内部映射到下游
@@ -5713,23 +6282,49 @@ async def dashboard():
         token_status = "✅ 已配置 " + _cfg.mask_secret(secret) if secret else "⚠️ 缺失"
         input_placeholder = "已配置，输入新值覆盖" if secret else "填写 " + (sec_ref or "token")
         input_value = "******" if secret else ""
-        token_edit = (
-            f'<div class="token-edit" id="te-{port}">'
-            f'  <div class="te-status">token: {token_status}</div>'
-            f'  <div class="te-row">'
-            f'    <input type="password" class="te-input" data-label="{esc_label}" data-ref="{sec_ref}"'
-            f'           placeholder="{input_placeholder}" value="{input_value}">'
-            f'    <button class="te-save" onclick="saveCardToken(\'{esc_label}\', this)">保存</button>'
-            f'    {recrack_btn}'
-            f'  </div>'
-            f'</div>'
-        )
+        # 破解网关扩展：凭据管理按钮 + 额度/签到状态展示容器
+        crack_status_html = ""
+        is_crack = t.get('category') == 'crack'
+        if is_crack:
+            crack_status_html = (
+                f'<div class="crack-status" id="cs-{port}" data-label="{esc_label}" '
+                f'data-ref="{sec_ref}">'
+                f'  <div class="cs-loading">状态加载中…</div>'
+                f'</div>'
+            )
+        if is_crack:
+            # crack 类：统一凭据弹窗（schema 驱动），无内联 password 输入
+            token_edit = (
+                f'<div class="token-edit" id="te-{port}">'
+                f'  <div class="te-status">凭据: {token_status}</div>'
+                f'  <div class="te-row">'
+                f'    <button class="te-cred-btn" onclick="openCredentialModal(\'{esc_label}\', this)">'
+                f'      凭据管理</button>'
+                f'    {recrack_btn}'
+                f'  </div>'
+                f'  {crack_status_html}'
+                f'</div>'
+            )
+        else:
+            # free/paid 类：保留单字段 token 编辑
+            token_edit = (
+                f'<div class="token-edit" id="te-{port}">'
+                f'  <div class="te-status">token: {token_status}</div>'
+                f'  <div class="te-row">'
+                f'    <input type="password" class="te-input" data-label="{esc_label}" data-ref="{sec_ref}"'
+                f'           placeholder="{input_placeholder}" value="{input_value}">'
+                f'    <button class="te-save" onclick="saveCardToken(\'{esc_label}\', this)">保存</button>'
+                f'    {recrack_btn}'
+                f'  </div>'
+                f'  {crack_status_html}'
+                f'</div>'
+            )
 
         card = _build_card_html(
-            name=f"{t['label']} ({port})",
+            name=f"{t['label']}",
             note="统一透传引擎 · targets.json 驱动",
             kind_badge=badge_map.get(category, category),
-            status_badge=f"{r['total']} 请求" if r["alive"] else ("未监听" if t.get("enabled") is False else "离线"),
+            status_badge="运行中" if r["alive"] else ("未监听" if t.get("enabled") is False else "离线"),
             status_badge_class=badge_class_map.get(category, "gray") if r["alive"] else "red",
             kv_items=kv,
             models=t.get("models", []),
@@ -5741,6 +6336,7 @@ async def dashboard():
             label=t["label"],
             port=port,
             meta_badges=meta_badges,
+            can_prune=(t.get("handler") == "copilot"),
         )
         if category == "crack":
             crack_cards.append(card)
@@ -5780,16 +6376,35 @@ async def dashboard():
   <h1>🔀 LLM Gateway — 管理总览</h1>
   <div class="sub">8081 Anthropic (FastAPI) → 8082 copilot (透传) → 上游 · 统一 targets.json 驱动 <span class="refresh-time">· 手动刷新 · {datetime.now().strftime("%H:%M:%S")}</span></div>
   <div class="overview-bar">
-    <div>共 <b>{len(results)}</b> 个服务</div>
-    <div class="divider"></div>
-    <div>累计 <b>{total_requests_all}</b> 请求</div>
-    <div class="divider"></div>
-    <div>存活端口 <b>{alive_ports}</b> / {len(results)}</div>
-    <div class="divider"></div>
-    <div>{overview_dots} {" ".join(str(p) for p in _dash_ports)}</div>
-    <div class="divider"></div>
-    <button class="ov-btn" onclick="doReload()">♻️ 重载配置</button>
-    <button class="ov-btn ov-btn-primary" onclick="location.reload()">🔄 刷新状态</button>
+    <div class="kpi-grid">
+      <div class="kpi-card">
+        <span class="kpi-label">服务总数</span>
+        <span class="kpi-value">{len(results)}</span>
+        <span class="kpi-sub">enabled targets</span>
+      </div>
+      <div class="kpi-card">
+        <span class="kpi-label">累计请求</span>
+        <span class="kpi-value">{total_requests_all}</span>
+        <span class="kpi-sub">所有存活端口</span>
+      </div>
+      <div class="kpi-card">
+        <span class="kpi-label">存活端口</span>
+        <span class="kpi-value">{alive_ports}<small>/{len(results)}</small></span>
+        <span class="kpi-sub">在线 / 全部端口</span>
+      </div>
+      <div class="kpi-card">
+        <span class="kpi-label">在线率</span>
+        <span class="kpi-value accent">{alive_rate}%</span>
+        <span class="kpi-sub"><span class="kpi-dot" style="background:{_alive_color}; box-shadow:0 0 6px {_alive_color};"></span>运行健康度</span>
+      </div>
+    </div>
+    <div class="ov-side">
+      <div class="ov-dots">{overview_dots}</div>
+      <div class="ov-actions">
+        <button class="ov-btn" onclick="doReload()">♻️ 重载配置</button>
+        <button class="ov-btn ov-btn-primary" onclick="location.reload()">🔄 刷新状态</button>
+      </div>
+    </div>
     <span id="ov-msg" class="ov-msg" role="status"></span>
   </div>
   {cards_html}
@@ -5869,6 +6484,39 @@ async function openModelEditor(btn) {{
 function closeModelEditor() {{
   var overlay = document.getElementById('model-modal');
   if (overlay) overlay.classList.remove('open');
+}}
+
+// ── 清理过期模型：对照上游最新列表，删除已下线模型（配置 + 内存）──
+async function pruneModels(btn) {{
+  var label = btn.dataset.label;
+  var msgEl = document.querySelector('.model-msg[data-label="' + label + '"]');
+  btn.disabled = true;
+  btn.textContent = '清理中...';
+  var show = function(t, cls) {{
+    if (msgEl) {{ msgEl.textContent = t; msgEl.className = 'model-msg ' + (cls || ''); }}
+  }};
+  try {{
+    var resp = await fetch('/api/targets/' + encodeURIComponent(label) + '/prune-models', {{method: 'POST'}});
+    var r = await resp.json();
+    if (resp.ok) {{
+      if (r.removed && r.removed.length) {{
+        show('✅ 已删除 ' + r.removed.length + ' 个过期模型: ' + r.removed.join(', '), 'ok');
+        setTimeout(function() {{ location.reload(); }}, 1200);
+      }} else {{
+        show('✅ 无过期模型（全部与上游一致，共 ' + r.keptCount + ' 个）', 'ok');
+        btn.disabled = false;
+        btn.textContent = '🧹 清理过期模型';
+      }}
+    }} else {{
+      show('❌ ' + (r.detail || JSON.stringify(r)), 'err');
+      btn.disabled = false;
+      btn.textContent = '🧹 清理过期模型';
+    }}
+  }} catch (e) {{
+    show('❌ 请求异常: ' + e, 'err');
+    btn.disabled = false;
+    btn.textContent = '🧹 清理过期模型';
+  }}
 }}
 
 // 点击遮罩关闭
@@ -6086,6 +6734,224 @@ async function doReload() {{
 
 // ── 初始化 ──
 bindModelEvents();
+
+// ── 破解网关：凭据管理弹窗（schema 驱动，表单/JSON 双模式）──
+var credModal = null;
+var credSchema = null;
+var credLabel = '';
+
+async function openCredentialModal(label, btn) {{
+  credLabel = label;
+  if (!credModal) {{
+    var div = document.createElement('div');
+    div.className = 'cred-modal';
+    div.innerHTML =
+      '<div class="cred-box">' +
+      '  <div class="cred-head">' +
+      '    <h3 id="cred-title">凭据管理</h3>' +
+      '    <button class="cred-close" onclick="closeCredModal()">×</button>' +
+      '  </div>' +
+      '  <div class="cred-tabs">' +
+      '    <button class="cred-tab active" data-mode="form" onclick="switchCredTab(&quot;form&quot;)">表单</button>' +
+      '    <button class="cred-tab" data-mode="json" onclick="switchCredTab(&quot;json&quot;)">JSON</button>' +
+      '  </div>' +
+      '  <div class="cred-body">' +
+      '    <div id="cred-form" class="cred-pane active"></div>' +
+      '    <div id="cred-json" class="cred-pane" style="display:none">' +
+      '      <p class="cred-hint" id="cred-json-hint"></p>' +
+      '      <textarea id="cred-json-input" placeholder="粘贴 JSON 凭据..."></textarea>' +
+      '    </div>' +
+      '  </div>' +
+      '  <div class="cred-foot">' +
+      '    <div class="cred-msg" id="cred-msg"></div>' +
+      '    <button class="cred-cancel" onclick="closeCredModal()">取消</button>' +
+      '    <button class="cred-save" onclick="submitCredential()">保存</button>' +
+      '  </div>' +
+      '</div>';
+    div.addEventListener('click', function(e) {{ if (e.target === div) closeCredModal(); }});
+    document.body.appendChild(div);
+    credModal = div;
+  }}
+  document.getElementById('cred-msg').textContent = '';
+  document.getElementById('cred-json-input').value = '';
+  showCredMsg('加载中...', '');
+  try {{
+    var resp = await fetch('/api/crack/' + label + '/schema');
+    if (!resp.ok) {{ showCredMsg('获取 schema 失败: HTTP ' + resp.status, 'err'); return; }}
+    credSchema = await resp.json();
+    document.getElementById('cred-title').textContent = '凭据 · ' + (credSchema.displayName || label);
+    // 渲染表单
+    var formHtml = '';
+    credSchema.fields.forEach(function(f) {{
+      var masked = (f.type === 'password') ? '留空则不修改' : '可选';
+      formHtml += '<div class="cred-field">' +
+        '<label>' + f.label + (f.required ? ' <span class="cred-req">*</span>' : '') + '</label>' +
+        '<input type="' + f.type + '" data-key="' + f.key + '"' +
+        '       placeholder="' + (f.placeholder || masked) + '">' +
+        '<span class="cred-hint">' + (f.hint || '') + '</span>' +
+        '<span class="cred-field-err"></span>' +
+        '</div>';
+    }});
+    if (credSchema.readonlyFields && credSchema.readonlyFields.length) {{
+      formHtml += '<div class="cred-readonly">只读字段（查询结果，不需手动填写）: ' +
+        credSchema.readonlyFields.join(', ') + '</div>';
+    }}
+    document.getElementById('cred-form').innerHTML = formHtml;
+    // JSON 模式提示
+    var jsonHint = '粘贴 JSON，支持字段: ' + credSchema.fields.map(function(f){{return f.key}}).join(' / ');
+    var rawKeys = Object.keys(credSchema.jsonImportMapping || {{}});
+    if (rawKeys.length) jsonHint += '（或原始命名: ' + rawKeys.join(' / ') + '）';
+    document.getElementById('cred-json-hint').textContent = jsonHint;
+    showCredMsg('', '');
+    credModal.classList.add('open');
+    switchCredTab('form');
+  }} catch (e) {{
+    showCredMsg('加载异常: ' + e, 'err');
+  }}
+}}
+
+function switchCredTab(mode) {{
+  document.querySelectorAll('.cred-tab').forEach(function(b) {{
+    b.classList.toggle('active', b.dataset.mode === mode);
+  }});
+  document.getElementById('cred-form').style.display = (mode === 'form') ? '' : 'none';
+  document.getElementById('cred-json').style.display = (mode === 'json') ? '' : 'none';
+}}
+
+function closeCredModal() {{
+  if (credModal) credModal.classList.remove('open');
+}}
+
+function showCredMsg(text, kind) {{
+  var el = document.getElementById('cred-msg');
+  if (!el) return;
+  el.textContent = text;
+  el.className = 'cred-msg' + (kind ? ' ' + kind : '');
+}}
+
+async function submitCredential() {{
+  if (!credSchema || !credLabel) return;
+  var activeMode = document.querySelector('.cred-tab.active').dataset.mode;
+  var data = {{}};
+  if (activeMode === 'form') {{
+    var errors = [];
+    credSchema.fields.forEach(function(f) {{
+      var input = document.querySelector('#cred-form input[data-key="' + f.key + '"]');
+      if (!input) return;
+      var val = (input.value || '').trim();
+      if (!val) return;  // 留空 = 不修改
+      if (f.pattern) {{
+        try {{
+          var re = new RegExp(f.pattern);
+          if (!re.test(val)) {{
+            input.closest('.cred-field').querySelector('.cred-field-err').textContent = '格式不符';
+            errors.push(f.label + ' 格式不符');
+            return;
+          }}
+        }} catch (e) {{}}
+      }}
+      input.closest('.cred-field').querySelector('.cred-field-err').textContent = '';
+      data[f.key] = val;
+    }});
+    if (errors.length) {{ showCredMsg(errors.join('; '), 'err'); return; }}
+    if (Object.keys(data).length === 0) {{ showCredMsg('没有填写任何字段（留空 = 不修改）', 'warn'); return; }}
+  }} else {{
+    var raw = document.getElementById('cred-json-input').value.trim();
+    if (!raw) {{ showCredMsg('请输入 JSON', 'err'); return; }}
+    try {{ data = JSON.parse(raw); }}
+    catch (e) {{ showCredMsg('JSON 解析失败: ' + e.message, 'err'); return; }}
+    if (typeof data !== 'object' || Array.isArray(data)) {{ showCredMsg('JSON 必须是对象', 'err'); return; }}
+  }}
+  showCredMsg('保存中...', '');
+  try {{
+    var resp = await fetch('/api/secrets/' + credLabel + '/bulk', {{
+      method: 'PUT',
+      headers: {{'Content-Type': 'application/json'}},
+      body: JSON.stringify({{data: data}})
+    }});
+    var r = await resp.json();
+    if (resp.ok) {{
+      showCredMsg('✅ 已保存 ' + (r.imported || 0) + ' 个字段', 'ok');
+      setTimeout(function() {{ closeCredModal(); location.reload(); }}, 800);
+    }} else {{
+      showCredMsg('保存失败: ' + (r.detail || JSON.stringify(r)), 'err');
+    }}
+  }} catch (e) {{
+    showCredMsg('请求异常: ' + e, 'err');
+  }}
+}}
+
+// ── 破解网关：额度/签到状态加载 ──
+function loadCrackStatus(label, el) {{
+  if (!el || !label) return;
+  fetch('/api/crack/' + label + '/status')
+    .then(function(resp) {{ return resp.json(); }})
+    .then(function(r) {{
+      if (!r.supported) {{
+        el.innerHTML = '<div class="cs-err">该破解网关未接入状态查询</div>';
+        return;
+      }}
+      if (!r.configured) {{
+        el.innerHTML = '<div class="cs-err">凭据未配置，无法查询状态</div>';
+        return;
+      }}
+      if (r.error) {{
+        el.innerHTML = '<div class="cs-err">状态查询失败: ' + r.error + '</div>';
+        return;
+      }}
+      var caps = r.capabilities || {{}};
+      var account = r.account || '—';
+      // 标题：网关名 · 账号（让用户知道是哪个账号登录的）
+      var title = (r.displayName || label) + ' · ' + account;
+      var html = '<div class="cs-head">' + title + '</div>';
+      // 签到行（仅该网关有签到机制时显示）
+      if (caps.hasCheckin && r.checkin) {{
+        var c = r.checkin;
+        var ciText = c.checkedIn
+          ? '✅ 已签' + (c.credits ? ' (+' + c.credits + ')' : '')
+          : '⚠️ 未签';
+        var ciClass = c.checkedIn ? 'cs-checkin-ok' : 'cs-checkin-no';
+        html += '<div class="cs-row"><span class="k">签到</span>' +
+          '<span class="' + ciClass + '">' + ciText + '</span></div>';
+      }}
+      // token 到期（有值才显示）
+      if (r.refresh && r.refresh.tokenExpireAt) {{
+        var exp = r.refresh.tokenExpireAt.replace('T', ' ').slice(0, 16);
+        html += '<div class="cs-row"><span class="k">token 到期</span><span>' + exp + '</span></div>';
+      }}
+      // 最后定时刷新（仅需签到/刷 token 的网关显示）
+      if (caps.hasCheckin || caps.hasRefresh) {{
+        var last = r.lastDailyRun ? r.lastDailyRun.replace('T', ' ').slice(0, 16) : '';
+        html += '<div class="cs-row"><span class="k">最后定时刷新</span>' +
+          (last ? '<span>' + last + '</span>' : '<span class="cs-never">尚未运行</span>') + '</div>';
+      }}
+      // 额度明细
+      if (r.quota && r.quota.length) {{
+        html += '<div class="cs-quota">';
+        r.quota.forEach(function(q) {{
+          if (q.error) {{ html += '<div class="cs-err">' + q.error + '</div>'; return; }}
+          var limit = (q.limit === undefined || q.limit === null) ? '∞' : q.limit;
+          var exp = q.expireAt ? (' · ' + q.expireAt.replace('T', ' ').slice(0, 10)) : '';
+          html += '<div class="cs-qrow"><span class="qname">' + q.name + '</span>' +
+            '<span>' + q.used + ' / ' + limit + '<span class="qexp">' + exp + '</span></span></div>';
+        }});
+        html += '</div>';
+      }}
+      el.innerHTML = html;
+    }})
+    .catch(function(e) {{
+      el.innerHTML = '<div class="cs-err">加载失败: ' + e + '</div>';
+    }});
+}}
+
+// 页面加载后加载所有 crack 卡片的额度/签到状态
+function initCrackStatus() {{
+  document.querySelectorAll('.crack-status').forEach(function(el) {{
+    loadCrackStatus(el.dataset.label, el);
+  }});
+}}
+document.addEventListener('DOMContentLoaded', initCrackStatus);
+setTimeout(initCrackStatus, 300);
 </script>
 </body>
 </html>"""

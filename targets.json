@@ -2,7 +2,7 @@
   "anthropicForwardPort": 8082,
   "targets": [
     {
-      "label": "copilot",
+      "label": "copilot-enterprise",
       "listenPort": 8082,
       "category": "crack",
       "handler": "copilot",
@@ -14,20 +14,130 @@
       "secretRef": "copilot_token",
       "apikeyEnv": "COPILOT_GHE_TOKEN",
       "models": [
+        {
+          "id": "claude-sonnet-4.6",
+          "enabled": true
+        },
+        {
+          "id": "claude-sonnet-5",
+          "enabled": true
+        },
+        {
+          "id": "gemini-3.6-flash",
+          "enabled": true
+        },
+        {
+          "id": "gpt-5.3-codex",
+          "enabled": false
+        },
+        {
+          "id": "gpt-5.4-mini",
+          "enabled": false
+        },
+        {
+          "id": "gpt-5.4",
+          "enabled": false
+        },
+        {
+          "id": "gpt-5.6-luna",
+          "enabled": true
+        },
+        {
+          "id": "gpt-5.6-terra",
+          "enabled": true
+        },
+        {
+          "id": "kimi-k2.7-code",
+          "enabled": true
+        },
+        {
+          "id": "mai-code-1-flash-picker",
+          "enabled": false
+        },
+        {
+          "id": "trajectory-compaction",
+          "enabled": false
+        },
+        {
+          "id": "gpt-5-mini",
+          "enabled": false
+        },
+        {
+          "id": "gpt-4o-mini-2024-07-18",
+          "enabled": false
+        },
+        {
+          "id": "text-embedding-3-small",
+          "enabled": false
+        },
+        {
+          "id": "text-embedding-3-small-inference",
+          "enabled": false
+        },
+        {
+          "id": "claude-haiku-4.5",
+          "enabled": true
+        },
+        {
+          "id": "gpt-4.1-2025-04-14",
+          "enabled": false
+        },
+        {
+          "id": "gpt-3.5-turbo-0613",
+          "enabled": false
+        },
+        {
+          "id": "gpt-4.1",
+          "enabled": false
+        },
+        {
+          "id": "gpt-3.5-turbo",
+          "enabled": false
+        },
+        {
+          "id": "gpt-4o-mini",
+          "enabled": false
+        },
+        {
+          "id": "text-embedding-ada-002",
+          "enabled": false
+        }
+      ],
+      "extraHeaders": {
+        "Copilot-Integration-Id": "copilot-developer-cli"
+      },
+      "modelMapping": {
+        "opus": "claude-sonnet-5",
+        "sonnet": "claude-sonnet-5",
+        "haiku": "claude-haiku-4.5"
+      },
+      "isFree": false,
+      "enabled": true,
+      "name": "copilot-enterprise"
+    },
+    {
+      "label": "copilot",
+      "name": "copilot",
+      "listenPort": 8083,
+      "category": "crack",
+      "handler": "copilot",
+      "targetHost": "api.githubcopilot.com",
+      "targetPort": 443,
+      "targetProtocol": "https",
+      "routePrefix": "",
+      "crackTool": "crack_copilot.py",
+      "secretRef": "copilot_personal_token",
+      "apikeyEnv": "COPILOT_PERSONAL_TOKEN",
+      "models": [
         "claude-opus-4.8",
-        "claude-opus-4.6",
         "claude-sonnet-5",
         "claude-sonnet-4.6",
-        "claude-sonnet-4.5",
-        "claude-opus-4.5",
         "claude-haiku-4.5",
         "gpt-5.5",
         "gpt-5.4",
-        "gpt-5.3-codex",
         "gpt-5-mini",
         "gpt-4.1",
-        "gpt-4o-mini",
-        "gemini-2.5-pro"
+        "gpt-4o-mini"
       ],
       "extraHeaders": {
         "Copilot-Integration-Id": "copilot-developer-cli"
@@ -37,7 +147,7 @@
         "sonnet": "claude-sonnet-5",
         "haiku": "claude-haiku-4.5"
       },
-      "isFree": false,
+      "isFree": true,
       "enabled": true
     },
     {
@@ -71,15 +181,15 @@
         },
         {
           "id": "minimax-m2.5",
-          "enabled": true
+          "enabled": false
         },
         {
           "id": "minimax-m3",
-          "enabled": true
+          "enabled": false
         },
         {
           "id": "minimax-m2.7",
-          "enabled": true
+          "enabled": false
         },
         {
           "id": "glm-5.2",
@@ -87,31 +197,31 @@
         },
         {
           "id": "glm-5.1",
-          "enabled": true
+          "enabled": false
         },
         {
           "id": "glm-5.0",
-          "enabled": true
+          "enabled": false
         },
         {
           "id": "glm-5.0-turbo",
-          "enabled": true
+          "enabled": false
         },
         {
           "id": "glm-5v-turbo",
-          "enabled": true
+          "enabled": false
         },
         {
           "id": "glm-4.7",
-          "enabled": true
+          "enabled": false
         },
         {
           "id": "glm-4.6",
-          "enabled": true
+          "enabled": false
         },
         {
           "id": "glm-4.6v",
-          "enabled": true
+          "enabled": false
         },
         {
           "id": "kimi-k3-1",
@@ -146,7 +256,7 @@
           "enabled": false
         }
       ],
-      "isFree": false,
+      "isFree": true,
       "enabled": true
     },
     {
@@ -162,17 +272,50 @@
       "secretRef": "qclaw_api_key",
       "apikeyEnv": "QCLAW_API_KEY",
       "models": [
-        "modelroute",
-        "pool-hy3-preview",
-        "pool-deepseek-v4-pro",
-        "pool-deepseek-v4-flash",
-        "pool-glm-5.2",
-        "pool-glm-5.2-night",
-        "pool-glm-5.1",
-        "pool-kimi-k2.7-code-highspeed",
-        "pool-kimi-k2.6",
-        "pool-minimax-m3",
-        "pool-minimax-m2.7"
+        {
+          "id": "modelroute",
+          "enabled": true
+        },
+        {
+          "id": "pool-hy3-preview",
+          "enabled": true
+        },
+        {
+          "id": "pool-deepseek-v4-pro",
+          "enabled": true
+        },
+        {
+          "id": "pool-deepseek-v4-flash",
+          "enabled": true
+        },
+        {
+          "id": "pool-glm-5.2",
+          "enabled": true
+        },
+        {
+          "id": "pool-glm-5.2-night",
+          "enabled": true
+        },
+        {
+          "id": "pool-glm-5.1",
+          "enabled": false
+        },
+        {
+          "id": "pool-kimi-k2.7-code-highspeed",
+          "enabled": false
+        },
+        {
+          "id": "pool-kimi-k2.6",
+          "enabled": false
+        },
+        {
+          "id": "pool-minimax-m3",
+          "enabled": false
+        },
+        {
+          "id": "pool-minimax-m2.7",
+          "enabled": false
+        }
       ],
       "modelMapping": {
         "opus": "pool-deepseek-v4-pro",
@@ -184,23 +327,105 @@
         "medium": "low",
         "small": "low"
       },
-      "isFree": false,
+      "isFree": true,
       "enabled": true
     },
     {
       "label": "trae-work",
       "listenPort": 8086,
       "category": "crack",
-      "handler": "passthrough",
-      "targetHost": "",
+      "handler": "trae-work",
+      "targetHost": "trae-api-cn.mchost.guru",
       "targetPort": 443,
       "targetProtocol": "https",
       "routePrefix": "",
       "crackTool": "crack_traework.py",
       "secretRef": "trae_work_token",
-      "models": [],
-      "enabled": false,
-      "isFree": false
+      "models": [
+        {
+          "id": "glm-5.2",
+          "enabled": true
+        },
+        {
+          "id": "glm-5.1",
+          "enabled": false
+        },
+        {
+          "id": "glm-5",
+          "enabled": false
+        },
+        {
+          "id": "glm-4.7",
+          "enabled": false
+        },
+        {
+          "id": "glm-4.6",
+          "enabled": false
+        },
+        {
+          "id": "DeepSeek-V4-Pro",
+          "enabled": true
+        },
+        {
+          "id": "DeepSeek-V4-Flash",
+          "enabled": true
+        },
+        {
+          "id": "Doubao-Seed-2.1-Pro",
+          "enabled": false
+        },
+        {
+          "id": "Doubao-Seed-2.1-Turbo",
+          "enabled": false
+        },
+        {
+          "id": "Doubao-Seed-Code",
+          "enabled": true
+        },
+        {
+          "id": "kimi-k3",
+          "enabled": false
+        },
+        {
+          "id": "kimi-k2.7-code",
+          "enabled": false
+        },
+        {
+          "id": "kimi-k2",
+          "enabled": false
+        },
+        {
+          "id": "minimax-m3",
+          "enabled": false
+        },
+        {
+          "id": "minimax-m2.1",
+          "enabled": false
+        },
+        {
+          "id": "minimax-m2",
+          "enabled": false
+        },
+        {
+          "id": "qwen-3.7-plus",
+          "enabled": false
+        },
+        {
+          "id": "qwen-3.5",
+          "enabled": false
+        },
+        {
+          "id": "qwen3-coder",
+          "enabled": false
+        }
+      ],
+      "enabled": true,
+      "isFree": true,
+      "modelMapping": {
+        "opus": "glm-5.2",
+        "sonnet": "glm-5.1",
+        "haiku": "DeepSeek-V4-Flash"
+      }
     },
     {
       "label": "openrouter",
