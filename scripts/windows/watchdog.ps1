@@ -1,11 +1,12 @@
 # Watchdog：检测代理端口挂掉自动重启
-# 用法：schtasks 每 2 分钟触发 powershell.exe -WindowStyle Hidden -ExecutionPolicy Bypass -File watchdog.ps1
+# 用法：schtasks 每 2 分钟触发 pwsh.exe -WindowStyle Hidden -ExecutionPolicy Bypass -File scripts\windows\watchdog.ps1
 # 检测方式：.NET TcpClient 异步连接，2 秒超时（比 VBS COM 对象可靠）
+# 本文件位于 scripts\windows\，项目根目录 = 本文件所在目录的上级
 
 $ErrorActionPreference = "Stop"
 $port = 8082
 $ip = "127.0.0.1"
-$projectDir = "c:\Users\Administrator\claude-code-proxy-main"
+$projectDir = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
 $logFile = "$projectDir\watchdog.log"
 
 function Log-Msg {
@@ -44,8 +45,8 @@ Log-Msg "[WATCHDOG] proxy down (port $port not listening), restarting..."
 
 # 调用 start_proxy.vbs 重启代理（vbs 隐藏窗口 + 调用 bat）
 # 不能直接 Start-Process bat —— PowerShell Start-Process 调 bat 不工作
-# wscript.exe start_proxy.vbs 是验证过最可靠的启动方式
-Start-Process -FilePath "wscript.exe" -ArgumentList "$projectDir\start_proxy.vbs"
+# wscript.exe start_proxy.vbs 是验证过最可靠的启动方式（与 start_proxy.vbs 同目录）
+Start-Process -FilePath "wscript.exe" -ArgumentList "$PSScriptRoot\start_proxy.vbs"
 
 # 等待 25 秒后再次检测，确认重启成功
 # 代理启动需调用 QClaw 上游做 startup diag，约需 10-15 秒，故等待 25 秒
