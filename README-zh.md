@@ -25,6 +25,7 @@
 - **isFree**：管理界面维护，标记供应商 key 是否免费（重试策略预留字段）
 - **热重载**：`targets.json` / `secrets.json` mtime 轮询（2s），修改后自动生效
 - **base_url 规范**：crack 类与 gemini-native 统一 `/v1`（代理内部映射下游）；free/paid 透传用 `routePrefix`（如 `/api/v1`）
+- **codebuddy 非流式兼容**：上游只接受流式（11101），代理自动把非流式请求转流式聚合为完整 JSON，非流式客户端也可用
 - **管理界面**：`http://127.0.0.1:8081/dashboard`（任意端口 `/dashboard` 也可访问，`/api/*` 自动代理回 8081）
 
 ## 快速启动

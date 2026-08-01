@@ -70,6 +70,7 @@ Add to `~/.claude/settings.json` (any provider — only `targets.json` decides r
 - **热重载**：mtime 轮询（2s），`targets.json` / `secrets.json` 修改后自动生效
 - **base_url 规范**：crack 类与 gemini-native 统一 `/v1`（代理内部映射下游）；free/paid 透传用 `routePrefix`
 - **客户端接入**：`base_url = http://<host>:<port>/v1`（或 `/api/v1`），`api_key = "dummy"`（free/paid 用真实 key）
+- **codebuddy 非流式兼容**：上游只接受流式（11101），代理自动把非流式请求转流式聚合为完整 JSON，非流式客户端也可用
 
 📖 完整架构、targets.json schema、gemini-native 协议转换、路径重写规则 → [docs/architecture.md](docs/architecture.md)
 
