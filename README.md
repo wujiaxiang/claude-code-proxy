@@ -55,10 +55,11 @@ Add to `~/.claude/settings.json` (any provider — only `targets.json` decides r
 | 端口 | 供应商 | 分类 | handler | 协议 |
 |------|--------|------|---------|------|
 | 8081 | anthropic-compatible | — | FastAPI | Anthropic（入口 + dashboard） |
-| 8082 | copilot | crack | copilot | OpenAI |
+| 8082 | copilot-enterprise | crack | copilot | OpenAI（GHE 企业版，收费） |
+| 8083 | copilot | crack | copilot | OpenAI（个人版） |
 | 8084 | codebuddy | crack | passthrough | OpenAI |
 | 8085 | qclaw | crack | qclaw | OpenAI |
-| 8086 | trae-work (预留) | crack | passthrough | OpenAI |
+| 8086 | trae-work | crack | trae-work | OpenAI |
 | 8090 | openrouter | free | passthrough | OpenAI |
 | 8091 | nvidia | free | passthrough | OpenAI |
 | 8092 | gemini | free | **gemini-native** | OpenAI↔Gemini 原生转换 |
@@ -92,6 +93,31 @@ Add to `~/.claude/settings.json` (any provider — only `targets.json` decides r
 
 > **OS 支持**：仅 `crack_copilot.py` 跨平台（需 gh CLI）；`codebuddy`/`qclaw` 仅 Windows 本地破解，其他 OS 下 dashboard 按钮置灰提示。QClaw 可通过 `QCLAW_API_KEY` 环境变量或 dashboard 手动填 key 直连上游。
 
+### 额度/签到状态查询（dashboard 展示）
+
+`crack_*_q.py` 系列模块查询各破解网关的剩余额度/签到状态，dashboard 通过 `GET /api/crack/{label}/status` 统一展示：
+
+| 模块 | 网关 | 查询内容 |
+|------|------|---------|
+| `crack_traework.py`（crack_common） | trae-work | 权益包额度 + 每日签到 |
+| `crack_copilot_q.py` | copilot-enterprise / copilot | quota_snapshots（chat/completions/premium_interactions） |
+| `crack_qclaw_q.py` | qclaw | 积分余额（data/4110）+ 今日剩余 token（data/4075）+ 流水 |
+| `crack_codebuddy_q.py` | codebuddy | 资源包额度（get-user-resource）+ 成长计划任务/连续天数 |
+
+统一入口：`crack_common.CRACK_STATUS_HANDLERS` 注册表 + `get_crack_status(label, secrets)`。
+
+### 统一每日任务（单一 cron）
+
+`crack_daily.py` 是破解网关统一每日调度器（签到/领取奖励/刷新 token），插件化注册：
+
+```
+0 3 * * * /root/shared-workspace/claude-code-proxy/scripts/cron/crack_daily.sh
+```
+
+- 每个网关注册自己的 `daily()` 任务（trae-work 签到、codebuddy 成长任务领取、qclaw/copilot 仅校验 token）
+- **无 key 的网关自动跳过**（按 secrets.json 判断）
+- 日志：`/tmp/crack_daily.log`
+
 📖 详见 [docs/crack-tools.md](docs/crack-tools.md) 与 [QCLAW_19000_GATEWAY_REVERSE.md](QCLAW_19000_GATEWAY_REVERSE.md)
 
 ## Windows Deployment 🪤
@@ -120,3 +146,4 @@ Contributions are welcome! Please feel free to submit a Pull Request. 🎁
 - [DESIGN.md](DESIGN.md) — Dashboard 设计契约
 - [CHANGELOG.md](CHANGELOG.md) — 变更日志
 - [QCLAW_19000_GATEWAY_REVERSE.md](QCLAW_19000_GATEWAY_REVERSE.md) — 19000 网关逆向调研报告
+- [docs/trae-work.md](docs/trae-work.md) — Trae Work 破解与 API 逆向文档（tc 加密、接口规范、签到/额度/续期）

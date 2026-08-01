@@ -3,6 +3,13 @@
 ## [Unreleased]
 
 ### Added
+- **破解网关额度/签到状态查询**（dashboard `GET /api/crack/{label}/status`）：`crack_*_q.py` 模块族 + `crack_common.CRACK_STATUS_HANDLERS` 注册表
+  - `crack_copilot_q.py`：copilot-enterprise（GHE，`api.bmw.ghe.com/copilot_internal/user`）+ copilot 个人版（`api.github.com`，quota_snapshots）
+  - `crack_qclaw_q.py`：QClaw 积分余额（`jprx.m.qq.com/data/4110/forward`）+ 今日 token（4075）+ 流水（4222），认证从 177 提取（userInfo/jwtToken/device-id）
+  - `crack_codebuddy_q.py`：CodeBuddy 资源包额度（`billing/meter/get-user-resource`）+ 成长计划任务/连续天数（`/v2/activity/growth/*`）
+- **8083 个人版 copilot 端口**：上游 `api.githubcopilot.com`，token 从本地 `/root/.copilot/config.json` 破解（`copilot_personal_token`），与 8082 企业账号完全隔离
+- **统一每日任务 `crack_daily.py`**：插件化调度器（DAILY_HANDLERS 注册表），单一 cron 入口 `scripts/cron/crack_daily.sh`（每日 03:00），无 key 网关自动跳过
+- dashboard `isFree` 标签尊重 targets.json 显式配置（crack 类可标记"收费"）
 - 横向扩展多端口架构：一端口一供应商（8082 copilot / 8084 codebuddy / 8085 qclaw / 8086 trae-work 预留 / 8090-8094 免费代理）
 - targets.json 新 schema（category/isFree/handler/crackTool/secretRef/enabled/modelMapping/reasoning）
 - secrets.json 私密 key/token 存储（gitignore，dashboard 热更新）
