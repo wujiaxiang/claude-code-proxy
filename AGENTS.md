@@ -9,9 +9,10 @@
 
 **claude-code-proxy** 是一个 FastAPI 代理服务，让 Anthropic 客户端（如 Claude Code）能用多种后端（OpenAI / Gemini / Anthropic / Copilot Enterprise / QClaw）。
 
-- **主入口**：`server.py`（单文件，~3100 行）
+- **主入口**：`server.py`（单文件，~6000 行）
 - **Python 版本**：3.10+（见 `pyproject.toml`）
 - **依赖**：fastapi, uvicorn, httpx, litellm, python-dotenv, tiktoken, pydantic
+- **配置模块**：`config_store.py`（targets.json 加载/迁移/校验、secrets.json 读写、热重载）
 - **虚拟环境**：`.venv/`（Windows 下用 `.venv\Scripts\python.exe`）
 
 ---
@@ -25,7 +26,7 @@
 | `C:\Users\Administrator\claude-code-proxy-main\` | 项目根 |
 | `.venv\Scripts\python.exe` | 项目专用 Python |
 | `.env` | 配置文件（**gitignored**，含密钥） |
-| `start_proxy.vbs` | 开机自启脚本（隐藏窗口） |
+| `scripts\windows\start_proxy.vbs` | 开机自启脚本（隐藏窗口，动态定位项目根） |
 | `proxy.log` | 运行日志 |
 | 计划任务 `\ClaudeCodeProxy` | 登录时触发 VBS |
 
@@ -39,7 +40,7 @@ Set-Location "c:\Users\Administrator\claude-code-proxy-main"
 
 ### 开机自启
 
-计划任务 `\ClaudeCodeProxy` 在用户登录时调用 `wscript.exe start_proxy.vbs`。VBS 是**纯启动器**，不设任何环境变量——所有配置来自 `.env`。
+计划任务 `\ClaudeCodeProxy` 在用户登录时调用 `wscript.exe scripts\windows\start_proxy.vbs`。VBS 是**纯启动器**，不设任何环境变量——所有配置来自 `.env`。脚本用 `ScriptFullName` 动态定位项目根（`scripts/windows/` 上两级），移动项目目录后只需更新计划任务路径。
 
 修改配置：编辑 `.env` → 重启代理（`Stop-Process -Id <PID>` + 重跑 VBS）。
 
@@ -67,27 +68,29 @@ Set-Location "c:\Users\Administrator\claude-code-proxy-main"
 
 ## 4. API 端点（多端口架构）
 
-| 端口 | 供应商 | 协议 | 用途 |
-|------|--------|------|------|
-| **8081** | Anthropic 入口 + dashboard | FastAPI | `/v1/messages`（Anthropic）/ dashboard 管理界面 / `/api/targets` 等 REST API |
-| **8082** | copilot | OpenAI | `/v1/chat/completions`（透传）+ 由 8081 内部转发 |
-| **8084** | codebuddy | OpenAI | `/v1/chat/completions`（crack 透传） |
-| **8085** | qclaw | OpenAI | `/v1/chat/completions`（qclaw 透传） |
-| **8086** | trae-work (预留) | OpenAI | 暂未启用 |
-| **8090** | openrouter | OpenAI | 免费代理（透传客户端 key） |
-| **8091** | nvidia | OpenAI | 免费代理 |
-| **8092** | gemini-openai | OpenAI | 免费代理 |
-| **8093** | opencode-zen | OpenAI | 免费代理 |
-| **8094** | open-go | OpenAI | 收费代理 |
+| 端口 | 供应商 | 分类 | handler | 协议 | 用途 |
+|------|--------|------|---------|------|------|
+| **8081** | anthropic-compatible | — | FastAPI | Anthropic | `/v1/messages`（Anthropic）/ dashboard 管理界面 / `/api/targets` 等 REST API |
+| **8082** | copilot | crack | copilot | OpenAI | `/v1/chat/completions`（透传）+ 由 8081 内部转发 |
+| **8084** | codebuddy | crack | passthrough | OpenAI | `/v1/chat/completions`（crack 透传） |
+| **8085** | qclaw | crack | qclaw | OpenAI | `/v1/chat/completions`（qclaw 透传） |
+| **8086** | trae-work (预留) | crack | passthrough | OpenAI | 暂未启用 |
+| **8090** | openrouter | free | passthrough | OpenAI | 免费代理（透传客户端 key） |
+| **8091** | nvidia | free | passthrough | OpenAI | 免费代理 |
+| **8092** | gemini | free | **gemini-native** | OpenAI↔Gemini | 原生 Gemini 协议转换（generateContent） |
+| **8093** | opencode-zen | free | passthrough | OpenAI | 免费代理 |
+| **8094** | open-go | paid | passthrough | OpenAI | 收费代理 |
 
 - **配置驱动**：所有 target 由 `targets.json` 定义，无需修改 server.py
 - **分类**：`crack`（破解获取 token）/ `free`（免费透传）/ `paid`（收费透传）
 - **热重载**：mtime 轮询（2s），targets.json / secrets.json 修改后自动生效
+- **base_url 规范**：crack 类与 gemini-native 统一 `/v1`（代理内部映射下游）；free/paid 透传用 `routePrefix`（如 `/api/v1`）
 
 ### 客户端接入
 
-**OpenAI 协议**：`base_url = http://192.168.2.177:8082/v1`，`api_key = "dummy"`（代理不校验）
-**Anthropic 协议**：`base_url = http://192.168.2.177:8081`，`api_key = "dummy"`
+**OpenAI 协议**：`base_url = http://<局域网IP>:8082/v1`，`api_key = "dummy"`（crack 类代理不校验；free/paid 透传用真实 key）
+**Anthropic 协议**：`base_url = http://<局域网IP>:8081`，`api_key = "dummy"`
+> dashboard 卡片详情的 `base_url` 属性直接显示可粘贴地址（局域网 IP + 端口 + 后缀）。
 
 ---
 
@@ -136,24 +139,32 @@ Set-Location "c:\Users\Administrator\claude-code-proxy-main"
 
 ## 6. 代码结构（server.py）
 
+> 行号随版本漂移，以下按**功能模块**描述（实际位置用 `grep` 定位，不建议依赖行号）：
+
 ```
-Line 1-60      模块导入 + load_dotenv() + 常量
-Line 61-156    tiktoken 本地 token 估算
-Line 157-270   日志配置（彩色 + 滚动）
-Line 271-350   httpx 客户端管理 + QClaw body 清理
-Line 351-500   QClaw 透传函数 + OpenAI→Anthropic 转换
-Line 501-600   FastAPI lifespan（启动诊断）+ 异常处理
-Line 601-750   QClaw API Key DPAPI/AES 解密
-Line 751-850   targets.json 配置加载 + 热重载
-Line 851-950   Provider 策略注册（开闭原则）
-Line 951-1050  模型名映射（opus/sonnet/haiku → BIG/MEDIUM/SMALL）
-Line 1051-1350 Pydantic 模型（Anthropic 协议）
-Line 1351-1550 中间件 + 工具函数
-Line 1551-2100 Anthropic ↔ LiteLLM 双向转换
-Line 2101-2400 /v1/chat/completions（透传 + LiteLLM 分流）
-Line 2401-2800 流式响应处理
-Line 2801-3100 /v1/messages（Anthropic 端点）+ dashboard API
-Line 3101-3200 /v1/messages/count_tokens + /v1/models
+模块导入 + load_dotenv() + 常量
+tiktoken 本地 token 估算（QClaw 网关过滤 usage 时注入）
+日志配置（彩色 + 滚动）
+httpx 客户端管理（trust_env=False）+ QClaw body 清理
+QClaw 透传函数 + OpenAI→Anthropic 转换
+FastAPI lifespan（启动诊断 + target 端口启动 + 破解工具自动调用）
+QClaw API Key DPAPI/AES 解密（Windows；其他 OS 提示未实现）
+targets.json 配置加载 + 热重载（config_store.py 负责 schema 校验）
+Provider 策略注册（_PROVIDER_STRATEGIES，开闭原则）
+模型名映射（opus/sonnet/haiku → BIG/MEDIUM/SMALL）
+asyncio target 端口统一转发引擎（_handle_target_request）
+  - /api/*、/dashboard → 代理回 8081 FastAPI
+  - 路径重写（_rewrite_upstream_path：handler 映射 > routePrefix > 原样）
+  - 认证注入（_handler_prepare_headers：crack 注入 secrets / free-paid 透传客户端 key）
+  - 模型级统计（_bump_model_stats）
+  - gemini-native handler（_handle_gemini_native：OpenAI ↔ generateContent 转换）
+中间件（8081 /v1/messages 统计 + 日志）
+Anthropic ↔ LiteLLM 双向转换
+/v1/chat/completions（透传 + LiteLLM 分流）
+流式响应处理
+/v1/messages（Anthropic 端点）+ dashboard API
+dashboard（HTML/CSS/JS 内嵌：分类栏 / 卡片 / 模型编辑弹框 / 总开关 / 搜索）
+/v1/messages/count_tokens + /v1/models
 ```
 
 ### Provider 策略机制
@@ -165,8 +176,9 @@ Line 3101-3200 /v1/messages/count_tokens + /v1/models
 
 ### 透传 vs 翻译
 
-- **透传**（qclaw/openai/copilot/gemini-openai）：`/v1/chat/completions` 直接 httpx 转发，不经 LiteLLM，保留原始请求体
+- **透传**（qclaw/openai/copilot）：`/v1/chat/completions` 直接 httpx 转发，不经 LiteLLM，保留原始请求体
 - **翻译**（anthropic/gemini）：经 LiteLLM 做格式转换和模型映射
+- **gemini-native**（8092）：接受 OpenAI 请求，代理内部转换为 Google 原生 `generateContent` API（见 docs/architecture.md）
 
 ---
 

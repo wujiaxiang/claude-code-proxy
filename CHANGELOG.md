@@ -9,11 +9,25 @@
 - 独立破解工具 crack_qclaw / crack_codebuddy / crack_copilot / crack_traework（统一 CLI）
 - dashboard 管理界面：REST API（/api/targets、/api/secrets、/api/reload、recrack）+ token/isFree 编辑表单
 - 配置热重载：mtime 轮询（2s），端口动态增删，无需重启
+- **gemini-native handler**（8092）：OpenAI ↔ Google 原生 generateContent 协议转换（流式/非流式/工具/image inline_data），替代旧 OpenAI 兼容端点
+- **dashboard 分类栏**：聚合网关（8081）/ 破解网关 / 直连网关 三组，带数量徽标
+- **模型编辑弹框**：modal + iOS 滑动开关 + 总开关（全开/全关/部分开 indeterminate）+ 搜索框 + 编辑态自动拉取下游真实模型列表（失败降级配置）
+- **crackEnv 环境检测**：破解按钮按当前 OS/依赖置灰（非 Windows 的 codebuddy/qclaw 提示"仅支持 Windows，待后续补齐"）
+- **8081 anthropic-compatible 统计**：卡片改名 + `/v1/messages` 请求数与模型级统计（中间件记录）
+- **可粘贴 base_url**：卡片详情显示局域网 IP + 端口 + 后缀（crack/gemini 统一 /v1，free/paid 透传 routePrefix）
+- **Windows 启动脚本子目录化**：scripts/windows/（VBS/BAT/PS1 内部动态定位项目根，不再硬编码路径）
 
 ### Changed
 - 8082 从 PREFERRED_PROVIDER 动态切换改为固定 copilot
 - qclaw 配置从 .env 迁入 targets.json 的 8085 条目
 - 8081 转发目标由 anthropicForwardPort 配置（默认 8082）
+- 8092 gemini-openai → gemini（handler=gemini-native）
+- README 精简为多端口架构视角，Windows 部署坑拆至 docs/windows-deployment.md
+
+### Fixed
+- 模型编辑弹框保存时总开关行（"全部模型"）被误存为模型 —— 前端跳过无子开关行 + 后端 API 防御性过滤
+- qclaw handler 客户端不带 system message 时上游 400 —— asyncio 端口补齐 system 消息（与 FastAPI 路径一致）
+- config_store.py 合法 handler 校验遗漏 gemini-native
 
 ---
 

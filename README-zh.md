@@ -1,169 +1,55 @@
 # Claude Code Proxy
 
 让 Claude Code 通过第三方 API 运行，无需 Anthropic 官方账号。
-**策略模式设计，新增 provider 只需注册一个函数。**
+**多端口架构：每个上游供应商一个独立端口，由 `targets.json` 配置驱动。**
 
 ---
 
-## 支持的 Provider（6 种）
+## 多端口架构 🏗️
 
-| # | Provider | 后端 | 工具 | 说明 |
-|---|----------|------|------|------|
-| 1 | **anthropic** | LiteLLM → DeepSeek/Anthropic | ✅ ⭐ | 原生兼容，最快 |
-| 2 | **gemini** | LiteLLM（`gemini/` 前缀） | ✅ | 内置 thoughtSignature 签名处理 |
-| 3 | **gemini-openai** | httpx → Gemini `/v1beta/openai` | ✅ | Google OpenAI 兼容端点 |
-| 4 | **openai** | LiteLLM → OpenAI/兼容 | ✅ | 通用 |
-| 5 | **qclaw** | httpx/LiteLLM → QClaw 上游直连 | ✅ | 桌面版，自动解密 API Key |
-| 6 | **copilot** | LiteLLM → GitHub Copilot Enterprise | ✅ | 企业账号，双端点，推理文本透传 |
+| 端口 | 供应商 | 分类 | handler | 协议 |
+|------|--------|------|---------|------|
+| 8081 | anthropic-compatible | — | FastAPI | Anthropic（入口 + dashboard） |
+| 8082 | copilot | crack | copilot | OpenAI |
+| 8084 | codebuddy | crack | passthrough | OpenAI |
+| 8085 | qclaw | crack | qclaw | OpenAI |
+| 8086 | trae-work (预留) | crack | passthrough | OpenAI |
+| 8090 | openrouter | free | passthrough | OpenAI |
+| 8091 | nvidia | free | passthrough | OpenAI |
+| 8092 | gemini | free | **gemini-native** | OpenAI↔Gemini 原生转换 |
+| 8093 | opencode-zen | free | passthrough | OpenAI |
+| 8094 | open-go | paid | passthrough | OpenAI |
 
----
+- **统一透传引擎**：所有端口共享 HTTP 解析/转发/429 翻译/重试逻辑，由 `targets.json` 驱动
+- **分类**：`crack`（破解，注入 secrets.json token）/ `free`（免费，透传客户端 key）/ `paid`（收费，透传客户端 key）
+- **isFree**：管理界面维护，标记供应商 key 是否免费（重试策略预留字段）
+- **热重载**：`targets.json` / `secrets.json` mtime 轮询（2s），修改后自动生效
+- **base_url 规范**：crack 类与 gemini-native 统一 `/v1`（代理内部映射下游）；free/paid 透传用 `routePrefix`（如 `/api/v1`）
+- **管理界面**：`http://127.0.0.1:8081/dashboard`（任意端口 `/dashboard` 也可访问，`/api/*` 自动代理回 8081）
 
 ## 快速启动
 
 ```bash
-cd ~/claude-code-proxy
-/usr/bin/python3 -m pip install fastapi uvicorn litellm httpx python-dotenv pydantic
+cd claude-code-proxy
+python3 -m venv .venv && .venv/bin/pip install -r requirements.txt   # 或 uv sync
 
-# 编辑 .env（参考 .env.example）
-# 然后启动：
-PREFERRED_PROVIDER=anthropic /usr/bin/python3 server.py
+# 配置 targets.json（端口/供应商/分类/handler/模型）与 secrets.json（token）
+# .env 仅保留全局配置：DEBUG / LOG_FILE / LOG_RETENTION_DAYS / LOG_ROTATE_WHEN / LOG_ROTATE_INTERVAL
+
+.venv/bin/python server.py   # 启动 8081 + targets.json 定义的全部端口
 ```
 
----
+> 旧版 `PREFERRED_PROVIDER` 单 provider 切换机制已废弃——端口-供应商绑定由 `targets.json` 决定，不再由 `.env` 路由。
 
-## Provider 配置速查
+## 客户端接入
 
-### Anthropic（DeepSeek，推荐）
-```ini
-PREFERRED_PROVIDER=anthropic
-ANTHROPIC_API_KEY=sk-你的Key
-ANTHROPIC_BASE_URL=https://api.deepseek.com/anthropic
-BIG_MODEL=deepseek-v4-pro
-MEDIUM_MODEL=deepseek-v4-flash
-SMALL_MODEL=deepseek-v4-flash
-```
-
-### Gemini 原生
-```ini
-PREFERRED_PROVIDER=gemini
-GEMINI_API_KEY=AIza...
-BIG_MODEL=gemini-2.5-flash
-MEDIUM_MODEL=gemini-3.1-flash-lite
-SMALL_MODEL=gemini-3.1-flash-lite
-```
-
-### Gemini OpenAI 兼容
-```ini
-PREFERRED_PROVIDER=gemini-openai
-GEMINI_API_KEY=AIza...
-GEMINI_BASE_URL=https://generativelanguage.googleapis.com/v1beta/openai
-BIG_MODEL=gemini-2.5-flash
-MEDIUM_MODEL=gemini-3.1-flash-lite
-SMALL_MODEL=gemini-3.1-flash-lite
-```
-
-### OpenAI
-```ini
-PREFERRED_PROVIDER=openai
-OPENAI_API_KEY=sk-你的Key
-BIG_MODEL=gpt-4.1
-MEDIUM_MODEL=gpt-4.1-mini
-SMALL_MODEL=gpt-4.1-mini
-```
-
-### QClaw（上游直连 + 自动解密 API Key）
-
-从 QClaw 桌面客户端本地存储自动解密 API Key，直连腾讯上游 `mmgrcalltoken.3g.qq.com`（OpenAI 兼容接口）。无需 19000 本地网关，无需手动填 Key。
-
-```ini
-PREFERRED_PROVIDER=qclaw
-# API Key 自动从 QClaw 客户端解密，无需手动填写
-# 如需手动指定：QCLAW_API_KEY=sk-xxxxxxxx
-BIG_MODEL=pool-glm-5.2
-MEDIUM_MODEL=pool-deepseek-v4-pro
-SMALL_MODEL=pool-deepseek-v4-flash
-```
-
-**前置条件**：已安装 QClaw 桌面客户端并完成一次登录（保证本地存储中有加密的 API Key）。
-
-**可用模型**（11 个）：
-`modelroute`（Auto）· `pool-deepseek-v4-pro` · `pool-deepseek-v4-flash` · `pool-glm-5.2` · `pool-glm-5.2-night` · `pool-glm-5.1` · `pool-kimi-k2.7-code-highspeed` · `pool-kimi-k2.6` · `pool-minimax-m3` · `pool-minimax-m2.7` · `pool-hy3-preview`
-
-> ⚠️ 上游要求请求必须包含 `system` 消息，代理会自动补全。上游拒绝 `python-httpx` 默认 User-Agent，代理会自动伪装为 `OpenAI/JS 6.39.1`。
-
-### GitHub Copilot Enterprise（企业账号白嫖）
-
-使用 bmw.ghe.com 企业账号 PAT 通过 LiteLLM 调用 Copilot API，**无需任何额外费用**。
-
-```ini
-PREFERRED_PROVIDER=copilot
-COPILOT_GHE_TOKEN=github_pat_11ABNBEOY0...   # gh auth token --hostname bmw.ghe.com
-COPILOT_GHE_HOST=copilot-api.bmw.ghe.com     # 默认值，按实际企业域名修改
-COPILOT_INTEGRATION_ID=copilot-developer-cli  # 默认值，勿修改
-COPILOT_BIG_MODEL=claude-sonnet-4.6           # Opus 系列 → 此模型
-COPILOT_MEDIUM_MODEL=claude-sonnet-4.6        # Sonnet 系列 → 此模型
-COPILOT_SMALL_MODEL=claude-haiku-4.5          # Haiku 系列 → 此模型
-```
-
-**获取 PAT**：
-```bash
-gh auth token --hostname bmw.ghe.com
-```
-
-**可用模型**（企业 Copilot `/models` API 实际返回，2026-07 实测）：
-
-| 分类 | 模型 ID | 上下文窗口 |
-|------|---------|-----------|
-| Claude | `claude-opus-4.8` · `claude-opus-4.6` · `claude-sonnet-5` · `claude-sonnet-4.6` · `claude-sonnet-4.5` · `claude-opus-4.5` · `claude-haiku-4.5` | Copilot 网关限制 200K～264K |
-| GPT | `gpt-5.5` · `gpt-5.4` · `gpt-5.4-mini` · `gpt-5.3-codex` · `gpt-5-mini` · `gpt-4.1` · `gpt-4.1-2025-04-14` · `gpt-4o-mini` · `gpt-4o-mini-2024-07-18` · `gpt-3.5-turbo` · `gpt-3.5-turbo-0613` | — |
-| Gemini | `gemini-2.5-pro` | 128K |
-
-> ⚠️ `gpt-5.4-mini` 在 `/models` 列表中出现，但实际调用 `/chat/completions` 会被拒绝，不建议设为 SMALL_MODEL。
-
-> **上下文窗口**：以上 `max_context_window_tokens` 来自 Copilot 网关 `/models` API 返回值，是网关层面的策略限制，非模型原生能力（如 `claude-opus-4.8` 原生 1M 窗口，网关卡在 264K）。
-
-> **双端点透传**：Copilot 下游原生支持 `/v1/messages` 和 `/chat/completions` 两个端点。proxy 的 `/v1/messages` 走 **httpx 直接透传**下游的 `/v1/messages`，零协议转换，thinking/tool_use/signature 等复杂结构完整保留。`/v1/chat/completions` 同样走 httpx 直接透传下游的 `/chat/completions`。两条链路均绕过 LiteLLM。
-
-**双端点**：所有 provider 均开放两个端点：
-
-| 端点 | 格式 | 适合 | 路由方式 |
-|------|------|------|---------|
-| `:8082/v1/messages` | Anthropic | Claude Code / Cline | copilot→httpx 直连下游 `/v1/messages`；其他→LiteLLM |
-| `:8082/v1/chat/completions` | OpenAI | 任意 Agent / 自定义工具 | qclaw/openai/copilot/gemini-openai→httpx 透传；其他→LiteLLM |
-
-```bash
-# Anthropic 格式（Claude Code 默认）
-curl http://localhost:8082/v1/messages \
-  -H "x-api-key: dummy" -H "anthropic-version: 2023-06-01" \
-  -d '{"model":"claude-sonnet-20241022","messages":[{"role":"user","content":"hi"}],"max_tokens":100}'
-
-# OpenAI 格式（任意 provider 均可用）
-curl http://localhost:8082/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -d '{"model":"claude-sonnet-20241022","messages":[{"role":"user","content":"hi"}]}'
-```
-
----
-
-## 模型映射（3 级梯度）
-
-| Claude Code 请求模型 | 映射到 | 环境变量 |
-|---------------------|--------|---------|
-| Opus 系列 | `BIG_MODEL` | `COPILOT_BIG_MODEL`（copilot 专用） |
-| Sonnet 系列 | `MEDIUM_MODEL` | `COPILOT_MEDIUM_MODEL`（copilot 专用） |
-| Haiku 系列 | `SMALL_MODEL` | `COPILOT_SMALL_MODEL`（copilot 专用） |
-
-基于**子串包含**匹配，短名 `sonnet` / `haiku` / `opus` 也有效。
-
----
-
-## Claude Code 配置
+### Claude Code（Anthropic 协议）
 
 ```json
 // ~/.claude/settings.json
 {
   "env": {
-    "ANTHROPIC_BASE_URL": "http://127.0.0.1:8082",
+    "ANTHROPIC_BASE_URL": "http://127.0.0.1:8081",
     "ANTHROPIC_API_KEY": "dummy",
     "ANTHROPIC_AUTH_TOKEN": "dummy",
     "API_TIMEOUT_MS": "3000000",
@@ -174,18 +60,43 @@ curl http://localhost:8082/v1/chat/completions \
 }
 ```
 
-切换 provider 只需改 `.env` 一行 `PREFERRED_PROVIDER`，Claude Code 配置不用动。
+### OpenAI 兼容客户端
 
----
+```
+base_url = http://<局域网IP>:<端口>/v1     （crack 类 / gemini-native）
+base_url = http://<局域网IP>:<端口>/api/v1  （openrouter 等 free/paid 透传）
+api_key  = dummy（crack 类）；真实 key（free/paid 透传）
+```
+
+> 局域网 IP 与后缀直接显示在 dashboard 卡片详情的 `base_url` 属性，可复制即用。
+
+## Dashboard 管理界面
+
+`http://127.0.0.1:8081/dashboard`：
+
+- **分类栏**：聚合网关（8081）/ 破解网关 / 直连网关 三组，带数量徽标
+- **卡片**：端口强调条 + 请求数 + 流量统计块（成功率/运行时长/进度条）+ 可粘贴 `base_url` + token 编辑
+- **模型编辑弹框**（✏️ 编辑模型）：iOS 滑动开关 + **总开关**（全开/全关/部分开 indeterminate）+ 搜索框 + **编辑态自动拉取下游真实模型列表**（失败降级配置）
+- **8081 自身统计**：`/v1/messages` 请求数与模型级统计
+
+## 模型映射（3 级梯度）
+
+| Claude Code 请求模型 | 映射到 | 配置 |
+|---------------------|--------|------|
+| Opus 系列 | `BIG_MODEL` | `targets.json` 的 `modelMapping.opus` |
+| Sonnet 系列 | `MEDIUM_MODEL` | `modelMapping.sonnet` |
+| Haiku 系列 | `SMALL_MODEL` | `modelMapping.haiku` |
+
+基于**子串包含**匹配，短名 `sonnet` / `haiku` / `opus` 也有效。copilot 使用 `COPILOT_*_MODEL` 环境变量（见 docs/crack-tools.md）。
 
 ## 调试
 
 ```bash
-# 开启详细日志，同时写入文件
-DEBUG=true LOG_FILE=/tmp/proxy.log PREFERRED_PROVIDER=copilot python server.py
+# 开启详细日志
+DEBUG=true python server.py
 
 # 实时跟踪
-tail -f /tmp/proxy.log
+tail -f proxy.log
 ```
 
 | 变量 | 默认 | 说明 |
@@ -197,27 +108,6 @@ tail -f /tmp/proxy.log
 | `LOG_ROTATE_INTERVAL` | `1` | 轮转周期步长 |
 
 ---
-
-## 多端口架构 🏗️
-
-| 端口 | 供应商 | 分类 | handler |
-|------|--------|------|---------|
-| 8081 | Anthropic 入口 + dashboard | — | FastAPI |
-| 8082 | copilot | crack | copilot |
-| 8084 | codebuddy | crack | passthrough |
-| 8085 | claw (QClaw) | crack | qclaw |
-| 8086 | trae-work (预留) | crack | passthrough |
-| 8090 | openrouter | free | passthrough |
-| 8091 | nvidia | free | passthrough |
-| 8092 | gemini-openai | free | passthrough |
-| 8093 | opencode-zen | free | passthrough |
-| 8094 | open-go | paid | passthrough |
-
-- **统一透传引擎**：所有端口共享 HTTP 解析/转发/429 翻译/重试逻辑，由 `targets.json` 驱动
-- **分类**：`crack`（破解，注入 secrets.json token）/ `free`（免费，透传客户端 key）/ `paid`（收费，透传客户端 key）
-- **isFree**：管理界面维护，标记供应商 key 是否免费（重试策略预留字段）
-- **破解工具**：`crack_qclaw.py` / `crack_codebuddy.py` / `crack_copilot.py` / `crack_traework.py`，启动时自动调用，可独立 CLI 运行
-- **管理界面**：`http://127.0.0.1:8081/dashboard` 可编辑 token/isFree，热生效无需重启
 
 ## 测试
 
