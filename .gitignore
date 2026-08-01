@@ -66,3 +66,7 @@ _*/
 
 # 私密 key/token（dashboard 热更新，不入库）
 secrets.json
+
+# AI Agent 运行时状态（会话延续/进度，不入库）
+.omo/
+.superpowers/

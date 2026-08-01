@@ -7,6 +7,7 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 from typing import List, Dict, Any, Optional, Union, Literal
 import httpx
 import os
+import socket
 import base64
 import asyncio
 import struct
@@ -978,18 +979,283 @@ def _handler_prepare_body(target: dict, body_bytes: bytes):
     if target.get("modelMapping"):
         body_json = _apply_model_mapping(target, body_json)
     if handler == "qclaw":
+        # QClaw 网关要求必须有 system message（与 FastAPI 透传路径一致）
+        msgs = body_json.get("messages", [])
+        if not any(m.get("role") == "system" for m in msgs):
+            msgs.insert(0, {"role": "system", "content": "You are Claude, a helpful AI assistant."})
+            body_json["messages"] = msgs
         body_json = _clean_qclaw_body(body_json)
     return json.dumps(body_json, ensure_ascii=False).encode("utf-8"), body_json
 
 
+# ── Gemini 原生协议转换（handler=gemini-native）──
+# 客户端走 OpenAI 协议（/v1/chat/completions），代理内部转换为
+# Google 原生 generateContent / streamGenerateContent 调用。
+_GEMINI_NATIVE_BASE = "https://generativelanguage.googleapis.com/v1beta"
+
+_FINISH_REASON_MAP = {
+    "STOP": "stop",
+    "MAX_TOKENS": "length",
+    "SAFETY": "content_filter",
+    "RECITATION": "content_filter",
+    "BLOCKLIST": "content_filter",
+    "PROHIBITED_CONTENT": "content_filter",
+    "OTHER": "stop",
+}
+
+
+def _openai_to_gemini_body(body: dict) -> dict:
+    """OpenAI chat.completions 请求体 → Gemini generateContent 请求体。"""
+    contents, system_parts = [], []
+    for msg in body.get("messages", []):
+        role = msg.get("role", "user")
+        content = msg.get("content")
+        if role == "system":
+            system_parts.append({"text": content if isinstance(content, str) else json.dumps(content, ensure_ascii=False)})
+            continue
+        parts = []
+        if isinstance(content, str):
+            parts.append({"text": content})
+        elif isinstance(content, list):
+            for block in content:
+                if not isinstance(block, dict):
+                    continue
+                if block.get("type") == "text":
+                    parts.append({"text": block.get("text", "")})
+                elif block.get("type") == "image_url":
+                    img_url = (block.get("image_url") or {}).get("url", "")
+                    if img_url.startswith("data:"):
+                        try:
+                            meta, b64 = img_url[5:].split(",", 1)
+                            mime = meta.split(";")[0] or "image/png"
+                            parts.append({"inline_data": {"mime_type": mime, "data": b64}})
+                        except Exception:
+                            parts.append({"text": "[image]"})
+                    else:
+                        parts.append({"text": "[image: " + img_url[:100] + "]"})
+                elif block.get("type") == "tool_result" or block.get("type") == "tool_use":
+                    t = block.get("content") or block.get("input") or ""
+                    parts.append({"text": json.dumps(block, ensure_ascii=False)[:4000]})
+        gemini_role = "model" if role == "assistant" else "user"
+        contents.append({"role": gemini_role, "parts": parts})
+    out: dict = {"contents": contents}
+    if system_parts:
+        out["systemInstruction"] = {"parts": system_parts}
+    gc: dict = {}
+    if "max_tokens" in body:
+        gc["maxOutputTokens"] = body["max_tokens"]
+    elif "max_completion_tokens" in body:
+        gc["maxOutputTokens"] = body["max_completion_tokens"]
+    if "temperature" in body:
+        gc["temperature"] = body["temperature"]
+    if "top_p" in body:
+        gc["topP"] = body["top_p"]
+    if gc:
+        out["generationConfig"] = gc
+    if body.get("tools"):
+        fds = []
+        for t in body["tools"]:
+            fn = t.get("function", {}) if isinstance(t, dict) else {}
+            fds.append({
+                "name": fn.get("name", ""),
+                "description": fn.get("description", ""),
+                "parameters": fn.get("parameters"),
+            })
+        if fds:
+            out["tools"] = [{"functionDeclarations": fds}]
+    return out
+
+
+def _gemini_to_openai_response(gemini_resp: dict, model: str) -> dict:
+    """Gemini generateContent 响应 → OpenAI chat.completions 响应。"""
+    candidates = gemini_resp.get("candidates", []) or []
+    choices = []
+    for i, c in enumerate(candidates):
+        parts = ((c.get("content") or {}).get("parts", []) or [])
+        text = "".join(p.get("text", "") for p in parts if isinstance(p, dict) and "text" in p)
+        fr = c.get("finishReason", "STOP")
+        choices.append({
+            "index": i,
+            "message": {"role": "assistant", "content": text},
+            "finish_reason": _FINISH_REASON_MAP.get(fr, "stop"),
+        })
+    um = gemini_resp.get("usageMetadata", {}) or {}
+    usage = {
+        "prompt_tokens": um.get("promptTokenCount", 0),
+        "completion_tokens": um.get("candidatesTokenCount", 0),
+        "total_tokens": um.get("totalTokenCount", 0),
+    }
+    return {
+        "id": f"chatcmpl-{uuid.uuid4().hex[:24]}",
+        "object": "chat.completion",
+        "created": int(time.time()),
+        "model": model,
+        "choices": choices,
+        "usage": usage,
+    }
+
+
+def _gemini_chunk_to_openai(gemini_chunk: dict, model: str) -> dict:
+    """Gemini 流式 chunk → OpenAI chat.completion.chunk。"""
+    candidates = gemini_chunk.get("candidates", []) or []
+    if not candidates:
+        return None
+    c = candidates[0]
+    parts = ((c.get("content") or {}).get("parts", []) or [])
+    text = "".join(p.get("text", "") for p in parts if isinstance(p, dict) and "text" in p)
+    fr = c.get("finishReason", "")
+    return {
+        "id": f"chatcmpl-{uuid.uuid4().hex[:24]}",
+        "object": "chat.completion.chunk",
+        "created": int(time.time()),
+        "model": model,
+        "choices": [{
+            "index": 0,
+            "delta": {"role": "assistant", "content": text} if text else {},
+            "finish_reason": _FINISH_REASON_MAP.get(fr) if fr else None,
+        }],
+    }
+
+
+async def _handle_gemini_native(writer, target, method, path, headers, body, stats, label):
+    """Gemini 原生协议代理：OpenAI 请求 → generateContent → OpenAI 响应。
+
+    覆盖 /v1/chat/completions（含流式）与 /v1/models。
+    认证：客户端 x-goog-api-key/Authorization 优先，其次 secrets.json / 环境变量。
+    """
+    import json as _json
+    gemini_key = _cfg.resolve_secret(target, _SECRETS) or os.environ.get("GEMINI_API_KEY", "")
+    api_headers = {"Content-Type": "application/json"}
+    if gemini_key:
+        api_headers["x-goog-api-key"] = gemini_key
+    # 客户端传入的 key 优先（free 类透传场景）
+    for hk in ("x-goog-api-key", "authorization"):
+        if headers.get(hk):
+            api_headers[hk if hk != "authorization" else "x-goog-api-key"] = headers[hk]
+
+    try:
+        # ── /v1/models：原生模型列表 → OpenAI 格式 ──
+        if path == "/v1/models" and method == "GET":
+            async with httpx.AsyncClient(timeout=httpx.Timeout(10.0), trust_env=False) as c:
+                resp = await c.get(f"{_GEMINI_NATIVE_BASE}/models", headers=api_headers)
+                if resp.status_code == 200:
+                    data = resp.json()
+                    models = [
+                        {"id": m["name"].replace("models/", "", 1), "object": "model",
+                         "created": 1700000000, "owned_by": "google"}
+                        for m in (data.get("models", []) or [])
+                        if m.get("name", "").startswith("models/")
+                    ]
+                    payload = _json.dumps({"data": models, "object": "list", "has_more": False}).encode()
+                    writer.write(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: %d\r\n\r\n%s" % (len(payload), payload))
+                    await writer.drain()
+                    writer.close(); return
+                await _write_error_response(writer, resp.status_code, f"Gemini /models upstream HTTP {resp.status_code}"); return
+
+        # ── /v1/chat/completions：转换 + 转发 ──
+        if path == "/v1/chat/completions" and method == "POST":
+            try:
+                body_json = _json.loads(body.decode("utf-8"))
+            except Exception:
+                await _write_error_response(writer, 400, "invalid json"); return
+            model = body_json.get("model", "gemini-2.5-flash")
+            is_stream = bool(body_json.get("stream", False))
+            stats["totalRequests"] += 1
+            _bump_model_stats(label, model, "ok")
+
+            gemini_body = _openai_to_gemini_body(body_json)
+            endpoint = (f"{_GEMINI_NATIVE_BASE}/models/{model}:streamGenerateContent?alt=sse"
+                        if is_stream else f"{_GEMINI_NATIVE_BASE}/models/{model}:generateContent")
+            async with httpx.AsyncClient(timeout=httpx.Timeout(300.0, connect=10.0), trust_env=False) as c:
+                req = c.build_request("POST", endpoint, headers=api_headers,
+                                      content=_json.dumps(gemini_body).encode())
+                resp = await c.send(req, stream=True)
+
+                if resp.status_code >= 400:
+                    resp_body = await resp.aread()
+                    await _write_error_response(writer, resp.status_code,
+                                                f"Gemini upstream HTTP {resp.status_code}: {resp_body.decode('utf-8', errors='replace')[:300]}")
+                    return
+
+                # ── 非流式 ──
+                if not is_stream:
+                    resp_body = await resp.aread()
+                    try:
+                        gemini_json = _json.loads(resp_body.decode("utf-8"))
+                        out = _gemini_to_openai_response(gemini_json, model)
+                    except Exception:
+                        await _write_error_response(writer, 502, "Gemini response parse failed")
+                        return
+                    payload = _json.dumps(out, ensure_ascii=False).encode()
+                    writer.write(f"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {len(payload)}\r\n\r\n".encode())
+                    writer.write(payload)
+                    await writer.drain()
+                    stats["passthroughOk"] += 1
+                    writer.close(); return
+
+                # ── 流式：Gemini SSE → OpenAI SSE ──
+                writer.write(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: keep-alive\r\n\r\n")
+                async for chunk in resp.aiter_bytes():
+                    line = chunk.decode("utf-8", errors="replace")
+                    for raw in line.split("\n"):
+                        raw = raw.strip()
+                        if not raw.startswith("data:"):
+                            continue
+                        data_str = raw[5:].strip()
+                        if not data_str or data_str == "[DONE]":
+                            continue
+                        try:
+                            gemini_chunk = _json.loads(data_str)
+                        except Exception:
+                            continue
+                        oai_chunk = _gemini_chunk_to_openai(gemini_chunk, model)
+                        if oai_chunk:
+                            writer.write(("data: " + _json.dumps(oai_chunk, ensure_ascii=False) + "\n\n").encode())
+                            await writer.drain()
+                writer.write(b"data: [DONE]\n\n")
+                await writer.drain()
+                stats["passthroughOk"] += 1
+                writer.close(); return
+
+        # ── 其他路径：透传原生端点 ──
+        upstream_url = f"{_GEMINI_NATIVE_BASE}{path}"
+        async with httpx.AsyncClient(timeout=httpx.Timeout(60.0, connect=10.0), trust_env=False) as c:
+            req = c.build_request(method, upstream_url, headers=api_headers, content=body if body else None)
+            resp = await c.send(req, stream=True)
+            status, _ = await _write_response(writer, resp, stats=stats)
+            if status and status >= 400:
+                logger.warning(f"[{label}] gemini-native {path} HTTP {status}")
+            return
+    except Exception as e:
+        stats["passthroughError"] += 1
+        logger.exception(f"[{label}] gemini-native proxy exception")
+        try:
+            await _write_error_response(writer, 503, f"Gemini proxy error: {e}")
+        except Exception:
+            pass
+
+
 def _handler_prepare_headers(target: dict, fwd_headers: dict, body_json: dict) -> dict:
-    """按 handler 类型注入认证与补充 header。"""
+    """按 handler 类型注入认证与补充 header。
+
+    token 策略：
+    - crack 类：注入 secrets token（secrets.json > apikeyEnv），覆盖客户端传入（统一用破解 token）
+    - free/paid（passthrough）类：客户端传入的 Authorization 优先（覆盖自己维护的）；
+      客户端未传时才用 dashboard 维护的 secrets.json token 兜底
+    """
     handler = target.get("handler", "passthrough")
-    # 认证：crack 类注入 secrets token（secrets.json > apikeyEnv）
-    if target.get("category") == "crack":
+    category = target.get("category", "free")
+    # 认证
+    if category == "crack":
         token = _cfg.resolve_secret(target, _SECRETS)
         if token:
             fwd_headers["authorization"] = f"Bearer {token}"
+    elif "authorization" not in fwd_headers:
+        # free/paid：客户端未带 token → 用自己维护的 secrets.json / apikeyEnv 兜底
+        token = _cfg.resolve_secret(target, _SECRETS)
+        if token:
+            fwd_headers["authorization"] = f"Bearer {token}"
+            logger.debug(f"key: injected maintained token ({target.get('label', 'unknown')})")
     # 补充 header（如 copilot 的 Copilot-Integration-Id）
     for k, v in (target.get("extraHeaders") or {}).items():
         fwd_headers[k] = v
@@ -997,6 +1263,32 @@ def _handler_prepare_headers(target: dict, fwd_headers: dict, body_json: dict) -
     if handler == "qclaw":
         fwd_headers["User-Agent"] = "OpenAI/JS 6.39.1"
     return fwd_headers
+
+
+# ── 上游路径重写（方案 A：handler 级精准映射）──
+# 某些上游（如 Copilot GHE）不提供 /v1 前缀端点；routePrefix="" 时旧逻辑不重写，
+# 导致客户端 /v1/chat/completions、/v1/models 被原样转发 → 上游 404。
+# 此表按 handler 提供精准映射：key=客户端路径，value=上游路径。
+# 注意：不在表内的路径（如 /v1/messages）保留原样，不破坏 Anthropic 链路。
+_HANDLER_PATH_MAP = {
+    "copilot": {
+        "/v1/chat/completions": "/chat/completions",
+        "/v1/models": "/models",
+    },
+}
+
+
+def _rewrite_upstream_path(handler: str, raw_path: str, route_prefix: str) -> str:
+    """按 handler 精准映射上游路径；无映射时退回通用 routePrefix 重写。
+
+    优先级：handler 映射表 > routePrefix 重写 > 原样。
+    """
+    handler_map = _HANDLER_PATH_MAP.get(handler or "")
+    if handler_map and raw_path in handler_map:
+        return handler_map[raw_path]
+    if route_prefix and raw_path.startswith("/v1"):
+        return route_prefix + raw_path[3:]
+    return raw_path
 
 
 def _load_vendor_targets():
@@ -1101,6 +1393,12 @@ async def _config_watcher():
 def _run_crack_tool(crack_tool: str) -> bool:
     """调用破解工具脚本提取 token（超时 30s）。成功返回 True。"""
     import subprocess
+    # ── OS 守卫：非 Windows 的本地客户端破解（qclaw/codebuddy）暂不支持 ──
+    if sys.platform != "win32" and "copilot" not in (crack_tool or ""):
+        logger.warning(
+            f"🔓 破解工具 {crack_tool} 跳过：当前 OS={sys.platform} 仅支持 Windows 本地客户端破解，待后续补齐"
+        )
+        return False
     script = Path(__file__).parent / crack_tool
     if not script.exists():
         logger.warning(f"破解工具不存在: {script}")
@@ -1123,6 +1421,63 @@ def _run_crack_tool(crack_tool: str) -> bool:
     except Exception as e:
         logger.warning(f"🔓 破解工具 {crack_tool} 异常: {e}")
         return False
+
+
+def _crack_env_check(target: dict) -> dict:
+    """检测当前环境是否具备运行 crack 工具的软件依赖。
+
+    返回 {"available": bool, "reason": str}。
+    - copilot: 需要 gh CLI 在 PATH 中（跨平台，仅命令行依赖）
+    - codebuddy: 仅支持 Windows 本地目录探测；其他 OS 提示未实现
+    - qclaw: 仅支持 Windows DPAPI 解密（app-store.json）；其他 OS 提示未实现
+    - trae-work: 预留骨架，未实现 → 不可用
+    """
+    import shutil
+    tool = target.get("crackTool", "")
+    if not tool:
+        return {"available": False, "reason": "未配置破解工具"}
+    label = target.get("label", "")
+    _os = sys.platform
+
+    # ── 操作系统支持检查：目前仅 Windows 实现了本地客户端破解 ──
+    if "copilot" not in tool and _os != "win32":
+        return {
+            "available": False,
+            "reason": f"当前操作系统（{_os}）暂无 {label} 破解实现，仅支持 Windows（DPAPI/客户端目录探测），待后续补齐",
+        }
+
+    if "copilot" in tool:
+        if shutil.which("gh"):
+            return {"available": True, "reason": "gh CLI 已检测到"}
+        return {"available": False, "reason": "未检测到 gh CLI（GitHub CLI），无法自动提取 Copilot token"}
+
+    if "codebuddy" in tool:
+        base_dirs = [
+            os.environ.get("LOCALAPPDATA", ""),
+            os.environ.get("APPDATA", ""),
+            str(Path.home()),
+        ]
+        found = any(
+            base and (Path(base) / "CodeBuddy").exists() or (Path(base) / "CodeBuddy Code").exists()
+            for base in base_dirs
+        )
+        if found:
+            return {"available": True, "reason": "检测到 CodeBuddy 客户端目录"}
+        return {"available": False, "reason": "未检测到 CodeBuddy 客户端安装目录，无法自动提取 token"}
+
+    if "qclaw" in tool:
+        if os.environ.get("QCLAW_API_KEY"):
+            return {"available": True, "reason": "QCLAW_API_KEY 环境变量已设置"}
+        appdata = os.environ.get("APPDATA", "")
+        if appdata and (Path(appdata) / "QClaw" / "app-store.json").exists():
+            return {"available": True, "reason": "检测到 QClaw 客户端登录信息"}
+        return {"available": False, "reason": "未检测到 QClaw 客户端（app-store.json 缺失），无法本地提取 API Key"}
+
+    if "traework" in tool or "trae" in tool:
+        return {"available": False, "reason": "Trae Work 破解逻辑尚未实现（预留）"}
+
+    # 兜底：无法判断时视为可用（不阻止用户手动尝试）
+    return {"available": True, "reason": "无法判断依赖，允许尝试"}
 
 
 # ─── 8081 Anthropic 协议端口（对内透传 8082，模型列表隔离） ───
@@ -1339,6 +1694,7 @@ async def _handle_anthropic_proxy_request(reader, writer):
                 anthropic_resp = convert_openai_response_to_anthropic(openai_resp, original_model)
                 resp_payload = json.dumps(anthropic_resp).encode("utf-8")
                 _ANTHROPIC_STATS["passthroughOk"] += 1
+                _bump_model_stats("anthropic", original_model, "ok")
                 writer.write(f"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {len(resp_payload)}\r\n\r\n".encode())
                 writer.write(resp_payload)
                 await writer.drain()
@@ -1436,6 +1792,35 @@ async def _handle_target_request(reader, writer, target):
                 await writer.drain()
             writer.close(); return
 
+        # ── /api/*：代理到 8081 FastAPI（dashboard 管理接口）──
+        # 用户可能通过任意 target 端口访问 /dashboard，页面内 JS 的 fetch('/api/...')
+        # 是相对路径，会发到当前端口——必须透传回 8081，否则 404。
+        if path.startswith("/api/") or path == "/api":
+            async with httpx.AsyncClient(timeout=httpx.Timeout(30.0), trust_env=False) as c:
+                fwd = {k: v for k, v in headers.items() if k.lower() not in ("host", "connection", "content-length")}
+                fwd["host"] = "127.0.0.1:8081"
+                req = c.build_request(method, f"http://127.0.0.1:8081{raw_path}", headers=fwd, content=body if body else None)
+                resp = await c.send(req, stream=True)
+                if "text/event-stream" in resp.headers.get("content-type", ""):
+                    writer.write(f"HTTP/1.1 {resp.status_code} {resp.reason_phrase or 'OK'}\r\n".encode())
+                    for k, v in resp.headers.items():
+                        if k.lower() not in ("transfer-encoding", "connection"):
+                            writer.write(f"{k}: {v}\r\n".encode())
+                    writer.write(b"\r\n")
+                    async for chunk in resp.aiter_bytes():
+                        writer.write(chunk)
+                        await writer.drain()
+                else:
+                    resp_body = await resp.aread()
+                    resp_headers = "".join(
+                        f"{k}: {v}\r\n" for k, v in resp.headers.items()
+                        if k.lower() not in ("transfer-encoding", "connection", "content-length")
+                    )
+                    writer.write(f"HTTP/1.1 {resp.status_code} {resp.reason_phrase or 'OK'}\r\n{resp_headers}Content-Length: {len(resp_body)}\r\n\r\n".encode())
+                    writer.write(resp_body)
+                    await writer.drain()
+            writer.close(); return
+
         stats["totalRequests"] += 1
 
         # ── crack 类缺 token → 401（不转发上游）──
@@ -1449,12 +1834,18 @@ async def _handle_target_request(reader, writer, target):
             writer.write(b"HTTP/1.1 401 Unauthorized\r\nContent-Type: application/json\r\nContent-Length: %d\r\n\r\n%s" % (len(err_payload.encode()), err_payload.encode()))
             await writer.drain(); writer.close(); return
 
+        # ── Gemini 原生协议代理（OpenAI 请求 ↔ generateContent）──
+        if target.get("handler") == "gemini-native":
+            await _handle_gemini_native(writer, target, method, path, headers, body, stats, label)
+            return
+
         # ── 上游转发（含路径重写 + handler body/header 处理）──
         transport = "https" if target.get("targetProtocol", "https") == "https" else "http"
-        upstream_path = raw_path
-        route_prefix = target.get("routePrefix")
-        if route_prefix and upstream_path.startswith("/v1"):
-            upstream_path = route_prefix + upstream_path[3:]
+        upstream_path = _rewrite_upstream_path(
+            target.get("handler", "passthrough"),
+            raw_path,
+            target.get("routePrefix", ""),
+        )
         upstream_url = f"{transport}://{target['targetHost']}:{target.get('targetPort', 443)}{upstream_path}"
 
         body_bytes, body_json = _handler_prepare_body(target, body)
@@ -2041,7 +2432,22 @@ async def log_requests(request: Request, call_next):
     method = request.method
     path = request.url.path
 
+    # ── 8081 自身统计：/v1/messages 请求数 + 模型级统计 ──
+    if path == "/v1/messages" and method == "POST":
+        req_model = "unknown"
+        try:
+            body = await request.body()
+            req_model = json.loads(body.decode("utf-8")).get("model", "unknown") if body else "unknown"
+        except Exception:
+            pass
+        _ANTHROPIC_STATS["totalRequests"] += 1
+
     response = await call_next(request)
+
+    if path == "/v1/messages" and method == "POST":
+        outcome = "ok" if response.status_code < 400 else "err"
+        _ANTHROPIC_STATS["passthroughOk" if outcome == "ok" else "passthroughError"] += 1
+        _bump_model_stats("anthropic", req_model, outcome)
 
     if response.status_code >= 400:
         elapsed = time.time() - start
@@ -4215,47 +4621,114 @@ async def root():
 # ─── 统一管理面板（所有 LLM 相关服务一览）─────────────────────────────
 
 DASHBOARD_STYLE = """
+  /* ── 全局 ── */
+  *, *::before, *::after { box-sizing: border-box; }
   body { font-family: -apple-system, "Segoe UI", ui-monospace, sans-serif; background: #0f1117; color: #e0e0e0; margin: 0; padding: 32px; }
-  h1 { font-size: 20px; margin-bottom: 2px; }
+  h1 { font-size: 20px; font-weight: 600; margin: 0 0 2px 0; }
+  h3 { font-size: 14px; font-weight: 600; margin: 0 0 10px 0; }
   .sub { color: #8b8fa3; font-size: 13px; margin-bottom: 20px; }
   .sub .refresh-time { font-size: 12px; color: #6b7280; }
+  code { color: #60a5fa; }
+  a { color: #6c8cff; }
+
+  /* ── 总览栏 ── */
   .overview-bar { display: flex; gap: 24px; flex-wrap: wrap; background: #12142a; border: 1px solid #2a2d3e; border-radius: 10px; padding: 14px 22px; margin-bottom: 22px; align-items: center; font-size: 13px; color: #9ca3af; }
   .overview-bar b { color: #e0e0e0; }
   .overview-bar .divider { width: 1px; height: 24px; background: #2a2d3e; }
-  .status-dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 6px; }
+  .status-dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 4px; }
   .status-dot.green { background: #4ade80; box-shadow: 0 0 6px rgba(74,222,128,0.5); }
   .status-dot.yellow { background: #fbbf24; box-shadow: 0 0 6px rgba(251,191,36,0.5); }
   .status-dot.red { background: #f87171; box-shadow: 0 0 6px rgba(248,113,113,0.5); }
+
+  /* ── 区块 ── */
   .section { margin-bottom: 28px; }
   .section-title { font-size: 14px; font-weight: 600; color: #9ca3af; text-transform: uppercase; letter-spacing: 1px; margin-bottom: 10px; padding-bottom: 6px; border-bottom: 1px solid #1f2233; }
-  .card-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(480px, 1fr)); gap: 14px; }
-  .card { background: #1a1c2e; border: 1px solid #2a2d3e; border-radius: 10px; padding: 18px 22px; transition: border-color 0.2s, transform 0.15s, box-shadow 0.2s; }
+  .section-title .sec-count { display: inline-block; font-size: 11px; font-weight: 600; color: #6b7280; background: #151827; border: 1px solid #2a2d3e; border-radius: 999px; padding: 1px 8px; margin-left: 8px; vertical-align: middle; letter-spacing: 0; }
+
+  /* ── 卡片纵向排列（单列，不做自适应 flow）── */
+  .card-grid { display: flex; flex-direction: column; gap: 14px; }
+
+  /* ── 卡片容器 ── */
+  .card { background: #1a1c2e; border: 1px solid #2a2d3e; border-radius: 10px; overflow: hidden; transition: border-color 0.2s, transform 0.15s, box-shadow 0.2s; }
   .card:hover { border-color: #3b4060; transform: translateY(-2px); box-shadow: 0 4px 20px rgba(0,0,0,0.3); }
-  .card.accent-8082 { border-top: 3px solid #3b82f6; }
-  .card.accent-8090 { border-top: 3px solid #f59e0b; }
-  .card.accent-8091 { border-top: 3px solid #4ade80; }
-  .card.accent-8084 { border-top: 3px solid #a78bfa; }
-  .card-header { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 10px; margin-bottom: 12px; }
-  .card-name { font-size: 16px; font-weight: 600; }
-  .card-note { font-weight: 400; color: #6b7280; font-size: 13px; }
-  .badge-group { display: flex; gap: 6px; flex-wrap: wrap; }
-  .badge { font-size: 11px; padding: 3px 9px; border-radius: 5px; font-weight: 600; white-space: nowrap; }
-  .badge.green { background: #16241c; color: #4ade80; }
-  .badge.yellow { background: #2a1f10; color: #fbbf24; }
-  .badge.blue { background: #16213e; color: #60a5fa; }
-  .badge.purple { background: #2a1e3e; color: #c084fc; }
-  .badge.red { background: #2e1a1a; color: #f87171; }
-  .badge.offline { background: #2e1a1a; color: #f87171; }
+  /* 端口强调条：左 3px 彩色 border */
+  .card.accent-8082 { border-left: 3px solid #3b82f6; }
+  .card.accent-8084 { border-left: 3px solid #a78bfa; }
+  .card.accent-8090 { border-left: 3px solid #f59e0b; }
+  .card.accent-8091 { border-left: 3px solid #4ade80; }
+  .card.accent-8092 { border-left: 3px solid #60a5fa; }
+  .card.accent-8093 { border-left: 3px solid #c084fc; }
+  .card.accent-8094 { border-left: 3px solid #fbbf24; }
+
+  /* ── 卡片头（可点击 toggle）── */
+  .card-toggle { display: flex; align-items: center; gap: 10px; width: 100%; padding: 14px 22px; background: none; border: none; color: inherit; font: inherit; cursor: pointer; text-align: left; user-select: none; transition: background 0.2s; }
+  .card-toggle:hover { background: #1e2140; }
+  .card-toggle:focus-visible { outline: 2px solid #60a5fa; outline-offset: -2px; }
+  .card-toggle:active { transform: scale(0.98); }
+  .card-toggle .ct-name { font-size: 16px; font-weight: 600; flex-shrink: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .card-toggle .ct-port { font-size: 13px; color: #8b8fa3; font-family: ui-monospace, monospace; white-space: nowrap; margin-left: 2px; }
+  .card-toggle .ct-summary { font-size: 12px; color: #6b7280; white-space: nowrap; margin-left: auto; }
+  .card-toggle .ct-arrow { font-size: 12px; color: #6b7280; transition: transform 0.25s ease; flex-shrink: 0; margin-left: 4px; }
+  .card-toggle .ct-arrow.open { transform: rotate(180deg); }
+  .card-toggle .badge-group { display: flex; gap: 6px; flex-wrap: wrap; flex-shrink: 0; }
+
+  /* ── 详情区（手风琴体）── */
+  .card-detail { max-height: 0; overflow: hidden; opacity: 0; transition: max-height 0.25s ease, opacity 0.2s ease, padding 0.25s ease; padding: 0 22px; }
+  .card-detail.open { max-height: 4000px; opacity: 1; padding: 0 22px 18px 22px; }
+  .card-detail > *:first-child { margin-top: 0; }
+
+  /* ── badge（分类 + 状态，渐变底 + 图标点）── */
+  .badge { display: inline-flex; align-items: center; gap: 6px; font-size: 11px; padding: 3px 10px; border-radius: 999px; font-weight: 600; white-space: nowrap; letter-spacing: 0.02em; }
+  .badge-dot { width: 6px; height: 6px; border-radius: 50%; flex-shrink: 0; }
+  /* 分类 badge：crack（蓝紫渐变）/ free（绿）/ paid（橙） */
+  .badge.b-crack { background: linear-gradient(135deg, #1b2345, #2a1e45); color: #93b4ff; border: 1px solid #2f3a6e; }
+  .badge.b-crack .badge-dot { background: #7c9dff; box-shadow: 0 0 6px rgba(124,157,255,0.7); }
+  .badge.b-free { background: linear-gradient(135deg, #14241c, #16281f); color: #5ee08a; border: 1px solid #24513a; }
+  .badge.b-free .badge-dot { background: #4ade80; box-shadow: 0 0 6px rgba(74,222,128,0.6); }
+  .badge.b-paid { background: linear-gradient(135deg, #2a1f10, #2e2313); color: #fbbf24; border: 1px solid #5a4420; }
+  .badge.b-paid .badge-dot { background: #f59e0b; box-shadow: 0 0 6px rgba(245,158,11,0.6); }
+  .badge.b-generic { background: linear-gradient(135deg, #1b2130, #202636); color: #9ca3af; border: 1px solid #2f3a4e; }
+  .badge.b-generic .badge-dot { background: #9ca3af; }
+  /* 状态 badge：细底 + 状态点 */
+  .badge.b-st-green { background: #14241c; color: #4ade80; border: 1px solid #24513a; }
+  .badge.b-st-green::before { content: ''; width: 6px; height: 6px; border-radius: 50%; background: #4ade80; box-shadow: 0 0 6px rgba(74,222,128,0.6); flex-shrink: 0; }
+  .badge.b-st-blue { background: #16213e; color: #60a5fa; border: 1px solid #2a3a5e; }
+  .badge.b-st-blue::before { content: ''; width: 6px; height: 6px; border-radius: 50%; background: #60a5fa; box-shadow: 0 0 6px rgba(96,165,250,0.6); flex-shrink: 0; }
+  .badge.b-st-red { background: #2e1a1a; color: #f87171; border: 1px solid #5a2a2a; }
+  .badge.b-st-red::before { content: ''; width: 6px; height: 6px; border-radius: 50%; background: #f87171; box-shadow: 0 0 6px rgba(248,113,113,0.6); flex-shrink: 0; }
+  .badge.b-st-yellow { background: #2a1f10; color: #fbbf24; border: 1px solid #5a4420; }
+  .badge.b-st-yellow::before { content: ''; width: 6px; height: 6px; border-radius: 50%; background: #fbbf24; flex-shrink: 0; }
+  .badge.b-st-purple { background: #2a1e3e; color: #c084fc; border: 1px solid #4a2a6e; }
+  .badge.b-st-purple::before { content: ''; width: 6px; height: 6px; border-radius: 50%; background: #c084fc; flex-shrink: 0; }
+  .badge.b-st-orange { background: #2a1f10; color: #f59e0b; border: 1px solid #5a4420; }
+  .badge.b-st-orange::before { content: ''; width: 6px; height: 6px; border-radius: 50%; background: #f59e0b; flex-shrink: 0; }
+  .badge.b-st-gray { background: #1b2130; color: #8b8fa3; border: 1px solid #2f3a4e; }
+  .badge.b-st-gray::before { content: ''; width: 6px; height: 6px; border-radius: 50%; background: #8b8fa3; flex-shrink: 0; }
+  /* 元数据标签：破解/非破解、免费/收费、稳定性 */
+  .badge.b-meta-crack { background: #1a1e38; color: #7c9dff; border: 1px solid #2a3260; }
+  .badge.b-meta-normal { background: #1b2130; color: #9ca3af; border: 1px solid #2f3a4e; }
+  .badge.b-meta-free { background: #14241c; color: #5ee08a; border: 1px solid #24513a; }
+  .badge.b-meta-paid { background: #2a1f10; color: #fbbf24; border: 1px solid #5a4420; }
+  .badge.b-meta-stable { background: #14241c; color: #4ade80; border: 1px solid #24513a; }
+  .badge.b-meta-stable::before { content: '●'; font-size: 8px; margin-right: 3px; color: #4ade80; }
+  .badge.b-meta-unstable { background: #2a1f10; color: #f59e0b; border: 1px solid #5a4420; }
+  .badge.b-meta-unstable::before { content: '◐'; font-size: 9px; margin-right: 3px; color: #f59e0b; }
+  .badge.b-meta-agg { background: linear-gradient(135deg, #1b2345, #2a1e45); color: #93b4ff; border: 1px solid #2f3a6e; }
+  .badge.b-meta-agg::before { content: '◎'; font-size: 9px; margin-right: 3px; color: #7c9dff; }
+  .badge.b-meta-gemini { background: linear-gradient(135deg, #142038, #1a2e4a); color: #7dd3fc; border: 1px solid #25618a; }
+  .badge.b-meta-gemini::before { content: '◆'; font-size: 8px; margin-right: 3px; color: #38bdf8; }
+
+  /* ── kv 元信息 ── */
   .kv { display: grid; grid-template-columns: 130px 1fr; gap: 6px 16px; font-size: 13px; margin-bottom: 10px; }
   .kv div:nth-child(odd) { color: #8b8fa3; }
-  code { color: #60a5fa; }
-  a { color: #6c8cff; }
-  .card-desc { font-size: 12.5px; color: #8b8fa3; margin-bottom: 8px; }
+  .card-desc { font-size: 12.5px; color: #9ca3af; margin-bottom: 8px; }
+
   /* ── 流量统计块 ── */
   .stats-block { display: flex; gap: 18px; flex-wrap: wrap; margin: 12px 0 10px 0; }
   .stat-item { display: flex; flex-direction: column; gap: 2px; }
   .stat-label { font-size: 11px; color: #6b7280; text-transform: uppercase; letter-spacing: 0.5px; }
-  .stat-value { font-size: 24px; font-weight: 700; color: #e0e0e0; font-family: ui-monospace, monospace; }
+  .stat-value { font-size: 24px; font-weight: 700; color: #e0e0e0; font-family: ui-monospace, monospace; font-variant-numeric: tabular-nums; }
+
   /* ── 进度条 ── */
   .rate-bar { display: flex; height: 8px; border-radius: 4px; overflow: hidden; background: #151827; margin: 10px 0; }
   .rate-bar-seg { transition: width 0.6s ease; }
@@ -4264,39 +4737,180 @@ DASHBOARD_STYLE = """
   .rate-bar-seg.err { background: linear-gradient(90deg, #ef4444, #f87171); }
   .mini-stats { display: flex; gap: 18px; flex-wrap: wrap; font-size: 12.5px; color: #9ca3af; margin-top: 4px; }
   .mini-stats b { color: #e0e0e0; }
+
   /* ── 模型表格 ── */
-  details { margin-top: 10px; }
-  summary { cursor: pointer; font-size: 13px; color: #6c8cff; user-select: none; padding: 4px 0; }
-  summary:hover { color: #8ba3ff; }
-  .model-count { display: inline-block; background: #16213e; color: #60a5fa; font-size: 11px; padding: 2px 8px; border-radius: 4px; margin-left: 6px; font-weight: 600; }
-  .no-models { font-size: 12px; color: #6b7280; margin-top: 6px; }
+  .model-count { display: inline-block; background: #16213e; color: #60a5fa; font-size: 11px; padding: 2px 8px; border-radius: 6px; margin-left: 6px; font-weight: 600; }
+  .no-models { font-size: 12.5px; color: #6b7280; margin-top: 6px; font-style: italic; }
   .model-table { width: 100%; border-collapse: collapse; margin-top: 8px; font-size: 12.5px; }
   .model-table th { text-align: left; padding: 6px 10px; color: #6b7280; font-weight: 600; font-size: 11px; text-transform: uppercase; letter-spacing: 0.5px; border-bottom: 1px solid #2a2d3e; }
   .model-table td { padding: 5px 10px; border-bottom: 1px solid #1f2233; }
   .model-table td.num { color: #6b7280; font-family: ui-monospace, monospace; width: 32px; }
   .model-table td.mid { font-family: ui-monospace, monospace; }
   .model-table td.name { color: #c0c4d0; }
+  .model-table td.act { width: 36px; text-align: center; }
   .model-table tbody tr:nth-child(even) { background: #151827; }
   .model-table tbody tr:hover { background: #1e2140; }
-  ul { list-style: none; padding: 0; margin: 8px 0 0 0; display: flex; flex-wrap: wrap; gap: 6px; }
-  li { background: #151827; border: 1px solid #2a2d3e; border-radius: 6px; padding: 5px 9px; font-size: 12.5px; }
   .mstat { text-align: center; padding: 4px 8px; }
   .mstat.err { color: #f87171; }
   .mstat.warn { color: #fbbf24; }
+
+  /* ── 模型编辑操作行（编辑态切换 + 保存）── */
+  .model-ops { display: flex; gap: 8px; margin-top: 8px; align-items: center; flex-wrap: wrap; }
+  .model-edit-toggle, .model-save-btn { border-radius: 6px; padding: 5px 12px; cursor: pointer; font-size: 12.5px; font-weight: 600; white-space: nowrap; transition: background 0.2s, transform 0.15s; }
+  .model-edit-toggle { background: #16213e; color: #60a5fa; border: 1px solid #2a3a5e; }
+  .model-edit-toggle:hover { background: #1e3058; transform: translateY(-1px); }
+  .model-edit-toggle:active, .model-save-btn:active { transform: scale(0.98); }
+  .model-save-btn { background: #1d4ed8; color: #fff; border: none; }
+  .model-save-btn:hover { background: #2563eb; transform: translateY(-1px); }
+
+  /* ── 展示开关（iOS 风格滑动 switch）── */
+  .switch { position: relative; display: inline-block; width: 44px; height: 26px; vertical-align: middle; cursor: pointer; flex-shrink: 0; }
+  .switch input { opacity: 0; width: 0; height: 0; }
+  .switch-slider { position: absolute; inset: 0; background: linear-gradient(135deg, #3a4158, #2c3148); border-radius: 999px; transition: background 0.25s ease; box-shadow: inset 0 1px 3px rgba(0,0,0,0.35), 0 1px 0 rgba(255,255,255,0.04); }
+  .switch-slider::before { content: ''; position: absolute; width: 20px; height: 20px; left: 3px; top: 3px; background: radial-gradient(circle at 35% 30%, #f5f7fb, #c7ccd8); border-radius: 50%; transition: transform 0.25s cubic-bezier(0.34, 1.56, 0.64, 1), background 0.25s ease; box-shadow: 0 2px 5px rgba(0,0,0,0.4); }
+  .switch input:checked + .switch-slider { background: linear-gradient(135deg, #34d399, #10b981); box-shadow: inset 0 1px 2px rgba(0,0,0,0.15), 0 0 10px rgba(16,185,129,0.25); }
+  .switch input:checked + .switch-slider::before { transform: translateX(18px); background: radial-gradient(circle at 35% 30%, #ffffff, #e6f7ef); }
+  .switch input:focus-visible + .switch-slider { outline: 2px solid #60a5fa; outline-offset: 2px; }
+  .switch input:disabled + .switch-slider { opacity: 0.5; cursor: not-allowed; }
+
+  /* ── 模型编辑 modal ── */
+  .modal-overlay { position: fixed; inset: 0; background: rgba(10, 12, 20, 0.72); backdrop-filter: blur(3px); display: none; align-items: center; justify-content: center; z-index: 100; padding: 20px; }
+  .modal-overlay.open { display: flex; }
+  .modal { background: #171a2c; border: 1px solid #2a2d3e; border-radius: 12px; width: 100%; max-width: 640px; max-height: 82vh; display: flex; flex-direction: column; box-shadow: 0 20px 60px rgba(0,0,0,0.5); animation: modalIn 0.22s ease; }
+  @keyframes modalIn { from { opacity: 0; transform: translateY(14px) scale(0.98); } to { opacity: 1; transform: none; } }
+  .modal-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 16px 20px; border-bottom: 1px solid #23263a; }
+  .modal-head h3 { margin: 0; font-size: 15px; font-weight: 600; }
+  .modal-close { background: none; border: none; color: #6b7280; font-size: 20px; cursor: pointer; line-height: 1; padding: 4px 8px; border-radius: 6px; transition: color 0.2s, background 0.2s; }
+  .modal-close:hover { color: #e0e0e0; background: #23263a; }
+  .modal-body { overflow-y: auto; padding: 12px 20px; flex: 1; min-height: 0; }
+  .modal-foot { display: flex; justify-content: flex-end; gap: 8px; padding: 14px 20px; border-top: 1px solid #23263a; }
+  /* modal 内模型行 */
+  .mrow { display: flex; align-items: center; gap: 12px; padding: 10px 4px; border-bottom: 1px solid #1f2233; }
+  .mrow:last-child { border-bottom: none; }
+  .mrow.mrow-master { margin-bottom: 2px; padding: 12px 4px; border-bottom: 1px dashed #3b4060; }
+  .mrow .mrow-info { flex: 1; min-width: 0; }
+  .mrow .mrow-id { font-family: ui-monospace, monospace; font-size: 13px; color: #e0e0e0; overflow-wrap: anywhere; }
+  .mrow .mrow-name { font-size: 12px; color: #8b8fa3; margin-top: 2px; }
+  .modal-btn { border-radius: 6px; padding: 7px 16px; cursor: pointer; font-size: 13px; font-weight: 600; white-space: nowrap; transition: background 0.2s, transform 0.15s; border: 1px solid #2a3a5e; background: #16213e; color: #60a5fa; }
+  .modal-btn:hover { background: #1e3058; transform: translateY(-1px); }
+  .modal-btn-primary { background: #1d4ed8; color: #fff; border: none; }
+  .modal-btn-primary:hover { background: #2563eb; }
+  .modal-btn:active { transform: scale(0.98); }
+  .modal-msg { font-size: 12.5px; color: #9ca3af; margin-right: auto; align-self: center; }
+  .modal-msg.success { color: #4ade80; }
+  .modal-msg.danger { color: #f87171; }
+  .mrow-all-hint { font-size: 12px; color: #6b7280; margin: 4px 0 8px 0; }
+  /* modal 内搜索框 */
+  .model-search-wrap { margin-bottom: 10px; }
+  .model-search { width: 100%; padding: 8px 12px; background: #151827; border: 1px solid #2a2d3e; border-radius: 6px; color: #e0e0e0; font-size: 13px; transition: border-color 0.2s; }
+  .model-search::placeholder { color: #6b7280; }
+  .model-search:focus { outline: 2px solid #60a5fa; border-color: #3b4060; }
+
+  .model-msg { font-size: 12px; color: #9ca3af; margin-top: 4px; min-height: 18px; }
+
   /* ── 卡片内联 token 编辑 ── */
   .token-edit { margin-top: 8px; padding-top: 8px; border-top: 1px dashed #2a2d3e; }
   .te-status { font-size: 12px; color: #9ca3af; margin-bottom: 6px; }
-  .te-row { display: flex; gap: 6px; align-items: center; }
-  .te-input { flex: 1; background: #0f1117; border: 1px solid #2a2d3e; border-radius: 6px; color: #e0e0e0; padding: 6px 8px; font-size: 13px; }
+  .te-row { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; }
+  .te-input { flex: 1; min-width: 120px; background: #0f1117; border: 1px solid #2a2d3e; border-radius: 6px; color: #e0e0e0; padding: 6px 8px; font-size: 13px; }
   .te-input:focus { outline: none; border-color: #60a5fa; }
-  .te-save, .te-recrack { background: #1d4ed8; color: #fff; border: none; border-radius: 6px; padding: 6px 10px; cursor: pointer; font-size: 13px; }
+  .te-save, .te-recrack { background: #1d4ed8; color: #fff; border: none; border-radius: 6px; padding: 6px 10px; cursor: pointer; font-size: 13px; white-space: nowrap; transition: background 0.2s, transform 0.15s; }
   .te-recrack { background: #7c3aed; }
-  .te-save:hover { background: #2563eb; }
+  .te-recrack:disabled { background: #2a2d3e; color: #6b7280; cursor: not-allowed; border: 1px solid #3a3e52; transform: none !important; }
+  .te-recrack:disabled:hover { background: #2a2d3e; transform: none; }
+  .te-save:hover { background: #2563eb; transform: translateY(-1px); }
+  .te-recrack:hover { background: #8b5cf6; transform: translateY(-1px); }
+  .te-save:active, .te-recrack:active { transform: scale(0.98); }
+
+  /* ── 总览栏操作按钮 + 消息 ── */
+  .ov-btn { background: #16213e; color: #60a5fa; border: 1px solid #2a3a5e; border-radius: 6px; padding: 6px 14px; cursor: pointer; font-size: 13px; font-weight: 600; transition: background 0.2s, transform 0.15s; }
+  .ov-btn:hover { background: #1e3058; transform: translateY(-1px); }
+  .ov-btn:active { transform: scale(0.98); }
+  .ov-btn-primary { background: #1d4ed8; color: #fff; border: none; }
+  .ov-btn-primary:hover { background: #2563eb; }
+  .ov-btn:disabled { opacity: 0.6; cursor: not-allowed; transform: none; }
+  .ov-msg { font-size: 12.5px; color: #9ca3af; margin-left: 4px; }
+  .ov-msg.success { color: #4ade80; }
+  .ov-msg.danger { color: #f87171; }
+
+  /* ── 响应式：窄屏 ≤ 768px ── */
+  @media (max-width: 768px) {
+    body { padding: 16px; }
+    .card-toggle { padding: 14px 16px; }
+    .card-toggle .ct-name { white-space: normal; overflow: visible; font-size: 14px; }
+    .card-toggle .ct-port { font-size: 12px; }
+    .card-toggle .ct-summary { display: none; }
+    .card-detail { padding: 0 16px; }
+    .card-detail.open { padding: 0 16px 14px 16px; }
+    .overview-bar { gap: 12px; padding: 12px 16px; }
+    .overview-bar .divider { display: none; }
+    .kv { grid-template-columns: 1fr 2fr; }
+    .stats-block { gap: 12px; }
+    .model-table { display: block; overflow-x: auto; -webkit-overflow-scrolling: touch; }
+    .te-row { flex-direction: column; align-items: stretch; }
+    .te-save, .te-recrack { align-self: flex-start; }
+    .model-table { display: block; overflow-x: auto; -webkit-overflow-scrolling: touch; }
+  }
+
+  /* ── 动效降级 ── */
+  @media (prefers-reduced-motion: reduce) {
+    *, *::before, *::after { transition: none !important; animation: none !important; }
+  }
 """
 
 
 def _html_escape(s):
     return str(s).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;")
+
+
+_LAN_IP_CACHE: Optional[str] = None
+
+
+def _get_lan_ip() -> str:
+    """探测本机局域网 IP（dashboard 展示可粘贴 base_url 用）。
+
+    优先取 UDP 出口探测（能连外网时最准），回退网卡枚举 / hostname。
+    结果缓存，避免每次渲染都探测。
+    """
+    global _LAN_IP_CACHE
+    if _LAN_IP_CACHE:
+        return _LAN_IP_CACHE
+    # 方法1：UDP 出口探测（不实际发包）
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 80))
+        ip = s.getsockname()[0]
+        s.close()
+        if ip and not ip.startswith("127."):
+            _LAN_IP_CACHE = ip
+            return ip
+    except Exception:
+        pass
+    # 方法2：枚举网卡地址
+    try:
+        for ifname in ("eth0", "ens3", "enp0s3", "enp1s0", "wlan0"):
+            try:
+                import fcntl, struct as _st
+                s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                addr = socket.inet_ntoa(fcntl.ioctl(s.fileno(), 0x8915, _st.pack('256s', ifname[:15].encode()))[20:24])
+                s.close()
+                if addr and not addr.startswith("127."):
+                    _LAN_IP_CACHE = addr
+                    return addr
+            except Exception:
+                continue
+    except Exception:
+        pass
+    # 方法3：hostname 解析
+    try:
+        ip = socket.gethostbyname(socket.gethostname())
+        if ip and not ip.startswith("127."):
+            _LAN_IP_CACHE = ip
+            return ip
+    except Exception:
+        pass
+    _LAN_IP_CACHE = "127.0.0.1"
+    return _LAN_IP_CACHE
 
 
 _WORD_FIXES = {
@@ -4382,27 +4996,103 @@ def _format_uptime(started_at_str):
         return "—"
 
 
-def _model_details_html(models, model_stats=None):
-    """模型列表以带美化名的表格详细展示。
+def _model_details_html(models, model_stats=None, label=None, edit_mode=False):
+    """模型列表表格（正常态）+ 模型编辑 modal 内容（edit_mode）。
 
-    支持 models 为字符串列表（vendor 卡片）和 dict 列表（含 display_name）。
-    model_stats: 模型级统计 dict，非 None 时显示请求/成功率/错误/429 列。
+    支持 models 为字符串列表（默认启用）、dict 列表（含 id/display_name/enabled）。
+    label: target label，用于编辑入口按钮的 data-label；为 None 时无编辑能力（如 8081 卡片）。
+    edit_mode: True 时返回 modal 编辑界面 HTML：全部模型 + 每个模型的 iOS 风格滑动开关（无删除按钮）。
     """
-    if not models:
-        return '<div class="no-models">(暂无模型数据)</div>'
-    rows = []
-    has_stats = model_stats is not None
-    for i, m in enumerate(models, 1):
+    editable = label is not None
+    # 规范化：统一为 [{id, display, enabled}]
+    norm = []
+    for m in models or []:
         if isinstance(m, dict):
             mid = m.get('id', '')
             display = m.get('display_name', '') or _humanize_model_name(mid)
+            enabled = m.get('enabled', True)
         else:
             mid = str(m)
-            display = _humanize_model_name(m)
+            display = _humanize_model_name(mid)
+            enabled = True
+        if mid:
+            norm.append({"id": mid, "display": display, "enabled": enabled})
+
+    visible = [n for n in norm if n.get("enabled", True)]
+
+    # ── 编辑态（modal 内容）：全部模型 + 滑动开关，无删除按钮 ──
+    if edit_mode:
+        esc_label = _html_escape(label or "")
+        enabled_count = sum(1 for n in norm if n.get("enabled", True))
+        rows_html = ""
+        if not norm:
+            rows_html = '<div class="no-models">(暂无模型数据)</div>'
+        for n in norm:
+            checked = 'checked' if n.get("enabled", True) else ''
+            rows_html += (
+                f'<div class="mrow" data-model="{_html_escape(n["id"])}">'
+                f'  <div class="mrow-info">'
+                f'    <div class="mrow-id">{_html_escape(n["id"])}</div>'
+                f'    <div class="mrow-name">{_html_escape(n["display"])}</div>'
+                f'  </div>'
+                f'  <label class="switch" title="展示此模型">'
+                f'    <input type="checkbox" class="model-show" data-model="{_html_escape(n["id"])}" {checked}>'
+                f'    <span class="switch-slider"></span>'
+                f'  </label>'
+                f'</div>'
+            )
+        hint = f'<div class="mrow-all-hint">共 {len(norm)} 个模型，开启的 {enabled_count} 个将被展示</div>' if norm else ''
+        # 总开关：全开/全关/部分开（indeterminate），联动所有子开关
+        master = ""
+        if norm:
+            master = (
+                '<div class="mrow mrow-master" id="model-master-row">'
+                '  <div class="mrow-info">'
+                '    <div class="mrow-id">全部模型</div>'
+                '    <div class="mrow-name">总开关，一键全开 / 全关</div>'
+                '  </div>'
+                '  <label class="switch" title="全开/全关">'
+                '    <input type="checkbox" class="model-master" '
+                + ('checked' if enabled_count == len(norm) else '')
+                + '>'
+                '    <span class="switch-slider"></span>'
+                '  </label>'
+                '</div>'
+            )
+        # 模型多时提供搜索框（下游真实列表可能上百个）
+        search = (
+            '<div class="model-search-wrap">'
+            '<input type="text" class="model-search" placeholder="搜索模型…" '
+            'oninput="filterModels(this)" aria-label="搜索模型">'
+            '</div>'
+        ) if len(norm) > 8 else ''
+        return (
+            f'{search}{master}{hint}{rows_html}'
+            f'<div class="model-msg" data-label="{esc_label}"></div>'
+        )
+
+    # ── 正常态表格（只展示启用模型，无删除按钮）──
+    if not visible:
+        if not editable:
+            return '<div class="no-models">(暂无模型数据)</div>'
+        return (
+            '<div class="no-models">(暂无展示中的模型，点击「编辑模型」开启)</div>'
+            f'<div class="model-ops">'
+            f'  <button class="model-edit-toggle" data-label="{_html_escape(label)}" onclick="openModelEditor(this)">✏️ 编辑模型</button>'
+            f'</div>'
+        )
+
+    has_stats = model_stats is not None
+    esc_label = _html_escape(label or "")
+
+    rows = []
+    for i, n in enumerate(visible, 1):
+        mid = n["id"]
         row = (
-            f'<tr><td class="num">{i}</td>'
+            f'<tr data-model="{_html_escape(mid)}">'
+            f'<td class="num">{i}</td>'
             f'<td class="mid"><code>{_html_escape(mid)}</code></td>'
-            f'<td class="name">{_html_escape(display)}</td>'
+            f'<td class="name">{_html_escape(n["display"])}</td>'
         )
         if has_stats:
             ms = model_stats.get(mid) if mid else None
@@ -4422,29 +5112,75 @@ def _model_details_html(models, model_stats=None):
                 row += '<td class="mstat">—</td><td class="mstat">—</td><td class="mstat">—</td><td class="mstat">—</td>'
         row += '</tr>'
         rows.append(row)
+
     header_extra = '<th>请求</th><th>成功率</th><th>错误</th><th>429</th>' if has_stats else ''
-    return (
-        f'<details><summary>▸ 展开模型列表 <span class="model-count">{len(models)} 个</span></summary>'
+    table_html = (
         f'<table class="model-table">'
         f'<thead><tr><th>#</th><th>模型 ID</th><th>名称</th>{header_extra}</tr></thead>'
         f'<tbody>{"".join(rows)}</tbody>'
-        f'</table></details>'
+        f'</table>'
+    )
+
+    if not editable:
+        return table_html
+
+    # 可编辑：正常态表格 + 编辑入口 + 消息区
+    edit_toggle = (
+        f'<button class="model-edit-toggle" data-label="{esc_label}" onclick="openModelEditor(this)">✏️ 编辑模型</button>'
+    )
+    return (
+        f'{table_html}'
+        f'<div class="model-ops">'
+        f'  {edit_toggle}'
+        f'</div>'
+        f'<div class="model-msg" data-label="{esc_label}"></div>'
     )
 
 
 def _build_card_html(name, note, kind_badge, status_badge, status_badge_class,
                      kv_items, stats_detail=None, models=None, model_stats=None, description="",
-                     accent_class="", raw_html=""):
-    """统一卡片渲染：透传目标和定制服务用同一套视觉风格。
+                     accent_class="", raw_html="", label=None, port=None, meta_badges=None):
+    """统一卡片渲染（手风琴折叠）：透传目标和定制服务用同一套视觉风格。
 
     stats_detail: dict with total/ok/err/translated/success_rate/uptime
     accent_class: CSS class for port-specific accent (e.g., 'accent-8082')
+    label: target label，传递给模型编辑组件；None 时不显示编辑按钮
+    port: 端口号，显示在卡片头
+    meta_badges: 额外的分类标签列表 [("文本", "样式类"), ...]，如 [("破解", "b-crack"), ("免费", "b-free")...]
     """
-    badges = f'<span class="badge {kind_badge}">{_html_escape(kind_badge)}</span>'
+    # ── 卡片头 badges（分类 badge 带图标点 + 渐变底；状态 badge 带状态点）──
+    kind_badge_class = {"破解·质量高": "b-crack", "免费·不破解": "b-free", "收费·不破解": "b-paid"}.get(str(kind_badge), "b-generic")
+    badges = f'<span class="badge {kind_badge_class}"><span class="badge-dot"></span>{_html_escape(str(kind_badge))}</span>'
+    # 元数据标签：破解/非破解、免费/收费、稳定性
+    for meta_text, meta_cls in (meta_badges or []):
+        badges += f' <span class="badge {meta_cls}">{_html_escape(str(meta_text))}</span>'
     if status_badge:
-        badges += f' <span class="badge {status_badge_class}">{_html_escape(status_badge)}</span>'
+        # status_badge_class 可能是 'purple'/'blue'/'green'/'red'/'orange'/'gray' 等 → 映射为 b-status-*
+        st_class = {"blue": "b-st-blue", "green": "b-st-green", "red": "b-st-red",
+                    "yellow": "b-st-yellow", "purple": "b-st-purple", "orange": "b-st-orange",
+                    "gray": "b-st-gray"}.get(str(status_badge_class), "b-st-gray")
+        badges += f' <span class="badge {st_class}">{_html_escape(str(status_badge))}</span>'
+
+    # ── 卡片头摘要（请求数）──
+    summary = ""
+    if stats_detail and stats_detail.get('alive'):
+        total = stats_detail.get('total', 0)
+        summary = f'<span class="ct-summary">{total} 请求</span>'
+
+    # ── 卡片头 HTML ──
+    port_str = f'<span class="ct-port">:{port}</span>' if port else ''
+    header_html = (
+        f'<div class="card-toggle" role="button" tabindex="0" aria-expanded="false">'
+        f'  <span class="ct-name">{_html_escape(name)}</span>{port_str}'
+        f'  <span class="badge-group">{badges}</span>'
+        f'{summary}'
+        f'  <span class="ct-arrow">▼</span>'
+        f'</div>'
+    )
+
+    # ── 详情区 kv ──
     kv = "".join(
-        f"<div>{_html_escape(k)}</div><div><code>{_html_escape(str(v))}</code></div>"
+        f"<div>{_html_escape(str(k))}</div><div><code>{_html_escape(str(v))}</code></div>"
         for k, v in kv_items
     )
 
@@ -4486,19 +5222,18 @@ def _build_card_html(name, note, kind_badge, status_badge, status_badge_class,
             f'</div>'
         )
 
-    model_html = _model_details_html(models, model_stats) if models is not None else ""
+    model_html = _model_details_html(models, model_stats, label, edit_mode=False) if models is not None else ""
     card_class = f'card {accent_class}'.strip()
 
-    return f"""<div class="{card_class}">
-  <div class="card-header">
-    <div class="card-name">🔀 {_html_escape(name)} <span class="card-note">（{_html_escape(note)}）</span></div>
-    <div class="badge-group">{badges}</div>
-  </div>
+    return f"""<div class="{card_class}" data-label="{_html_escape(label or '')}">
+  {header_html}
+  <div class="card-detail">
   <div class="kv">{kv}</div>
   {f'<div class="card-desc">{_html_escape(description)}</div>' if description else ""}
   {stats_html}
-  {model_html}
+  <div class="model-section" data-label="{_html_escape(label or '')}">{model_html}</div>
   {raw_html}
+  </div>
 </div>"""
 
 
@@ -4508,16 +5243,19 @@ def _build_card_html(name, note, kind_badge, status_badge, status_badge_class,
 
 @app.get("/api/targets")
 async def api_targets():
-    """返回全部 target 配置 + secrets 元信息（key 打码）+ 统计。"""
+    """返回全部 target 配置 + secrets 元信息（key 打码）+ 统计 + 破解环境检测。"""
     result = []
     for t in _TARGETS:
         secret = _cfg.resolve_secret(t, _SECRETS)
-        result.append({
+        item = {
             **t,
             "secretSet": bool(secret),
             "secretMasked": _cfg.mask_secret(secret),
             "stats": _TARGET_STATS.get(t["label"], {}),
-        })
+        }
+        if t.get("category") == "crack" and t.get("crackTool"):
+            item["crackEnv"] = _crack_env_check(t)
+        result.append(item)
     return {
         "anthropicForwardPort": _ANTHROPIC_FORWARD_PORT,
         "targets": result,
@@ -4535,7 +5273,7 @@ class TargetUpdate(BaseModel):
     targetPort: Optional[int] = None
     targetProtocol: Optional[str] = None
     routePrefix: Optional[str] = None
-    models: Optional[List[str]] = None
+    models: Optional[List] = None
     crackTool: Optional[str] = None
     secretRef: Optional[str] = None
     apikeyEnv: Optional[str] = None
@@ -4549,6 +5287,13 @@ async def api_update_target(label: str, update: TargetUpdate):
         if t["label"] == label:
             payload = update.model_dump(exclude_none=True)
             payload.pop("label", None)
+            # ── 防御：过滤总开关等 UI 辅助行（旧版 bug 会混入 id="全部模型"）──
+            if "models" in payload and isinstance(payload["models"], list):
+                payload["models"] = [
+                    m for m in payload["models"]
+                    if not (isinstance(m, dict) and m.get("id") == "全部模型")
+                    and not (isinstance(m, str) and m == "全部模型")
+                ]
             t.update(payload)
             break
     else:
@@ -4606,6 +5351,98 @@ async def api_reload():
     return {"ok": True, "changes": changes}
 
 
+async def _fetch_live_models(target: dict):
+    """从下游网关拉取真实模型列表（OpenAI 格式，data[].id）。
+
+    编辑弹框用：与 copilot 一致，展示下游真实可用模型。
+    返回模型 id 列表；拉取失败（无 key/超时/非 200）返回 None，调用方降级。
+    gemini-native handler：走 Google 原生 /v1beta/models，解析 models[].name。
+    """
+    host = target.get("targetHost") or ""
+    if not host:
+        return None
+    protocol = target.get("targetProtocol", "https")
+    port = target.get("targetPort", 443)
+    prefix = target.get("routePrefix", "")
+    url = f"{protocol}://{host}:{port}{prefix}/models"
+    headers = {}
+    secret = _cfg.resolve_secret(target, _SECRETS)
+    if secret:
+        headers["Authorization"] = f"Bearer {secret}"
+    for k, v in (target.get("extraHeaders") or {}).items():
+        headers[k] = v
+    is_gemini_native = target.get("handler") == "gemini-native"
+    if is_gemini_native:
+        headers.pop("Authorization", None)
+        if secret:
+            headers["x-goog-api-key"] = secret
+        url = f"{_GEMINI_NATIVE_BASE}/models"
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(8.0), trust_env=False) as c:
+            resp = await c.get(url, headers=headers)
+            if resp.status_code != 200:
+                return None
+            data = resp.json()
+            ids = []
+            if is_gemini_native:
+                for m in (data.get("models", []) or []):
+                    nm = m.get("name", "") if isinstance(m, dict) else ""
+                    if nm.startswith("models/"):
+                        ids.append(nm[len("models/"):])
+            else:
+                items = data.get("data", []) if isinstance(data, dict) else []
+                for m in items:
+                    if isinstance(m, dict) and m.get("id"):
+                        ids.append(m["id"])
+                    elif isinstance(m, str):
+                        ids.append(m)
+            return ids or None
+    except Exception as e:
+        logger.debug(f"_fetch_live_models {url} failed: {e}")
+        return None
+
+
+@app.get("/api/targets/{label}/models", response_class=HTMLResponse)
+async def api_target_models_html(label: str, edit: int = 0):
+    """返回单个 target 的模型区 HTML（edit=1 时渲染编辑态：全部模型 + 展示开关）。
+
+    供 dashboard 前端「编辑模型」切换时无整页刷新重渲染。
+    edit=1 时优先从下游 /models 拉取真实模型列表（与 copilot 一致），
+    拉取失败则降级为 targets.json 配置的 models。
+    """
+    from fastapi.responses import HTMLResponse as _HR
+    target = next((t for t in _TARGETS if t["label"] == label), None)
+    if target is None:
+        raise HTTPException(status_code=404, detail=f"target '{label}' 不存在")
+    models = target.get("models", [])
+    if edit:
+        live = await _fetch_live_models(target)
+        if live:
+            # 合并：以下游为准，保留 targets.json 中已存在的 enabled 状态
+            local = {}
+            for m in models:
+                if isinstance(m, dict):
+                    local[m.get("id", "")] = m.get("enabled", True)
+                else:
+                    local[str(m)] = True
+            merged, seen = [], set()
+            for mid in live:
+                merged.append({"id": mid, "enabled": local.get(mid, True)})
+                seen.add(mid)
+            for mid, en in local.items():
+                if mid and mid not in seen:
+                    merged.append({"id": mid, "enabled": en})
+            models = merged
+    stats = _TARGET_STATS.get(label, {})
+    html = _model_details_html(
+        models,
+        model_stats=_MODEL_STATS.get(label, {}),
+        label=label,
+        edit_mode=bool(edit),
+    )
+    return _HR(html)
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 
 @app.get("/dashboard", response_class=HTMLResponse)
@@ -4658,25 +5495,42 @@ async def dashboard():
     total_requests_all = sum(r["total"] for r in results if r["alive"])
     alive_ports = sum(1 for r in results if r["alive"])
 
-    cards = []
+    # ── 局域网 IP（可粘贴 base_url 用）──
+    _lan_ip = _get_lan_ip()
 
-    # ── 8081 Anthropic（FastAPI，本 App 自身） ──
-    cards.append(_build_card_html(
-        name="claude-code-proxy (8081 Anthropic)",
+    # ── 分组：聚合网关(8081) / 破解网关(crack) / 直连网关(free/paid) ──
+    agg_cards, crack_cards, direct_cards = [], [], []
+
+    # ── 8081 Anthropic（FastAPI，本 App 自身）—— 聚合网关 ──
+    _8081_total = _ANTHROPIC_STATS.get("totalRequests", 0)
+    _8081_ok = _ANTHROPIC_STATS.get("passthroughOk", 0)
+    _8081_err = _ANTHROPIC_STATS.get("passthroughError", 0)
+    _8081_rate = round(_8081_ok / _8081_total * 100, 1) if _8081_total > 0 else 100.0
+    agg_cards.append(_build_card_html(
+        name="anthropic-compatible (8081)",
         note="FastAPI · Anthropic 协议入口 · /v1/messages 翻译为 OpenAI 后内部请求 8082",
         kind_badge="协议转换",
-        status_badge="运行中",
+        status_badge=f"{_8081_total} 请求" if _8081_total > 0 else "运行中",
         status_badge_class="purple",
         kv_items=[
+            ("base_url", f"http://{_lan_ip}:8081"),
             ("监听地址", "http://0.0.0.0:8081"),
             ("内部回调", "http://127.0.0.1:8082/v1/chat/completions"),
             ("协议", "Anthropic /v1/messages → OpenAI 翻译"),
             ("模型数量", f"{len(_ANTHROPIC_PORT_MODELS)} 个（仅 Anthropic）"),
-            ("systemd 服务", "claude-code-proxy"),
+            ("systemd 服务", "anthropic-compatible"),
         ],
         models=_ANTHROPIC_PORT_MODELS,
-        model_stats=None,
+        model_stats=_MODEL_STATS.get("anthropic", {}),
+        stats_detail={
+            "total": _8081_total, "ok": _8081_ok, "err": _8081_err,
+            "translated": 0, "success_rate": _8081_rate,
+            "uptime": _format_uptime(_ANTHROPIC_STATS.get("startedAt", "")), "alive": True,
+        },
         description="接收 Anthropic 客户端请求，结构化解码后转换为 OpenAI 格式，内部转发到 8082（copilot 透传）。响应译回 Anthropic 格式。",
+        label=None,
+        port=8081,
+        meta_badges=[("聚合网关", "b-meta-agg"), ("Anthropic 协议", "b-meta-normal")],
     ))
 
     # ── 动态 target 卡片（targets.json 驱动）──
@@ -4691,8 +5545,29 @@ async def dashboard():
         category = t.get("category", "free")
         badge_map = {"crack": "破解·质量高", "free": "免费·不破解", "paid": "收费·不破解"}
         badge_class_map = {"crack": "blue", "free": "green", "paid": "orange"}
+        # ── 模型标签分类：破解/非破解 · 免费/收费（破解都免费）· 稳定性（破解/收费高，免费低）──
+        is_crack = category == "crack"
+        is_free = category != "paid"
+        is_stable = category in ("crack", "paid")  # 破解与收费服务稳定性高
+        meta_badges = [
+            ("破解" if is_crack else "非破解", "b-meta-crack" if is_crack else "b-meta-normal"),
+            ("免费" if is_free else "收费", "b-meta-free" if is_free else "b-meta-paid"),
+            ("稳定性高" if is_stable else "稳定性低", "b-meta-stable" if is_stable else "b-meta-unstable"),
+        ]
+        if t.get("handler") == "gemini-native":
+            meta_badges.append(("gemini 协议", "b-meta-gemini"))
         secret = _cfg.resolve_secret(t, _SECRETS)
+        # 可粘贴 base_url：局域网 IP + 本机端口 + 后缀（客户端直接可用）
+        # - crack 类：我们自己定义 base_url 规范，客户端统一 /v1，代理内部映射到下游
+        # - gemini-native：客户端走 OpenAI 协议入口 /v1
+        # - free/paid 透传：直接用上游 routePrefix（如 /api/v1）
+        if t.get("category") == "crack" or t.get("handler") == "gemini-native":
+            _base_suffix = "/v1"
+        else:
+            _base_suffix = t.get("routePrefix", "")
+        _base_url = f"http://{_lan_ip}:{port}{_base_suffix}"
         kv = [
+            ("base_url", _base_url),
             ("分类", badge_map.get(category, category)),
             ("handler", t.get("handler", "passthrough")),
             ("上游", f"{t.get('targetProtocol','https')}://{t['targetHost']}:{t.get('targetPort',443)}{t.get('routePrefix','')}"),
@@ -4705,7 +5580,17 @@ async def dashboard():
         # ── 卡片内联 token 编辑块 ──
         sec_ref = t.get("secretRef", "")
         esc_label = t["label"].replace("'", "\\'")
-        recrack_btn = f'<button class="te-recrack" onclick="recrackCard(\'{esc_label}\', this)">重新破解</button>' if t.get('category') == 'crack' else ''
+        # 破解环境检测：不可用则置灰 + title 提示
+        recrack_btn = ""
+        if t.get('category') == 'crack' and t.get('crackTool'):
+            env = _crack_env_check(t)
+            if env.get("available"):
+                recrack_btn = f'<button class="te-recrack" onclick="recrackCard(\'{esc_label}\', this)">重新破解</button>'
+            else:
+                recrack_btn = (
+                    f'<button class="te-recrack" disabled title="{_html_escape(env.get("reason", "环境依赖缺失"))}">'
+                    f'重新破解</button>'
+                )
         token_status = "✅ 已配置 " + _cfg.mask_secret(secret) if secret else "⚠️ 缺失"
         input_placeholder = "已配置，输入新值覆盖" if secret else "填写 " + (sec_ref or "token")
         input_value = "******" if secret else ""
@@ -4721,7 +5606,7 @@ async def dashboard():
             f'</div>'
         )
 
-        cards.append(_build_card_html(
+        card = _build_card_html(
             name=f"{t['label']} ({port})",
             note="统一透传引擎 · targets.json 驱动",
             kind_badge=badge_map.get(category, category),
@@ -4734,9 +5619,29 @@ async def dashboard():
             description=f"category={category} · handler={t.get('handler','passthrough')} · isFree={t.get('isFree')}",
             accent_class=f"accent-{port}",
             raw_html=token_edit,
-        ))
+            label=t["label"],
+            port=port,
+            meta_badges=meta_badges,
+        )
+        if category == "crack":
+            crack_cards.append(card)
+        else:
+            direct_cards.append(card)
 
-    cards_html = "".join(cards)
+    def _render_group(title, cards_list):
+        if not cards_list:
+            return ""
+        return (
+            f'<div class="section"><div class="section-title">{title}'
+            f'<span class="sec-count">{len(cards_list)}</span></div>'
+            f'<div class="card-grid">{"".join(cards_list)}</div></div>'
+        )
+
+    cards_html = (
+        _render_group("聚合网关", agg_cards)
+        + _render_group("破解网关", crack_cards)
+        + _render_group("直连网关", direct_cards)
+    )
     all_models = _build_models_list()
     # 生成概览栏的状态点
     overview_dots = "".join(
@@ -4748,6 +5653,7 @@ async def dashboard():
 <html lang="zh-CN">
 <head>
 <meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
 <title>LLM Gateway — 管理总览</title>
 <style>{DASHBOARD_STYLE}</style>
 </head>
@@ -4763,89 +5669,304 @@ async def dashboard():
     <div class="divider"></div>
     <div>{overview_dots} {" ".join(str(p) for p in _dash_ports)}</div>
     <div class="divider"></div>
-    <button onclick="location.reload()" style="background:#16213e;color:#60a5fa;border:1px solid #2a3a5e;border-radius:6px;padding:6px 14px;cursor:pointer;font-size:13px;font-weight:600;transition:background 0.2s" onmouseover="this.style.background='#1e3058'" onmouseout="this.style.background='#16213e'">🔄 刷新状态</button>
+    <button class="ov-btn" onclick="doReload()">♻️ 重载配置</button>
+    <button class="ov-btn ov-btn-primary" onclick="location.reload()">🔄 刷新状态</button>
+    <span id="ov-msg" class="ov-msg" role="status"></span>
   </div>
-  <div class="section">
-    <div class="section-title">服务架构</div>
-    <div class="card-grid">{cards_html}</div>
+  {cards_html}
+
+  <!-- 模型编辑 modal -->
+  <div class="modal-overlay" id="model-modal" role="dialog" aria-modal="true" aria-label="编辑模型展示">
+    <div class="modal">
+      <div class="modal-head">
+        <h3 id="model-modal-title">编辑模型</h3>
+        <button class="modal-close" onclick="closeModelEditor()" aria-label="关闭">×</button>
+      </div>
+      <div class="modal-body" id="model-modal-body"></div>
+      <div class="modal-foot">
+        <span class="modal-msg" id="model-modal-msg"></span>
+        <button class="modal-btn" onclick="closeModelEditor()">取消</button>
+        <button class="modal-btn modal-btn-primary" id="model-modal-save" onclick="saveModelEditor(this)">保存</button>
+      </div>
+    </div>
   </div>
-  <div class="admin-panel" style="border-top:2px solid #60a5fa;background:#12142a;position:sticky;bottom:0;padding:16px 22px">
-  <h3>⚙️ 管理操作</h3>
-  <div id="admin-msg"></div>
-  <table class="model-table" id="admin-table">
-    <thead><tr><th>label</th><th>端口</th><th>分类</th><th>isFree</th></tr></thead>
-    <tbody id="admin-tbody"></tbody>
-  </table>
-  <p><button onclick="doReload()">♻️ 手动重载配置</button></p>
-</div>
 <script>
-async function loadAdmin() {{
-  const resp = await fetch('/api/targets');
-  const data = await resp.json();
-  const tbody = document.getElementById('admin-tbody');
-  tbody.innerHTML = '';
-  for (const t of data.targets) {{
-    const tr = document.createElement('tr');
-    tr.innerHTML = `
-      <td>${{t.label}}</td>
-      <td>${{t.listenPort}}</td>
-      <td>${{t.category}}${{t.isFree ? ' (免费)' : ''}}</td>
-      <td><input type="checkbox" ${{t.isFree ? 'checked' : ''}} onchange="setIsFree('${{t.label}}', this.checked)"></td>`;
-    tbody.appendChild(tr);
-  }}
-}}
-async function setIsFree(label, val) {{
-  const resp = await fetch('/api/targets/' + label, {{
-    method: 'PUT', headers: {{'Content-Type': 'application/json'}},
-    body: JSON.stringify({{isFree: val}})
+// ── 手风琴交互（互斥，任一时刻只展开一个）──
+(function() {{
+  var cards = document.querySelectorAll('.card');
+  cards.forEach(function(card) {{
+    var toggle = card.querySelector('.card-toggle');
+    var detail = card.querySelector('.card-detail');
+    var arrow = toggle ? toggle.querySelector('.ct-arrow') : null;
+    if (!toggle || !detail) return;
+
+    toggle.addEventListener('click', function() {{
+      var isOpen = detail.classList.contains('open');
+      // 关闭所有卡片
+      cards.forEach(function(c) {{
+        var d = c.querySelector('.card-detail');
+        var a = c.querySelector('.ct-arrow');
+        var t = c.querySelector('.card-toggle');
+        if (d) d.classList.remove('open');
+        if (a) a.classList.remove('open');
+        if (t) t.setAttribute('aria-expanded', 'false');
+      }});
+      // 打开当前卡片（如果之前是关闭的）
+      if (!isOpen) {{
+        detail.classList.add('open');
+        if (arrow) arrow.classList.add('open');
+        toggle.setAttribute('aria-expanded', 'true');
+      }}
+    }});
   }});
-  document.getElementById('admin-msg').textContent = JSON.stringify(await resp.json());
-}}
-async function recrackCard(label, btn) {{
-  btn.disabled = true; btn.textContent = '破解中...';
-  const resp = await fetch('/api/targets/' + label + '/recrack', {{method: 'POST'}});
-  const r = await resp.json();
-  if (resp.ok) {{
-    btn.textContent = '✅ 已破解'; btn.style.background = '#4ade80';
-    setTimeout(() => {{ location.reload(); }}, 1200);
-  }} else {{
-    btn.textContent = '❌ 失败'; btn.style.background = '#ef4444';
-    document.getElementById('admin-msg').textContent = JSON.stringify(r);
-    setTimeout(() => {{ btn.disabled = false; btn.textContent = '重新破解'; btn.style.background = ''; }}, 2000);
+}})();
+
+// ── 模型编辑 modal：打开（fetch 编辑态 HTML 填入 modal）──
+async function openModelEditor(btn) {{
+  var label = btn.dataset.label;
+  var overlay = document.getElementById('model-modal');
+  var body = document.getElementById('model-modal-body');
+  var title = document.getElementById('model-modal-title');
+  var msg = document.getElementById('model-modal-msg');
+  if (!overlay || !body) return;
+  title.textContent = '编辑模型 — ' + label;
+  msg.textContent = '';
+  body.innerHTML = '<div class="no-models">加载中...</div>';
+  overlay.classList.add('open');
+  try {{
+    var resp = await fetch('/api/targets/' + encodeURIComponent(label) + '/models?edit=1');
+    var html = await resp.text();
+    if (resp.ok) {{
+      body.innerHTML = html;
+      bindModelEvents();
+    }} else {{
+      body.innerHTML = '<div class="no-models">加载失败: ' + html + '</div>';
+    }}
+  }} catch (e) {{
+    body.innerHTML = '<div class="no-models">加载异常: ' + e + '</div>';
   }}
 }}
-async function saveCardToken(label, btn) {{
-  const row = btn.closest('.token-edit');
-  const input = row.querySelector('.te-input');
-  const ref = input.dataset.ref;
-  const val = input.value;
-  if (!ref) {{ alert('该 target 未配置 secretRef'); return; }}
-  if (!val || val === '******') {{ alert('请输入新的 token 值'); return; }}
+
+function closeModelEditor() {{
+  var overlay = document.getElementById('model-modal');
+  if (overlay) overlay.classList.remove('open');
+}}
+
+// 点击遮罩关闭
+(function() {{
+  var overlay = document.getElementById('model-modal');
+  if (overlay) {{
+    overlay.addEventListener('click', function(e) {{
+      if (e.target === overlay) overlay.classList.remove('open');
+    }});
+  }}
+}})();
+
+// ── 保存模型展示设置（读取 modal 内所有开关 → PUT models）──
+async function saveModelEditor(btn) {{
+  var overlay = document.getElementById('model-modal');
+  var body = document.getElementById('model-modal-body');
+  var msg = document.getElementById('model-modal-msg');
+  if (!overlay || !body) return;
+  var label = document.getElementById('model-modal-title').textContent.replace('编辑模型 — ', '');
+  var rows = body.querySelectorAll('.mrow');
+  var models = [];
+  rows.forEach(function(row) {{
+    var idEl = row.querySelector('.mrow-id');
+    var sw = row.querySelector('.model-show');
+    if (!idEl || !sw) return;  // 跳过总开关行（无子开关 .model-show）
+    var mid = idEl.textContent;
+    models.push({{id: mid, enabled: sw.checked}});
+  }});
   btn.disabled = true; btn.textContent = '保存中...';
   try {{
-    const resp = await fetch('/api/secrets/' + label, {{
+    var resp = await fetch('/api/targets/' + encodeURIComponent(label), {{
       method: 'PUT', headers: {{'Content-Type': 'application/json'}},
-      body: JSON.stringify({{value: val}}),
+      body: JSON.stringify({{models: models}}),
     }});
-    const r = await resp.json();
+    var r = await resp.json();
     if (resp.ok) {{
-      btn.textContent = '✅ 已保存'; btn.style.background = '#4ade80';
-      input.value = '******'; input.placeholder = '已配置，输入新值覆盖';
-      setTimeout(() => {{ btn.disabled = false; btn.textContent = '保存'; btn.style.background = ''; }}, 2000);
+      msg.textContent = '✅ 已保存，热生效';
+      msg.className = 'modal-msg success';
+      setTimeout(function() {{ location.reload(); }}, 800);
     }} else {{
-      alert('保存失败: ' + JSON.stringify(r.detail || r));
+      msg.textContent = '❌ 保存失败: ' + JSON.stringify(r.detail || r);
+      msg.className = 'modal-msg danger';
       btn.disabled = false; btn.textContent = '保存';
     }}
   }} catch (e) {{
-    alert('保存异常: ' + e);
+    msg.textContent = '❌ 保存异常: ' + e;
+    msg.className = 'modal-msg danger';
     btn.disabled = false; btn.textContent = '保存';
   }}
 }}
-async function doReload() {{
-  const resp = await fetch('/api/reload', {{method: 'POST'}});
-  document.getElementById('admin-msg').textContent = JSON.stringify(await resp.json());
+
+// ── 总开关：全开/全关/部分开（indeterminate），联动所有子开关 ──
+function syncMasterState() {{
+  var body = document.getElementById('model-modal-body');
+  if (!body) return;
+  var master = body.querySelector('.model-master');
+  if (!master) return;
+  var subs = Array.prototype.slice.call(body.querySelectorAll('.mrow .model-show'));
+  if (subs.length === 0) return;
+  var on = subs.filter(function(s) {{ return s.checked; }}).length;
+  if (on === 0) {{
+    master.checked = false; master.indeterminate = false;
+  }} else if (on === subs.length) {{
+    master.checked = true; master.indeterminate = false;
+  }} else {{
+    master.checked = false; master.indeterminate = true;
+  }}
 }}
-loadAdmin();
+
+// ── 绑定模型编辑事件（modal 内开关绑定 + 总开关联动）──
+function bindModelEvents() {{
+  document.querySelectorAll('.model-show').forEach(function(sw) {{
+    if (sw._bound) return;
+    sw._bound = true;
+    sw.addEventListener('change', syncMasterState);
+  }});
+  var master = document.querySelector('#model-modal-body .model-master');
+  if (master && !master._bound) {{
+    master._bound = true;
+    master.addEventListener('change', function() {{
+      var checked = master.checked;
+      document.querySelectorAll('#model-modal-body .mrow .model-show').forEach(function(sw) {{
+        sw.checked = checked;
+      }});
+      syncMasterState();
+    }});
+  }}
+  syncMasterState();
+}}
+
+// ── modal 内模型搜索过滤（隐藏不匹配行）──
+function filterModels(input) {{
+  var q = (input.value || '').toLowerCase().trim();
+  var body = document.getElementById('model-modal-body');
+  if (!body) return;
+  var visible = 0;
+  body.querySelectorAll('.mrow').forEach(function(row) {{
+    var text = (row.textContent || '').toLowerCase();
+    var match = !q || text.indexOf(q) >= 0;
+    row.style.display = match ? '' : 'none';
+    if (match) visible++;
+  }});
+  // 无匹配时提示
+  var empty = body.querySelector('.no-models');
+  if (q && visible === 0) {{
+    if (!empty) {{
+      empty = document.createElement('div');
+      empty.className = 'no-models';
+      body.appendChild(empty);
+    }}
+    empty.textContent = '无匹配模型: ' + input.value;
+  }} else if (empty) {{
+    empty.remove();
+  }}
+}}
+
+// ── 破解 token 重试 ──
+async function recrackCard(label, btn) {{
+  btn.disabled = true; btn.textContent = '破解中...';
+  try {{
+    var resp = await fetch('/api/targets/' + label + '/recrack', {{method: 'POST'}});
+    var r = await resp.json();
+    if (resp.ok) {{
+      btn.textContent = '✅ 已破解'; btn.style.background = '#4ade80';
+      setTimeout(function() {{ location.reload(); }}, 1200);
+    }} else {{
+      btn.textContent = '❌ 失败'; btn.style.background = '#ef4444';
+      setOvMsg('❌ ' + (r.message || JSON.stringify(r)), 'danger');
+      setTimeout(function() {{ btn.disabled = false; btn.textContent = '重新破解'; btn.style.background = ''; }}, 2000);
+    }}
+  }} catch (e) {{
+    btn.textContent = '❌ 失败'; btn.style.background = '#ef4444';
+    setOvMsg('❌ 破解异常: ' + e, 'danger');
+    setTimeout(function() {{ btn.disabled = false; btn.textContent = '重新破解'; btn.style.background = ''; }}, 2000);
+  }}
+}}
+
+async function saveCardToken(label, btn) {{
+  var row = btn.closest('.token-edit');
+  var input = row.querySelector('.te-input');
+  var ref = input.dataset.ref;
+  var val = input.value;
+  if (!ref) {{
+    showTeStatus(row, '❌ 该 target 未配置 secretRef', 'danger');
+    return;
+  }}
+  if (!val || val === '******') {{
+    showTeStatus(row, '⚠️ 请输入新的 token 值', 'warning');
+    return;
+  }}
+  btn.disabled = true; btn.textContent = '保存中...';
+  try {{
+    var resp = await fetch('/api/secrets/' + label, {{
+      method: 'PUT', headers: {{'Content-Type': 'application/json'}},
+      body: JSON.stringify({{value: val}}),
+    }});
+    var r = await resp.json();
+    if (resp.ok) {{
+      btn.textContent = '✅ 已保存'; btn.style.background = '#4ade80';
+      input.value = '******'; input.placeholder = '已配置，输入新值覆盖';
+      showTeStatus(row, '✅ 已保存，热生效', 'success');
+      setTimeout(function() {{ btn.disabled = false; btn.textContent = '保存'; btn.style.background = ''; }}, 2000);
+    }} else {{
+      btn.disabled = false; btn.textContent = '保存';
+      showTeStatus(row, '❌ 保存失败: ' + JSON.stringify(r.detail || r), 'danger');
+    }}
+  }} catch (e) {{
+    btn.disabled = false; btn.textContent = '保存';
+    showTeStatus(row, '❌ 保存异常: ' + e, 'danger');
+  }}
+}}
+
+function showTeStatus(row, msg, level) {{
+  var status = row.querySelector('.te-status');
+  if (status) {{
+    var colors = {{'success': '#4ade80', 'warning': '#fbbf24', 'danger': '#f87171'}};
+    status.textContent = msg;
+    status.style.color = colors[level] || '#9ca3af';
+    if (level === 'success') {{
+      setTimeout(function() {{ status.style.color = '#9ca3af'; }}, 3000);
+    }}
+  }}
+}}
+
+// ── 模型编辑 modal（openModelEditor/saveModelEditor 在上方定义）──
+
+function setOvMsg(msg, level) {{
+  var el = document.getElementById('ov-msg');
+  if (!el) return;
+  el.textContent = msg;
+  el.className = 'ov-msg ' + (level || '');
+  if (level !== 'danger') {{
+    setTimeout(function() {{ el.textContent = ''; }}, 4000);
+  }}
+}}
+
+async function doReload() {{
+  var btn = event.target;
+  if (btn) {{ btn.disabled = true; btn.textContent = '重载中...'; }}
+  try {{
+    var resp = await fetch('/api/reload', {{method: 'POST'}});
+    var r = await resp.json();
+    if (resp.ok) {{
+      setOvMsg('✅ 配置已重载（' + (r.changes ? JSON.stringify(r.changes) : 'ok') + '）', 'success');
+      setTimeout(function() {{ location.reload(); }}, 800);
+    }} else {{
+      setOvMsg('❌ 重载失败: ' + JSON.stringify(r), 'danger');
+      if (btn) {{ btn.disabled = false; btn.textContent = '♻️ 重载配置'; }}
+    }}
+  }} catch (e) {{
+    setOvMsg('❌ 重载异常: ' + e, 'danger');
+    if (btn) {{ btn.disabled = false; btn.textContent = '♻️ 重载配置'; }}
+  }}
+}}
+
+// ── 初始化 ──
+bindModelEvents();
 </script>
 </body>
 </html>"""
