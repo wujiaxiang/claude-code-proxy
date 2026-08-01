@@ -28,6 +28,7 @@
 - 模型编辑弹框保存时总开关行（"全部模型"）被误存为模型 —— 前端跳过无子开关行 + 后端 API 防御性过滤
 - qclaw handler 客户端不带 system message 时上游 400 —— asyncio 端口补齐 system 消息（与 FastAPI 路径一致）
 - config_store.py 合法 handler 校验遗漏 gemini-native
+- **codebuddy 非流式请求自动转流式聚合**：上游（copilot.tencent.com）对所有模型拒绝非流式 chat（11101），代理检测后自动 `stream:true` 重试并聚合 SSE 为完整 JSON（含 reasoning_content/tool_calls/usage），非流式客户端也可用
 
 ---
 

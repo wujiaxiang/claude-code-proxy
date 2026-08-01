@@ -784,6 +784,98 @@ def _vendor_body_retryable(body_text: str) -> bool:
     return any(p.search(body_text) for p in _VENDOR_ERROR_PATTERNS)
 
 
+async def _aggregate_codebuddy_stream(target, upstream_url, fwd_headers, body_json, label):
+    """codebuddy 非流式请求转流式聚合：stream:true 重试，收集 SSE 拼装完整 JSON。
+
+    上游（copilot.tencent.com）拒绝非流式 chat（11101），但流式可用。
+    返回 OpenAI 格式完整响应 dict；失败返回 None（调用方透传上游 400）。
+    """
+    import json as _json
+    retry_body = dict(body_json)
+    retry_body["stream"] = True
+    payload = _json.dumps(retry_body, ensure_ascii=False).encode("utf-8")
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(300.0, connect=10.0), trust_env=False) as client:
+            req = client.build_request("POST", upstream_url, headers=fwd_headers, content=payload)
+            resp = await client.send(req, stream=True)
+            if resp.status_code >= 400:
+                await resp.aread()
+                return None
+
+            # ── 聚合 SSE chunks ──
+            chunks = []          # choices 的 delta 序列（按 index 分组）
+            usage = None
+            created = int(time.time())
+            resp_id = ""
+            model = retry_body.get("model", "")
+            finish_reason = None
+            async for raw in resp.aiter_lines():
+                line = raw.strip()
+                if not line.startswith("data:"):
+                    continue
+                data_str = line[5:].strip()
+                if not data_str or data_str == "[DONE]":
+                    continue
+                try:
+                    chunk = _json.loads(data_str)
+                except Exception:
+                    continue
+                if not resp_id:
+                    resp_id = chunk.get("id", "")
+                if chunk.get("model"):
+                    model = chunk["model"]
+                if chunk.get("usage"):
+                    usage = chunk["usage"]
+                for c in chunk.get("choices", []) or []:
+                    idx = c.get("index", 0)
+                    while len(chunks) <= idx:
+                        chunks.append({"role": "assistant", "content": "", "tool_calls": []})
+                    delta = c.get("delta", {}) or {}
+                    if delta.get("content"):
+                        chunks[idx]["content"] += delta["content"]
+                    if delta.get("reasoning_content"):
+                        chunks[idx].setdefault("reasoning_content", "")
+                        chunks[idx]["reasoning_content"] += delta["reasoning_content"]
+                    if delta.get("tool_calls"):
+                        for tc in delta["tool_calls"]:
+                            while len(chunks[idx]["tool_calls"]) <= tc.get("index", 0):
+                                chunks[idx]["tool_calls"].append({"id": "", "type": "function", "function": {"name": "", "arguments": ""}})
+                            tgt = chunks[idx]["tool_calls"][tc.get("index", 0)]
+                            if tc.get("id"):
+                                tgt["id"] = tc["id"]
+                            fn = tc.get("function", {}) or {}
+                            if fn.get("name"):
+                                tgt["function"]["name"] += fn["name"]
+                            if fn.get("arguments"):
+                                tgt["function"]["arguments"] += fn["arguments"]
+                    if c.get("finish_reason"):
+                        finish_reason = c["finish_reason"]
+
+            choices = [{
+                "index": i,
+                "message": c,
+                "finish_reason": finish_reason or "stop",
+            } for i, c in enumerate(chunks)]
+            if not choices:
+                # 无任何 chunk（异常空响应），不拼装
+                return None
+            return {
+                "id": resp_id or f"chatcmpl-{uuid.uuid4().hex[:24]}",
+                "object": "chat.completion",
+                "created": created,
+                "model": model,
+                "choices": choices,
+                "usage": usage or {
+                    "prompt_tokens": 0,
+                    "completion_tokens": 0,
+                    "total_tokens": 0,
+                },
+            }
+    except Exception as e:
+        logger.warning(f"[{label}] codebuddy aggregate failed: {e}")
+        return None
+
+
 # ─── HTTP 代理共享工具函数（所有端口统一用，不要各写各的） ───
 
 async def _parse_http_request(reader):
@@ -1884,6 +1976,33 @@ async def _handle_target_request(reader, writer, target):
 
             if status >= 400:
                 logger.warning(f"[{label}] HTTP {status}: {body_text[:300]}")
+
+            # ── codebuddy 上游只支持流式：非流式请求自动转流式聚合 ──
+            # 上游（copilot.tencent.com）对非流式 chat 返回 11101 "Non-stream chat request
+            # is currently not supported"。检测到该错误时，用 stream:true 重试并聚合 SSE。
+            if (
+                status == 400
+                and '"code":11101' in body_text
+                and target.get("label") == "codebuddy"
+            ):
+                # body_json 可能为 None（passthrough handler 不解析），这里自行解析
+                try:
+                    _agg_body = json.loads(body_bytes.decode("utf-8")) if body_bytes else None
+                except Exception:
+                    _agg_body = None
+                if _agg_body and not _agg_body.get("stream"):
+                    aggregated = await _aggregate_codebuddy_stream(
+                        target, upstream_url, fwd_headers, _agg_body, label
+                    )
+                    if aggregated is not None:
+                        if _req_model:
+                            _bump_model_stats(label, _req_model, "ok")
+                        payload = json.dumps(aggregated, ensure_ascii=False).encode("utf-8")
+                        writer.write(f"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {len(payload)}\r\n\r\n".encode())
+                        writer.write(payload)
+                        await writer.drain()
+                        writer.close(); return
+                    # 聚合失败：继续走下方错误处理（透传上游 400）
 
             if _vendor_body_retryable(body_text):
                 stats["translated429"] += 1

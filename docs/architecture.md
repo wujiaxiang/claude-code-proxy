@@ -88,6 +88,10 @@ Anthropic 协议：base_url = http://192.168.2.128:8081，api_key = "dummy"
 | `qclaw` | 去前缀、自动补 system message、body 清理、注入 `User-Agent: OpenAI/JS 6.39.1` |
 | `gemini-native` | **OpenAI ↔ Gemini 原生转换**（见下） |
 
+> **codebuddy 特例（label=codebuddy）**：上游 `copilot.tencent.com` 对所有模型拒绝非流式 chat（错误码 11101），只接受 `stream:true`。
+> 代理自动处理：客户端发非流式请求 → 检测到 11101 → 内部以 `stream:true` 重试 → 收集 SSE chunks 聚合为完整 JSON
+> （含 `reasoning_content` / `tool_calls` / `usage`）→ 返回客户端。非流式客户端也可用，行为与 copilot/qclaw 一致。
+
 ## gemini-native 协议转换
 
 8092 端口接受 **OpenAI 协议**请求，代理内部转换为 **Google 原生 generateContent API**：
