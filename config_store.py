@@ -65,15 +65,20 @@ def load_targets(path: Path = TARGETS_PATH) -> dict:
             "isFree": t.get("isFree", category == "free"),
             "enabled": t.get("enabled", True),
         })
-    return {
+    result = {
         "anthropicForwardPort": raw.get("anthropicForwardPort", 8082),
         "targets": normalized,
     }
+    af = raw.get("anthropicForward")
+    if af is not None:
+        result["anthropicForward"] = af
+    return result
 
 
 def validate_targets(cfg: dict) -> list:
     """校验配置，返回错误消息列表（空 = 通过）。"""
     errors = []
+    _validate_anthropic_forward(cfg.get("anthropicForward"), errors)
     targets = cfg.get("targets", [])
     labels = {}
     ports = {}
@@ -103,6 +108,33 @@ def validate_targets(cfg: dict) -> list:
             errors.append(f"端口 {port} 被多个 target 占用 ({ports[port]}, {label})")
         ports[port] = label
     return errors
+
+
+def _validate_anthropic_forward(af: object, errors: list) -> None:
+    """校验顶层 anthropicForward 配置（8081 转发目标：可指定默认端口 + 按模型映射端口/模型）。"""
+    if af is None:
+        return
+    if not isinstance(af, dict):
+        errors.append(f"anthropicForward 配置非法: 必须为对象")
+        return
+    default_port = af.get("defaultPort")
+    if default_port is not None and (isinstance(default_port, bool) or not isinstance(default_port, int) or default_port < 0):
+        errors.append(f"anthropicForward 配置非法: defaultPort 必须为非负整数")
+    model_map = af.get("modelMap")
+    if model_map is not None:
+        if not isinstance(model_map, dict):
+            errors.append(f"anthropicForward 配置非法: modelMap 必须为对象")
+        else:
+            for model_name, entry in model_map.items():
+                if not isinstance(entry, dict):
+                    errors.append(f"anthropicForward 配置非法: modelMap['{model_name}'] 必须为对象")
+                    continue
+                port = entry.get("port")
+                if isinstance(port, bool) or not isinstance(port, int) or port < 0:
+                    errors.append(f"anthropicForward 配置非法: modelMap['{model_name}'].port 必须为非负整数")
+                model = entry.get("model")
+                if not isinstance(model, str) or not model:
+                    errors.append(f"anthropicForward 配置非法: modelMap['{model_name}'].model 必须为非空字符串")
 
 
 def _validate_aggregator_target(t: dict, label: str, errors: list) -> None:

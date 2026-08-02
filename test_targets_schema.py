@@ -166,6 +166,42 @@ def test_validate_aggregator_bad_weight():
     assert any("agg:sonnet" in e and "weight" in e for e in errors), f"应报 weight 非法，实际: {errors}"
 
 
+# ─── anthropicForward 顶层配置校验 ───
+def test_validate_anthropic_forward_valid():
+    cfg = {"anthropicForwardPort": 8082, "targets": [], "anthropicForward": {
+        "defaultPort": 8082,
+        "modelMap": {"claude-opus-4-5": {"port": 8080, "model": "agg:opus"}},
+    }}
+    errors = config_store.validate_targets(cfg)
+    assert errors == [], f"合法 anthropicForward 不应有错误，实际: {errors}"
+
+
+def test_validate_anthropic_forward_not_dict():
+    cfg = {"anthropicForwardPort": 8082, "targets": [], "anthropicForward": "nope"}
+    errors = config_store.validate_targets(cfg)
+    assert any("anthropicForward" in e for e in errors), f"应报 anthropicForward 非法，实际: {errors}"
+
+
+def test_validate_anthropic_forward_bad_default_port():
+    cfg = {"anthropicForwardPort": 8082, "targets": [], "anthropicForward": {"defaultPort": -1}}
+    errors = config_store.validate_targets(cfg)
+    assert any("anthropicForward" in e for e in errors), f"应报 defaultPort 非法，实际: {errors}"
+
+
+def test_validate_anthropic_forward_bad_model_map_entry():
+    cfg = {"anthropicForwardPort": 8082, "targets": [], "anthropicForward": {
+        "modelMap": {"claude-opus-4-5": {"port": 8080}},  # 缺 model
+    }}
+    errors = config_store.validate_targets(cfg)
+    assert any("anthropicForward" in e for e in errors), f"应报 modelMap 条目非法，实际: {errors}"
+
+
+def test_validate_anthropic_forward_model_map_not_dict():
+    cfg = {"anthropicForwardPort": 8082, "targets": [], "anthropicForward": {"modelMap": "nope"}}
+    errors = config_store.validate_targets(cfg)
+    assert any("anthropicForward" in e for e in errors), f"应报 modelMap 非 dict，实际: {errors}"
+
+
 # ─── secrets 读写与打码 ───
 def test_secrets_roundtrip():
     with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
