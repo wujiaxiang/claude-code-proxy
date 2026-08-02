@@ -7,6 +7,7 @@
 
 | 端口 | 供应商 | 分类 | handler | 协议 | 用途 |
 |------|--------|------|---------|------|------|
+| **8080** | aggregator | aggregate | aggregator | OpenAI | 聚合网关（虚拟模型路由 / 会话粘性 / 重试降级 / 配额熔断） |
 | **8081** | anthropic-compatible | — | FastAPI | Anthropic | Anthropic 入口 + dashboard（`/v1/messages` 翻译为 OpenAI 后内部请求 8082） |
 | **8082** | copilot | crack | copilot | OpenAI | GitHub Copilot Enterprise 破解透传 |
 | **8084** | codebuddy | crack | passthrough | OpenAI | CodeBuddy 破解透传 |
@@ -18,7 +19,7 @@
 | **8093** | opencode-zen | free | passthrough | OpenAI | 免费透传 |
 | **8094** | open-go | paid | passthrough | OpenAI | 收费透传 |
 
-- **分类**：`crack`（破解获取 token，注入 secrets.json）/ `free`（免费，透传客户端 key）/ `paid`（收费，透传客户端 key）
+- **分类**：`crack`（破解获取 token，注入 secrets.json）/ `free`（免费，透传客户端 key）/ `paid`（收费，透传客户端 key）/ `aggregate`（聚合网关，不持凭据）
 - **isFree**：管理界面维护，标记供应商 key 是否免费（重试策略预留字段）
 
 ## base_url 规范（客户端接入）
@@ -70,6 +71,84 @@ Anthropic 协议：base_url = http://192.168.2.128:8081，api_key = "dummy"
 **secrets 优先级**：`secrets.json` > `apikeyEnv` 环境变量 > 客户端透传（free/paid）。
 
 **热重载**：`targets.json` / `secrets.json` mtime 轮询（2s），修改后自动生效，无需重启。
+
+## 聚合网关（8080）
+
+聚合网关是**多下游统一入口**：客户端只连一个端口（8080，OpenAI 协议），用**虚拟模型 id**（如 `agg:sonnet`）请求，代理按配置把请求路由到多个真实下游 target 端口（8082 copilot / 8084 codebuddy / 8090 openrouter 等），并在成员之间做加权选择、会话粘性、失败重试与配额熔断。路由目标永远是**本地其他 target 端口**，聚合层本身不直连任何上游。
+
+### targets.json 配置
+
+聚合网关是一个普通 target（`handler: "aggregator"`），额外字段：
+
+```jsonc
+{
+  "label": "aggregator",
+  "listenPort": 8080,
+  "category": "aggregate",
+  "handler": "aggregator",
+  "enabled": true,
+  "targetHost": "",            // aggregator 不直连上游，targetHost/targetPort 置空
+  "name": "聚合网关",
+  "poolDefaults": {            // 全局默认（虚拟模型级可覆盖）
+    "defaultRetries": 2,       //   默认池每个成员尝试次数
+    "fallbackRetries": 1,      //   降级池尝试次数
+    "sessionAffinityTtlSeconds": 3600,  // 会话粘性缓存 TTL
+    "probeIntervalSeconds": 300,        // 熔断端口探测间隔
+    "weight": 1                //   成员默认权重（未显式指定时）
+  },
+  "quotaErrorPatterns": ["insufficient credit", "quota exceeded", "credits exhausted", "余额不足", "积分不足", "配额不足", "resource exhausted"],
+  "virtualModels": {
+    "agg:sonnet": {
+      "defaultPool": [
+        {"port": 8082, "model": "claude-sonnet-5", "weight": 3},
+        {"port": 8084, "model": "deepseek-v4-pro", "weight": 2},
+        {"port": 8090, "model": "openrouter/auto"}
+      ],
+      "fallbackPool": [{"port": 8094, "model": "gpt-5.6-luna"}],
+      "defaultRetries": 3,     // 虚拟模型级覆盖 poolDefaults
+      "fallbackRetries": 1
+    }
+  }
+}
+```
+
+字段语义：
+
+- **`virtualModels`**：虚拟模型 id → 配置的字典。每个虚拟模型含 `defaultPool`（必填，非空）+ `fallbackPool`（可空）+ `defaultRetries` / `fallbackRetries`（可省略，回退 `poolDefaults`）
+- **池成员**：`{"port": 下游端口, "model": 真实模型名, "weight": 可选权重}`；`weight` 缺省用 `poolDefaults.weight`（默认 1，平等）
+- **`poolDefaults`**：聚合级默认值，被虚拟模型级字段覆盖
+- **`quotaErrorPatterns`**：配额/积分不足类错误的正则列表（大小写不敏感）。**与 429 限流严格区分**：429 由 `_VENDOR_ERROR_PATTERNS` 翻译但不摘除端口；配额匹配会**熔断**该端口
+- 校验（config_store.py）：aggregator target 必须有非空 `virtualModels`，每个虚拟模型必须有非空 `defaultPool`，`fallbackPool` 必须为列表；`targetHost`/`targetPort` 允许为空
+
+### 路由策略
+
+- **加权随机**：每次从可用成员中按权重做加权随机选择（权重越大命中概率越高）
+- **会话粘性**：同一会话的连续请求尽量走同一成员。粘性 key = `(虚拟模型 id, session_id)`，本地内存缓存 + TTL（`sessionAffinityTtlSeconds`）。session_id 取自请求头 `x-session-id` / `x-conversation-id`，或 body 的 `conversation_id` / `session_id` / `user`。命中熔断成员的粘性缓存自动失效并重选
+- **未知虚拟模型**：body 的 `model` 不在已配置列表 → **400 快速失败**（不静默转发）
+
+### 重试与降级
+
+1. 默认池尝试 `defaultRetries` 次（每次换成员，避免同一成员重复失败）
+2. 默认池全部失败 → 降级池尝试 `fallbackRetries` 次（走 `fallbackPool` 成员，成功记为降级）
+3. 全部失败 → **503**（`AllPoolsExhausted`）；降级池为空则默认池失败后直接 503
+
+### 配额熔断与探测恢复
+
+- **触发**：下游响应体匹配 `quotaErrorPatterns`（如「余额不足」「积分不足」「resource exhausted」）→ 按**端口**熔断（该端口所有虚拟模型的所有成员一并摘除，`reason: "quota_error"`）
+- **熔断期间**：路由跳过该端口（粘性缓存若指向它也失效重选）；状态由 `tripped_ports()` 暴露
+- **探测恢复**：`_aggregator_prober` 每 5s 检查一次熔断端口是否到达 `probeIntervalSeconds` 间隔，到期发最小探测请求（`{"model": "probe", "max_tokens": 1}`），状态码 < 500 视为恢复并解除熔断，否则保持熔断并重置计时
+- **与 429 的区别**：429 限流由统一转发层的 `_VENDOR_ERROR_PATTERNS` 处理（只翻译状态码、重试策略预留），**不触发熔断**；配额/积分不足才是熔断依据
+
+### 认证边界
+
+聚合层**不解析任何 `secretRef` / `apikeyEnv`**，也不持有任何凭据。它只把客户端的 `Authorization` 原样透传给所选下游端口，鉴权由各下游 target 自己处理（crack 注入 secrets、free/paid 透传客户端 key 等逻辑全部不变）。
+
+### 监控
+
+- `GET /api/aggregate/status`：返回 `configured` + 每虚拟模型每成员的 `requests / ok / err / degraded / avg_latency_ms` + 会话粘性（`cache_size / hits / lookups / hit_rate`）+ 熔断端口（`breakers`）。不包含任何密钥
+- dashboard「聚合网关」分组新增 8080 卡片，运行时状态由前端 fetch `/api/aggregate/status` 填充，**10s 自动刷新**
+
+实现：`aggregator.py`（`AggregatorEngine`，纯路由/熔断/统计逻辑，无网络 I/O）+ `server.py`（`_handle_aggregate_request` 分发 / `_aggregator_prober` 探测 / reload 钩子 / `/api/aggregate/status`）+ `config_store.py`（aggregate/aggregator 校验）。
 
 ## 路径重写（_rewrite_upstream_path）
 

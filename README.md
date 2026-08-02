@@ -54,6 +54,7 @@ Add to `~/.claude/settings.json` (any provider — only `targets.json` decides r
 
 | 端口 | 供应商 | 分类 | handler | 协议 |
 |------|--------|------|---------|------|
+| 8080 | aggregator | aggregate | aggregator | OpenAI（聚合网关：虚拟模型路由 / 会话粘性 / 熔断降级） |
 | 8081 | anthropic-compatible | — | FastAPI | Anthropic（入口 + dashboard） |
 | 8082 | copilot-enterprise | crack | copilot | OpenAI（GHE 企业版，收费） |
 | 8083 | copilot | crack | copilot | OpenAI（个人版） |
@@ -72,6 +73,7 @@ Add to `~/.claude/settings.json` (any provider — only `targets.json` decides r
 - **base_url 规范**：crack 类与 gemini-native 统一 `/v1`（代理内部映射下游）；free/paid 透传用 `routePrefix`
 - **客户端接入**：`base_url = http://<host>:<port>/v1`（或 `/api/v1`），`api_key = "dummy"`（free/paid 用真实 key）
 - **codebuddy 非流式兼容**：上游只接受流式（11101），代理自动把非流式请求转流式聚合为完整 JSON，非流式客户端也可用
+- **聚合网关（8080）**：客户端用虚拟模型 id（如 `agg:sonnet`）请求，按配置加权路由到多个真实下游端口，支持会话粘性 / 重试降级 / 配额熔断（详见 [docs/architecture.md](docs/architecture.md)「聚合网关」小节）
 
 📖 完整架构、targets.json schema、gemini-native 协议转换、路径重写规则 → [docs/architecture.md](docs/architecture.md)
 

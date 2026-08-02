@@ -65,7 +65,7 @@ nohup .venv/bin/python server.py > /tmp/proxy.log 2>&1 & disown
 每个 target 指定端口、供应商、分类、handler、上游 host、模型映射。端口-供应商绑定由 `listenPort` 字段定义。
 
 **必填字段**：`label / listenPort / category / handler / targetHost`
-**合法枚举**：category ∈ `crack|free|paid`；handler ∈ `passthrough|copilot|qclaw|gemini-native|trae-work`
+**合法枚举**：category ∈ `crack|free|paid|aggregate`；handler ∈ `passthrough|copilot|qclaw|gemini-native|trae-work|aggregator`
 **完整键**：`label, listenPort, category, handler, targetHost, targetPort, targetProtocol, routePrefix, crackTool, secretRef, apikeyEnv, models, extraHeaders, modelMapping, isFree, enabled, name, reasoning`
 **校验规则**：crack 类必须有 `crackTool`；label/端口不能冲突；`enabled=false` 跳过必填校验（预留位）
 **secrets 优先级**：`secrets.json > apikeyEnv 环境变量 > 客户端透传`
@@ -82,6 +82,7 @@ nohup .venv/bin/python server.py > /tmp/proxy.log 2>&1 & disown
 
 | 端口 | 供应商 | 分类 | handler | 协议 | 用途 |
 |------|--------|------|---------|------|------|
+| **8080** | aggregator | aggregate | aggregator | OpenAI | 聚合网关（虚拟模型路由 / 会话粘性 / 重试降级 / 配额熔断，路由到本地各真实端口） |
 | **8081** | anthropic-compatible | — | FastAPI | Anthropic | `/v1/messages`（Anthropic）/ dashboard 管理界面 / `/api/targets` 等 REST API |
 | **8082** | copilot-enterprise | crack | copilot | OpenAI | GHE 企业版 Copilot（收费，上游 copilot-api.bmw.ghe.com，token 用企业 PAT） |
 | **8083** | copilot | crack | copilot | OpenAI | 个人版 Copilot（上游 api.githubcopilot.com，token 从本地 `/root/.copilot` 破解，与 8082 账号隔离） |
@@ -312,6 +313,7 @@ dashboard → 模型区 → "🧹 清理过期模型"按钮（仅 copilot 系显
 10. **codebuddy 上游只支持流式**：非流式请求会报 `11101`，代理已自动聚合为流式 JSON。
 11. **codebuddy refreshToken 轮换**：刷新后必须立即持久化新值，否则旧值失效导致登录态丢失。
 12. **LXC 跑 Docker AppArmor 冲突**：手动 `docker run` 要加 `--security-opt apparmor=unconfined`（部署环境约束，见全局 CLAUDE.md）。
+13. **聚合网关（8080）**：熔断配额模式（`quotaErrorPatterns`，额度/积分不足 → 摘除端口）与 429 限流模式（`_VENDOR_ERROR_PATTERNS`，只翻译不熔断）必须严格区分，新增错误特征时先判断归哪一类；聚合层**不透传 secretRef/apikeyEnv**，只透传客户端 `Authorization`（凭据归各下游端口自己处理）；会话粘性 key = `(虚拟模型id, session_id)`，改粘性逻辑勿动这个隔离约定。
 
 ---
 
