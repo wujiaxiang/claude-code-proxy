@@ -1,90 +1,76 @@
-# 破解工具说明
+# 破解公共层索引
 
-本项目通过破解工具从本地客户端提取 API key/token，写入 `secrets.json`（dashboard 可编辑，不入库）。
-启动时自动调用；也可作为独立 CLI 运行。
+破解网关（crack 类 target）的**公共机制**集中说明：工具模块、凭据字段、状态查询、每日任务、环境检测。
+各网关的提取细节 / 接口逆向见对应专属文档。
 
-## 工具清单
+## 工具清单（索引）
 
-| 工具 | 目标 | 提取来源 | OS 支持 |
-|------|------|---------|---------|
-| `crack_copilot.py` | GitHub Copilot Enterprise / 个人版 | `gh auth token`（GitHub CLI）或本机 `/root/.copilot/config.json` | ✅ 跨平台（需 gh CLI） |
-| `crack_codebuddy.py` | CodeBuddy | 本机 CodeBuddy 客户端目录 | ✅ Windows / ❌ 其他 |
-| `crack_qclaw.py` | QClaw | `%APPDATA%\QClaw\app-store.json`（DPAPI 解密） | ✅ Windows / ❌ 其他 |
-| `crack_traework.py` | Trae Work | `%APPDATA%\TRAE SOLO CN\...\storage.json`（tc 加密解密） | ✅ Windows（可跨机导入） |
+| 模块 | 一行职责 | 网关文档 |
+|------|---------|---------|
+| `crack_copilot.py` | 提取 Copilot token（企业 PAT / 个人 OAuth，跨平台需 gh CLI） | 🔗 详见 [copilot.md](copilot.md) |
+| `crack_codebuddy.py` | 从 CodeBuddy 客户端目录提取 token（仅 Windows） | 🔗 详见 [codebuddy.md](codebuddy.md) |
+| `crack_qclaw.py` | 从 `%APPDATA%\QClaw` DPAPI 解密 API Key（仅 Windows） | 🔗 详见 [qclaw.md](qclaw.md) |
+| `crack_traework.py` | 从 TRAE SOLO CN `storage.json` 提取认证（tc 加密） | 🔗 详见 [trae-work.md](trae-work.md) |
+| `crack_daily.py` | 统一每日任务调度器（见下） | — |
+| `crack_*_q.py` | 各网关额度/签到查询（见下） | 🔗 详见各网关文档 |
 
-## 额度/签到状态查询（dashboard 展示）
+提取到的 token 写入 `secrets.json`（dashboard 可编辑，不入库）；服务启动时自动调用，也可独立 CLI 运行（成功退出码 0 / 失败 1）。
 
-`crack_*_q.py` 系列模块查询各破解网关的剩余额度/签到状态，dashboard 通过 `GET /api/crack/{label}/status` 统一展示（`crack_common.CRACK_STATUS_HANDLERS` 注册表分发）：
+## secrets.json 字段总表
 
-| 模块 | label | 查询内容 |
-|------|-------|---------|
-| `crack_common.py`（内建） | trae-work | 权益包额度（ide_user_ent_usage）+ 每日签到（checkin_credits） |
-| `crack_copilot_q.py` | copilot-enterprise / copilot | `GET {api-host}/copilot_internal/user` → quota_snapshots（chat/completions/premium_interactions） |
-| `crack_qclaw_q.py` | qclaw | `POST jprx.m.qq.com/data/4110/forward` 积分余额 + `data/4075` 今日 token + `data/4222` 流水 |
-| `crack_codebuddy_q.py` | codebuddy | `POST {endpoint}/billing/meter/get-user-resource` 资源包额度 + `/v2/activity/growth/*` 成长任务/连续天数 |
+按 `crack_common.CREDENTIAL_SCHEMAS` 整理（dashboard 凭据弹窗按此渲染，`PUT /api/secrets/{label}/bulk` 校验）：
 
-返回统一结构：`{quota: [...], checkin: {...}, refresh: {...}, extra: {...}}`。
+| label（target） | 依赖字段 | 必填 | 说明 |
+|------|---------|------|------|
+| copilot-enterprise (8082) | `copilot_token` | ✅ | 企业 PAT（`github_pat_` 前缀，需 Copilot 权限） |
+| copilot (8083) | `copilot_personal_token` | ✅ | 个人 OAuth token（`gho_` 前缀） |
+| codebuddy (8084) | `codebuddy_token` | ✅ | 可选 `codebuddy_refresh_token` / `codebuddy_uid`；昵称 `codebuddy_nickname` 只读 |
+| qclaw (8085) | `qclaw_api_key` | ✅ | 仅此字段即可正常代理；其余为积分查询增强：`qclaw_openclaw_token` / `qclaw_guid` / `qclaw_user_id` / `qclaw_device_token` / `qclaw_login_key`，缺省时状态区降级提示 |
+| trae-work (8086) | `trae_work_token` + `trae_work_refresh_token` | ✅✅ | 可选 `trae_work_user_id`；`trae_work_bound_device_id` 等其余字段见各网关文档 |
 
-> **copilot 双模式**：8082（copilot-enterprise）用企业 PAT（`copilot_token`，github_pat_ 前缀）查 `api.bmw.ghe.com`；8083（copilot）用个人 token（`copilot_personal_token`，gho_ 前缀，从本地 `/root/.copilot` 破解）查 `api.github.com`。两个账号 token 完全隔离，不可混用。
+> **copilot 双模式**（8082 企业 / 8083 个人，token 完全隔离不可混用）→ 🔗 详见 [copilot.md](copilot.md)
+
+## 状态查询统一结构
+
+dashboard 通过 `GET /api/crack/{label}/status` 统一展示额度/签到，由 `crack_common.CRACK_STATUS_HANDLERS` 注册表分发：
+
+```python
+{"quota": [...], "checkin": {...}, "refresh": {...}, "extra": {...}}
+# quota 条目: {"name", "limit", "used", "expireAt"}；装配时补充 displayName / account / capabilities / lastDailyRun
+```
+
+- **handler 签名**：标准 `handler(token, refresh_token)`（trae-work/codebuddy/copilot）；多字段 `handler(secrets)`（qclaw，`HANDLER_TAKES_SECRETS` 标记）
+- 各网关额度查询接口细节（quota_snapshots / jprx 4110/4075/4222 / get-user-resource 等）→ 🔗 [copilot.md](copilot.md) / [codebuddy.md](codebuddy.md) / [qclaw.md](qclaw.md) / [trae-work.md](trae-work.md)
 
 ## 统一每日任务（单一 cron）
 
-`crack_daily.py` 是所有破解网关的**统一每日调度器**（签到/领取奖励/刷新 token），插件化注册，单一 cron 入口：
-
-```
+```bash
 0 3 * * * /root/shared-workspace/claude-code-proxy/scripts/cron/crack_daily.sh
 ```
 
-- **插件注册**：`DAILY_HANDLERS` 字典，每个网关注册一个 `daily(secrets, out)` 函数
-- **无 key 跳过**：网关未在 secrets.json 配置 key 时自动跳过，不报错
-- **当前任务**：trae-work 签到+刷新、codebuddy 成长任务领取、qclaw/copilot 仅校验 token
-- **日志**：`/tmp/crack_daily.log`（-l/--log 可改）
+- `DAILY_HANDLERS` 注册表，每网关注册 `daily(secrets, out)`：trae-work 签到+刷新、codebuddy 成长任务领取、qclaw/copilot 仅校验 token
+- **无 key 的网关自动跳过**（按 secrets.json 判断）；**勿新增其他 cron**——这是唯一每日调度入口
+- 日志 `/tmp/crack_daily.log`；执行完写 `.cache/crack_daily_last_run` 时间戳（dashboard 展示"最后定时刷新"）
 
 ```bash
-# 手动运行全部
-.venv/bin/python crack_daily.py --secrets secrets.json
-# 只跑指定网关
-.venv/bin/python crack_daily.py --only trae-work,codebuddy
+.venv/bin/python crack_daily.py --secrets secrets.json        # 全部
+.venv/bin/python crack_daily.py --only trae-work,codebuddy    # 只跑指定网关
 ```
 
-## 运行方式
+## 环境检测（crackEnv）
 
-```bash
-# 独立 CLI
-python crack_copilot.py          # 提取并写入 secrets.json
-python crack_codebuddy.py --force
-python crack_qclaw.py --secrets secrets.json
+`_crack_env_check(target)` 在 `/api/targets` 返回 `crackEnv: {available, reason}`，dashboard「重新破解」按钮据此置灰/启用：
 
-# 服务启动时自动调用（crack 类 target 缺 key 时）
-python server.py
-```
-
-成功退出码 0；失败退出码 1 + 引导文案。
-
-## 环境检测（dashboard「重新破解」按钮）
-
-`_crack_env_check(target)` 在 `/api/targets` 返回 `crackEnv: {available, reason}`，前端据此决定按钮状态：
-
-- **copilot**：`shutil.which("gh")` 检测 gh CLI 是否在 PATH（企业/个人双模式：个人 token 从 `/root/.copilot/config.json` 破解）
-- **codebuddy**：Windows 下探测 `%LOCALAPPDATA%`/`%APPDATA%`/home 下的 CodeBuddy 客户端目录
-- **qclaw**：`QCLAW_API_KEY` 环境变量 或 `%APPDATA%\QClaw\app-store.json` 存在
-- **trae-work**：检测本机 `storage.json` 是否存在（可跨机通过 `--export`/`--import-json` 导入认证，无需本机安装）
-- **非 Windows 的 codebuddy/qclaw**：返回不可用，提示"仅支持 Windows，待后续补齐"
-
-**不可用时按钮置灰**（`disabled` + `title` 提示原因），不阻止手动填写。
-
-## QClaw 特殊性（自动解密）
-
-`server.py` 启动时自动从 QClaw 本地存储解密 API Key：
-- 读取 `%APPDATA%\QClaw\app-store.json` 的 `authGateway.providers.qclaw.apiKey.cipherText`
-- 读取 `%APPDATA%\QClaw\Local State` 的 `os_crypt.encrypted_key`
-- DPAPI 解密 AES 密钥 → AES-256-GCM 解密 cipherText → 得到 `sk-...` API Key
-
-**QClaw 客户端只需登录过一次，代理就能自动拿到 Key，不需要 QClaw 持续运行**（除非用 `qclaw-local`）。
-环境变量 `QCLAW_API_KEY` 优先级最高，可手动覆盖。
-
-> **注意**：QClaw 即使无法本地破解（如非 Windows），只要通过环境变量或 dashboard 手动填写 key，仍可直连上游使用。
+- **copilot**：`shutil.which("gh")` 检测 gh CLI 是否在 PATH（个人 token 从本机 `/root/.copilot/config.json` 破解）
+- **codebuddy**：Windows 下探测 `%LOCALAPPDATA%` / `%APPDATA%` / home 下的客户端目录
+- **qclaw**：`QCLAW_API_KEY` 环境变量或 `%APPDATA%\QClaw\app-store.json` 存在（自动解密细节 → 🔗 [qclaw.md](qclaw.md)）
+- **trae-work**：检测本机 `storage.json`（可跨机 `--export` / `--import-json` 导入认证，无需本机安装）
+- 非 Windows 的 codebuddy/qclaw 返回不可用（"仅支持 Windows"）；不可用时按钮置灰但不阻止手动填写
 
 ## 相关文档
 
+- 🔗 [copilot.md](copilot.md) — Copilot 双模式 / token 提取 / 额度查询
+- 🔗 [codebuddy.md](codebuddy.md) — CodeBuddy 破解 / 成长任务 / 额度查询
+- 🔗 [qclaw.md](qclaw.md) — QClaw 自动解密 / API Key / 积分查询
+- 🔗 [trae-work.md](trae-work.md) — Trae Work tc 加密 / 签到 / 额度 / 续期
 - [QCLAW_19000_GATEWAY_REVERSE.md](../QCLAW_19000_GATEWAY_REVERSE.md) — 19000 网关逆向调研报告（HMAC 签名 / PID 反查 / 寄生注入）

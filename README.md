@@ -91,42 +91,13 @@ Add to `~/.claude/settings.json` (any provider — only `targets.json` decides r
 
 ## Crack Tools 🔓
 
-`crack_copilot.py` / `crack_codebuddy.py` / `crack_qclaw.py` / `crack_traework.py` 从本地客户端提取 token 写入 `secrets.json`。
+`crack_*.py` 系列从本地客户端提取 token 写入 `secrets.json`。**OS 支持**：仅 `crack_copilot.py` 跨平台（需 gh CLI）；codebuddy/qclaw 仅 Windows 本地破解，qclaw 可用 `QCLAW_API_KEY` 环境变量或 dashboard 手动填 key 直连。额度/签到查询由 dashboard 通过 `GET /api/crack/{label}/status` 统一展示；每日签到/刷新由 `crack_daily.py` 单一 cron 调度（`0 3 * * *`），无 key 自动跳过。
 
-> **OS 支持**：仅 `crack_copilot.py` 跨平台（需 gh CLI）；`codebuddy`/`qclaw` 仅 Windows 本地破解，其他 OS 下 dashboard 按钮置灰提示。QClaw 可通过 `QCLAW_API_KEY` 环境变量或 dashboard 手动填 key 直连上游。
-
-### 额度/签到状态查询（dashboard 展示）
-
-`crack_*_q.py` 系列模块查询各破解网关的剩余额度/签到状态，dashboard 通过 `GET /api/crack/{label}/status` 统一展示：
-
-| 模块 | 网关 | 查询内容 |
-|------|------|---------|
-| `crack_traework.py`（crack_common） | trae-work | 权益包额度 + 每日签到 |
-| `crack_copilot_q.py` | copilot-enterprise / copilot | quota_snapshots（chat/completions/premium_interactions） |
-| `crack_qclaw_q.py` | qclaw | 积分余额（data/4110）+ 今日剩余 token（data/4075）+ 流水 |
-| `crack_codebuddy_q.py` | codebuddy | 资源包额度（get-user-resource）+ 成长计划任务/连续天数 |
-
-统一入口：`crack_common.CRACK_STATUS_HANDLERS` 注册表 + `get_crack_status(label, secrets)`。
-
-### 统一每日任务（单一 cron）
-
-`crack_daily.py` 是破解网关统一每日调度器（签到/领取奖励/刷新 token），插件化注册：
-
-```
-0 3 * * * /root/shared-workspace/claude-code-proxy/scripts/cron/crack_daily.sh
-```
-
-- 每个网关注册自己的 `daily()` 任务（trae-work 签到、codebuddy 成长任务领取、qclaw/copilot 仅校验 token）
-- **无 key 的网关自动跳过**（按 secrets.json 判断）
-- 日志：`/tmp/crack_daily.log`
-
-📖 详见 [docs/crack-tools.md](docs/crack-tools.md) 与 [QCLAW_19000_GATEWAY_REVERSE.md](QCLAW_19000_GATEWAY_REVERSE.md)
+🔗 各网关详细文档：[docs/copilot.md](docs/copilot.md)（双模式/额度/模型清理）· [docs/codebuddy.md](docs/codebuddy.md)（refreshToken/11101 聚合/成长任务）· [docs/qclaw.md](docs/qclaw.md)（自动解密/铁律/积分）· [docs/trae-work.md](docs/trae-work.md)（tc 加密/签到/续期/传图）· 公共层索引 [docs/crack-tools.md](docs/crack-tools.md)
 
 ## Windows Deployment 🪤
 
-Windows Server 计划任务 + VBS + BAT 三层自启架构，启动脚本在 [`scripts/windows/`](scripts/windows/)。
-
-> 8 个踩坑实录（GBK 崩溃 / VBS 重定向 / `cmd /c` 禁用 / watchdog COM 失败 / pwsh 闪框等）→ [docs/windows-deployment.md](docs/windows-deployment.md)
+Windows Server 计划任务 + VBS + BAT 三层自启架构，启动脚本在 [`scripts/windows/`](scripts/windows/)。> 8 个踩坑实录（GBK 崩溃 / VBS 重定向 / `cmd /c` 禁用 / watchdog COM 失败 / pwsh 闪框等）→ [docs/windows-deployment.md](docs/windows-deployment.md)
 
 ## How It Works 🧩
 
@@ -141,11 +112,14 @@ Contributions are welcome! Please feel free to submit a Pull Request. 🎁
 
 ## 相关文档
 
-- [docs/architecture.md](docs/architecture.md) — 多端口架构详解
-- [docs/crack-tools.md](docs/crack-tools.md) — 破解工具与 OS 支持
+- [docs/architecture.md](docs/architecture.md) — 多端口架构详解（targets.json schema + 权威端口表）
+- [docs/copilot.md](docs/copilot.md) — Copilot 双模式（企业/个人）/ token 提取 / 额度 / 模型清理
+- [docs/codebuddy.md](docs/codebuddy.md) — CodeBuddy：refreshToken 轮换 / 11101 聚合 / 成长任务
+- [docs/qclaw.md](docs/qclaw.md) — QClaw：解密链路 / 三条铁律 / 积分查询 / 排查
+- [docs/trae-work.md](docs/trae-work.md) — Trae Work 破解与 API 逆向（tc 加密、接口规范、签到/额度/续期）
+- [docs/crack-tools.md](docs/crack-tools.md) — 破解公共层索引
 - [docs/windows-deployment.md](docs/windows-deployment.md) — Windows 部署指南
 - [AGENTS.md](AGENTS.md) — AI Agent 项目上下文速查
 - [DESIGN.md](DESIGN.md) — Dashboard 设计契约
 - [CHANGELOG.md](CHANGELOG.md) — 变更日志
 - [QCLAW_19000_GATEWAY_REVERSE.md](QCLAW_19000_GATEWAY_REVERSE.md) — 19000 网关逆向调研报告
-- [docs/trae-work.md](docs/trae-work.md) — Trae Work 破解与 API 逆向文档（tc 加密、接口规范、签到/额度/续期）

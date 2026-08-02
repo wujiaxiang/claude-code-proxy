@@ -42,10 +42,20 @@ Set-Location "<项目根>"
 wscript.exe .\scripts\windows\start_proxy.vbs
 ```
 
-## 已知坑（详见 docs/windows-deployment.md）
+## 已知坑
 
-1. **GBK 崩溃**：计划任务环境 codepage 是 GBK，必须 `set PYTHONIOENCODING=utf-8`（已在 bat 处理）
-2. **`cmd /c` 被禁**：Trae IDE 沙盒拦截 `cmd /c`，直接调用 bat 而非 `cmd /c bat`
-3. **PowerShell 7**：系统只有 `pwsh.exe`，没有 `powershell.exe`
-4. **闪黑框**：pwsh 由 `wscript.exe` + `Run(..., 0, ...)` 在 CreateProcess 阶段隐藏窗口
-5. **watchdog 用 VBS 会静默失败**：COM 对象检测端口不可靠，必须用 PowerShell `.NET TcpClient`
+8 个 Windows 部署坑实录（GBK 崩溃 / VBS 重定向 / `cmd /c` 禁用 / watchdog COM 失败 / pwsh 闪框等）→ [docs/windows-deployment.md](../docs/windows-deployment.md)
+
+## 开发约定（本目录规则）
+
+- **改配置只改 `.env`**：VBS/BAT 是纯启动器，不设任何环境变量——所有配置来自项目根 `.env`。
+- **计划任务 Action 路径必须指向本子目录**（`scripts/windows/` 移动过，路径会失效）。
+- **动态路径定位**：脚本内用 `ScriptFullName` / `$PSScriptRoot` 推导项目根，移动项目目录后只需更新计划任务路径，脚本本身不改。
+
+### ANTI-PATTERNS（本目录禁止）
+
+1. **禁用 `cmd /c`**——VBS/PowerShell 里 Trae 沙盒会拦截（见 docs/windows-deployment.md 坑 3），直接调用 bat 而非 `cmd /c bat`。
+2. **不要假设 PowerShell 路径默认存在**——调用前用 `Test-Path` 验证。
+3. **不要在 VBS 里写中文/特殊字符重定向**——GBK 编码导致乱码/崩溃（必须 `set PYTHONIOENCODING=utf-8`）。
+4. **不要硬编码项目绝对路径**——必须动态定位，否则项目移动后自启失效。
+5. **勿用 `powershell.exe`（Windows PowerShell 5.x）**——本环境只有 pwsh 7（`"C:\Program Files\PowerShell\7\pwsh.exe"`），watchdog 用 `pwsh.exe` 启动。

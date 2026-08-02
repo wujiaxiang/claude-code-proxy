@@ -9,10 +9,11 @@
 |------|--------|------|---------|------|------|
 | **8080** | aggregator | aggregate | aggregator | OpenAI | 聚合网关（虚拟模型路由 / 会话粘性 / 重试降级 / 配额熔断） |
 | **8081** | anthropic-compatible | — | FastAPI | Anthropic | Anthropic 入口 + dashboard（`/v1/messages` 翻译为 OpenAI 后内部请求 8082） |
-| **8082** | copilot | crack | copilot | OpenAI | GitHub Copilot Enterprise 破解透传 |
+| **8082** | copilot | crack | copilot | OpenAI | GitHub Copilot Enterprise 破解透传（企业 PAT） |
+| **8083** | copilot | crack | copilot | OpenAI | 个人版 Copilot（上游 api.githubcopilot.com，与 8082 企业版账号隔离） |
 | **8084** | codebuddy | crack | passthrough | OpenAI | CodeBuddy 破解透传 |
 | **8085** | qclaw | crack | qclaw | OpenAI | QClaw 直连上游（自动解密 API Key） |
-| **8086** | trae-work | crack | passthrough | OpenAI | 预留（`enabled=false`） |
+| **8086** | trae-work | crack | trae-work | OpenAI | Trae Work 破解透传（签到/额度/续期，OpenAI↔llm_utils_chat 转换） |
 | **8090** | openrouter | free | passthrough | OpenAI | 免费透传（客户端带 key） |
 | **8091** | nvidia | free | passthrough | OpenAI | 免费透传 |
 | **8092** | gemini | free | **gemini-native** | OpenAI↔Gemini | **原生 Gemini 协议转换**（generateContent） |
@@ -28,7 +29,7 @@
 
 | 分类 | base_url 后缀 | 说明 |
 |------|--------------|------|
-| crack 类（8082/8084/8085/8086） | `/v1` | **统一 `/v1`**，代理内部把 `/v1/*` 映射到下游（`routePrefix`） |
+| crack 类（8082-8086） | `/v1` | **统一 `/v1`**，代理内部把 `/v1/*` 映射到下游（`routePrefix`） |
 | gemini-native（8092） | `/v1` | 客户端走 OpenAI 协议入口，内部转原生 Gemini API |
 | free/paid 透传（8090-8094） | `routePrefix`（如 `/api/v1`） | 直接透传上游同路径 |
 
@@ -236,3 +237,17 @@ Anthropic 协议：base_url = http://192.168.2.128:8081，api_key = "dummy"
 - **8081 统计**：`/v1/messages` 请求数与模型级统计（中间件记录）
 
 设计契约见 [`DESIGN.md`](../DESIGN.md)。
+
+## 典型错误码速查
+
+> 各网关详细排查见对应文档：🔗 [qclaw.md](qclaw.md) · [copilot.md](copilot.md) · [codebuddy.md](codebuddy.md) · [trae-work.md](trae-work.md)
+
+| 错误码 | 网关 | 含义 | 常见处理 |
+|---|---|---|---|
+| `9002` | qclaw | 登录态/API Key 失效 | 重新提取 key 或 dashboard 更新 `qclaw_api_key` |
+| `403` | copilot | token 无权限/过期/账号被踢 | 重新破解 `copilot_token` / `copilot_personal_token` |
+| `11101` | codebuddy | 上游拒绝非流式 chat（只收流式） | 代理已自动转流式聚合，客户端无需处理 |
+| `3003 all models failed` | trae-work | 模型不在多模态白名单时传图（glm 系） | 传图改用内置多模态模型（`Doubao_1_6` 等） |
+| `1005` | trae-work | 同上（doubao 系）/ 模型不可用 | 同上；或换可用模型 |
+| `4001 param is invalid` | trae-work | content 格式错误（如 `image` 字段） | 图片块用标准 `{"type":"image_url","image_url":{"url":...}}` |
+| `402 / 429` | 聚合网关（8080） | 下游配额不足（熔断摘除） / 限流（重试不摘除） | 熔断由 `quotaErrorPatterns` 判定，429 仅翻译 |
