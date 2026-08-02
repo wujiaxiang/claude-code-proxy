@@ -5526,6 +5526,14 @@ DASHBOARD_STYLE = """
   .agg-input { background: var(--bg-inset); border: 1px solid var(--border); border-radius: var(--radius-sm); color: var(--text-primary); padding: 7px 10px; font-size: 12.5px; font-family: var(--font-mono); transition: border-color 0.2s, box-shadow 0.2s; min-width: 0; }
   .agg-input:focus { outline: none; border-color: var(--brand-cyan); box-shadow: 0 0 0 2px rgba(34,211,238,0.15); }
   .agg-vm { border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 12px 14px; margin-bottom: 12px; background: linear-gradient(180deg, rgba(255,255,255,0.02), rgba(255,255,255,0.004)), var(--bg-inset); }
+  /* 虚拟模型成员明细（折叠，默认收起——model-table 为主监控列表，明细避免重复） */
+  .agg-vm-detail { border: 1px solid var(--border); border-radius: var(--radius-sm); margin-bottom: 8px; background: var(--bg-inset); }
+  .agg-vm-detail summary { cursor: pointer; list-style: none; padding: 8px 12px; font-size: 12.5px; color: var(--text-primary); display: flex; align-items: center; gap: 8px; user-select: none; }
+  .agg-vm-detail summary::-webkit-details-marker { display: none; }
+  .agg-vm-detail summary .agg-vm-sum { color: var(--text-tertiary); font-size: 11.5px; }
+  .agg-vm-detail summary .agg-arrow { margin-left: auto; color: var(--text-tertiary); font-size: 10px; transition: transform 0.2s; }
+  .agg-vm-detail[open] summary .agg-arrow { transform: rotate(180deg); }
+  .agg-vm-detail .agg-vm-body { padding: 2px 12px 10px; border-top: 1px dashed var(--border); }
   .agg-vm-head { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
   .agg-vm-id { flex: 1; min-width: 0; }
   .agg-pool { margin: 8px 0 2px 0; }
@@ -6644,7 +6652,7 @@ async def dashboard():
     agg_cards.append(_build_card_html(
         name="流量聚合",
         note="虚拟模型聚合路由 · 会话粘性 · 熔断降级（OpenAI /v1 入口）",
-        kind_badge="聚合路由",
+        kind_badge="流量聚合",
         status_badge="运行中" if _agg_configured else "未配置",
         status_badge_class="green" if _agg_configured else "gray",
         kv_items=[
@@ -6662,7 +6670,7 @@ async def dashboard():
         accent_class="accent-8080",
         label=None,
         port=8080,
-        meta_badges=[("流量聚合", "b-meta-agg"), ("OpenAI 协议", "b-meta-oa")],
+        meta_badges=[("熔断降级", "b-meta-normal"), ("OpenAI 协议", "b-meta-oa")],
         raw_html=(
             '<div class="model-ops">'
             '  <button class="model-edit-toggle" onclick="openAggConfigEditor(this)" '
@@ -6685,8 +6693,8 @@ async def dashboard():
     agg_cards.append(_build_card_html(
         name="anthropic-compatible",
         note="FastAPI · Anthropic 协议入口 · /v1/messages 翻译为 OpenAI 后内部请求 8082",
-        kind_badge="协议转换",
-        status_badge=f"{_8081_total} 请求" if _8081_total > 0 else "运行中",
+        kind_badge="Protocol",
+        status_badge="运行中",
         status_badge_class="purple",
         kv_items=[
             ("base_url", f"http://{_lan_ip}:8081"),
@@ -6712,7 +6720,7 @@ async def dashboard():
             '    title="编辑 8081 Anthropic 转发目标（默认端口 + 按模型映射）">✏️ 转发配置</button>'
             '</div>'
         ),
-        meta_badges=[("转发网关", "b-meta-agg"), ("Anthropic 协议", "b-meta-normal")],
+        meta_badges=[("Forward Gateway", "b-meta-agg"), ("Anthropic", "b-meta-normal")],
         mapping_label=_forward_label,
     ))
 
@@ -8129,26 +8137,36 @@ async function loadAggregateStatus() {{
     var vms = r.virtual_models || {{}};
     var vmKeys = Object.keys(vms);
     if (vmKeys.length === 0) {{
-      html += '<div class="agg-vm"><div class="agg-vm-head">虚拟模型</div><div class="agg-vm-row"><span class="m">暂无虚拟模型</span></div></div>';
+      html += '<div class="agg-vm-detail"><summary class="agg-vm-head">虚拟模型：暂无</summary></div>';
     }} else {{
       vmKeys.forEach(function(vmId) {{
         var members = vms[vmId] || {{}};
         var memberKeys = Object.keys(members);
-        html += '<div class="agg-vm"><div class="agg-vm-head">' + escHtml(vmId) + '</div>';
+        var mTotal = 0, mOk = 0, mErr = 0, mDeg = 0;
+        memberKeys.forEach(function(mk) {{
+          var mm = members[mk] || {{}};
+          mTotal += mm.requests || 0; mOk += mm.ok || 0; mErr += mm.err || 0; mDeg += mm.degraded || 0;
+        }});
+        var bodyHtml = '';
         if (memberKeys.length === 0) {{
-          html += '<div class="agg-vm-row"><span class="m">暂无流量</span></div>';
+          bodyHtml = '<div class="agg-vm-row"><span class="m">暂无流量</span></div>';
         }} else {{
           memberKeys.forEach(function(mk) {{
             var m = members[mk] || {{}};
             var req = m.requests || 0;
             var lat = (m.avg_latency_ms || 0).toFixed(0) + 'ms';
-            html += '<div class="agg-vm-row"><span class="' + aggMemberDot(m) + '"></span>' +
+            bodyHtml += '<div class="agg-vm-row"><span class="' + aggMemberDot(m) + '"></span>' +
               '<span class="m">' + escHtml(mk) + '</span>' +
               '<span class="s">' + req + ' 请求 · 成功 ' + (m.ok || 0) + ' · 失败 ' + (m.err || 0) +
               ' · 降级 ' + (m.degraded || 0) + ' · ' + lat + '</span></div>';
           }});
         }}
-        html += '</div>';
+        html += '<details class="agg-vm-detail">' +
+          '<summary><span class="agg-dot ok"></span>' + escHtml(vmId) +
+          '<span class="agg-vm-sum">' + memberKeys.length + ' 成员 · ' + mTotal + ' 请求 · 成功 ' + mOk +
+          ' · 失败 ' + mErr + ' · 降级 ' + mDeg + '</span>' +
+          '<span class="agg-arrow">▼</span></summary>' +
+          '<div class="agg-vm-body">' + bodyHtml + '</div></details>';
       }});
     }}
     var brks = r.breakers || {{}};
