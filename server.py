@@ -1689,18 +1689,25 @@ async def _handle_traework(writer, target, method, path, headers, body, stats, l
                 await _write_error_response(writer, 400, "invalid json"); return
             model = (body_json.get("model") or "glm-5.2").split("/")[-1]
             is_stream = bool(body_json.get("stream", False))
-            stats["totalRequests"] += 1
+            # 注：totalRequests 由外层 _handle_target_request 统一计数，这里不再 +1（避免双重计数）
             _bump_model_stats(label, model, "ok")
+            logger.debug(f"[{label}] trae-work {method} {path} model={model} stream={is_stream} "
+                         f"req_body={_json.dumps(body_json, ensure_ascii=False)[:2000]}")
 
             trae_body = _openai_to_trae_body(body_json)
             endpoint = f"{_TRAE_API_HOST}/api/agent/v3/llm_utils_chat"
+            logger.debug(f"[{label}] trae-work upstream POST {endpoint} "
+                         f"body={_json.dumps(trae_body, ensure_ascii=False)[:3000]}")
             async with httpx.AsyncClient(timeout=httpx.Timeout(300.0, connect=10.0), trust_env=False) as c:
                 req = c.build_request("POST", endpoint, headers=api_headers,
                                       content=_json.dumps(trae_body).encode())
                 resp = await c.send(req, stream=True)
+                logger.debug(f"[{label}] trae-work upstream HTTP {resp.status_code}")
 
                 if resp.status_code >= 400:
                     resp_body = await resp.aread()
+                    logger.debug(f"[{label}] trae-work upstream error body="
+                                 f"{resp_body.decode('utf-8', errors='replace')[:4000]}")
                     await _write_error_response(writer, resp.status_code,
                                                 f"Trae upstream HTTP {resp.status_code}: {resp_body.decode('utf-8', errors='replace')[:300]}")
                     return
@@ -1710,6 +1717,7 @@ async def _handle_traework(writer, target, method, path, headers, body, stats, l
                     writer.write(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: keep-alive\r\n\r\n")
                     # seed-code 系模型的 DSML 标记是分片输出的，累积到完整块再解析
                     dsml_buf = ""
+                    n_chunks = 0
                     async for chunk in resp.aiter_bytes():
                         line = chunk.decode("utf-8", errors="replace")
                         for raw in line.split("\n"):
@@ -1735,19 +1743,30 @@ async def _handle_traework(writer, target, method, path, headers, body, stats, l
                                         dsml_buf += resp_text
                                     tcs = _parse_dsml_tool_calls(dsml_buf)
                                     if tcs:
+                                        logger.debug(f"[{label}] trae-work DSML parsed {len(tcs)} tool_calls: "
+                                                     f"{_json.dumps(tcs, ensure_ascii=False)[:500]}")
                                         oai = _trae_chunk_to_openai(
                                             {"response": "", "tool_calls": [{"type": "function", "function": tc["function"]} for tc in tcs]},
                                             model,
                                         )
+                                        n_chunks += 1
                                         writer.write(("data: " + _json.dumps(oai, ensure_ascii=False) + "\n\n").encode())
                                         await writer.drain()
                                         dsml_buf = ""
                                     # 未闭合时继续累积，不输出 content（避免把 DSML 标记透给客户端）
                                     continue
                                 oai = _trae_chunk_to_openai(trae_chunk, model)
+                                if trae_chunk.get("tool_calls"):
+                                    logger.debug(f"[{label}] trae-work chunk tool_calls: "
+                                                 f"{_json.dumps(trae_chunk.get('tool_calls'), ensure_ascii=False)[:800]}")
+                                n_chunks += 1
                                 writer.write(("data: " + _json.dumps(oai, ensure_ascii=False) + "\n\n").encode())
                                 await writer.drain()
                     # 流结束：若残留 DSML 未解析完，丢弃（不把半截标记透给客户端）
+                    if dsml_buf:
+                        logger.debug(f"[{label}] trae-work DSML trailing {len(dsml_buf)} bytes dropped: "
+                                     f"{dsml_buf[:300]!r}")
+                    logger.debug(f"[{label}] trae-work stream done, {n_chunks} chunks → client")
                     writer.write(("data: " + _json.dumps(_trae_final_to_openai(model), ensure_ascii=False) + "\n\n").encode())
                     writer.write(b"data: [DONE]\n\n")
                     await writer.drain()
@@ -1807,6 +1826,9 @@ async def _handle_traework(writer, target, method, path, headers, body, stats, l
                         content_parts.append(dsml_buf)  # 非 DSML 残留（如纯文本工具描述）照常输出
                 out = _trae_nonstream_to_openai(model, content_parts, reasoning_parts, tool_calls or None)
                 payload = _json.dumps(out, ensure_ascii=False).encode()
+                logger.debug(f"[{label}] trae-work nonstream done: content_parts={len(content_parts)} "
+                             f"reasoning={len(reasoning_parts)} tool_calls={len(tool_calls)} "
+                             f"out_len={len(payload)}")
                 writer.write(f"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {len(payload)}\r\n\r\n".encode())
                 writer.write(payload)
                 await writer.drain()
@@ -1819,6 +1841,7 @@ async def _handle_traework(writer, target, method, path, headers, body, stats, l
             req = c.build_request(method, upstream_url, headers=api_headers, content=body if body else None)
             resp = await c.send(req, stream=True)
             status, _ = await _write_response(writer, resp, stats=stats)
+            logger.debug(f"[{label}] trae-work passthrough {method} {path} → HTTP {status}")
             if status and status >= 400:
                 logger.warning(f"[{label}] trae-work {path} HTTP {status}")
             return
