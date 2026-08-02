@@ -1366,6 +1366,10 @@ _TRAE_IDE_VERSION = "0.1.43"
 _TRAE_IDE_VERSION_CODE = "20260730"
 _TRAE_DEVICE_ID = "199444637423849"
 _TRAE_MACHINE_ID = "d2115a713ee587fea5d340ceb8ef1fda3ad808431c24e7fed3085693f52f4428"
+# trae 上游模型列表缓存（get_detail_param，TTL 5 分钟）
+_TRAE_MODELS_CACHE: list = []
+_TRAE_MODELS_CACHE_TIME: float = 0.0
+_TRAE_MODELS_TTL: float = 300.0
 
 
 def _trae_build_headers(token: str) -> dict:
@@ -1389,6 +1393,61 @@ def _trae_build_headers(token: str) -> dict:
         "request-traffic-type": "prod",
         "X-Trae-Client-Type": "lite",
     }
+
+
+async def _trae_fetch_models(token: str) -> list:
+    """从 trae 上游 get_detail_param 拉取最新模型列表（TTL 缓存 5 分钟）。
+
+    解析 config_info_list：过滤 __dev 开发变体、不可用(config_switch=false)、
+    用户不可见(is_invisible_to_user)的配置；失败时返回缓存兜底。
+    """
+    global _TRAE_MODELS_CACHE, _TRAE_MODELS_CACHE_TIME
+    now = time.time()
+    if _TRAE_MODELS_CACHE and (now - _TRAE_MODELS_CACHE_TIME) < _TRAE_MODELS_TTL:
+        return _TRAE_MODELS_CACHE
+    if not token:
+        return []
+    try:
+        client = await get_http_client()
+        resp = await client.post(
+            f"{_TRAE_API_HOST}/api/ide/v1/get_detail_param",
+            json={
+                "function": "chat_v3",
+                "config_names": None,
+                "need_prompt": False,
+                "current_config_info": None,
+                "poly_prompt": True,
+                "mode_type": None,
+                "agent_type": None,
+            },
+            headers=_trae_build_headers(token),
+            timeout=httpx.Timeout(15.0),
+        )
+        if resp.status_code != 200:
+            logger.warning(f"[trae-work] get_detail_param HTTP {resp.status_code}")
+            return _TRAE_MODELS_CACHE or []
+        data = resp.json()
+        models = []
+        seen = set()
+        for cfg in data.get("config_info_list", []):
+            cname = cfg.get("config_name", "")
+            if not cname or cname.endswith("__dev"):
+                continue
+            if not cfg.get("config_switch", True):
+                continue
+            if cfg.get("is_invisible_to_user", False):
+                continue
+            if cname not in seen:
+                seen.add(cname)
+                models.append(cname)
+        if models:
+            _TRAE_MODELS_CACHE = models
+            _TRAE_MODELS_CACHE_TIME = now
+            logger.info(f"[trae-work] 上游模型列表已同步: {len(models)} 个")
+        return models
+    except Exception as e:
+        logger.warning(f"[trae-work] 模型列表拉取失败: {e}")
+        return _TRAE_MODELS_CACHE or []
 
 
 def _openai_to_trae_body(body: dict) -> dict:
@@ -1493,24 +1552,25 @@ async def _handle_traework(writer, target, method, path, headers, body, stats, l
     api_headers = _trae_build_headers(token)
 
     try:
-        # ── /v1/models：静态模型列表（与 get_detail_param 对齐）──
+        # ── /v1/models：优先上游 get_detail_param 实时同步（TTL 缓存），失败回退 targets.json 配置，再兜底静态列表 ──
         if path == "/v1/models" and method == "GET":
-            models = [
-                {"id": "glm-5.2", "object": "model", "created": 1700000000, "owned_by": "trae"},
-                {"id": "glm-5.1", "object": "model", "created": 1700000000, "owned_by": "trae"},
-                {"id": "glm-5", "object": "model", "created": 1700000000, "owned_by": "trae"},
-                {"id": "glm-4.7", "object": "model", "created": 1700000000, "owned_by": "trae"},
-                {"id": "glm-4.6", "object": "model", "created": 1700000000, "owned_by": "trae"},
-                {"id": "DeepSeek-V4-Pro", "object": "model", "created": 1700000000, "owned_by": "trae"},
-                {"id": "DeepSeek-V4-Flash", "object": "model", "created": 1700000000, "owned_by": "trae"},
-                {"id": "Doubao-Seed-2.1-Pro", "object": "model", "created": 1700000000, "owned_by": "trae"},
-                {"id": "kimi-k3", "object": "model", "created": 1700000000, "owned_by": "trae"},
-                {"id": "kimi-k2.7-code", "object": "model", "created": 1700000000, "owned_by": "trae"},
-                {"id": "minimax-m3", "object": "model", "created": 1700000000, "owned_by": "trae"},
-                {"id": "qwen-3.7-plus", "object": "model", "created": 1700000000, "owned_by": "trae"},
-                {"id": "qwen-3.5", "object": "model", "created": 1700000000, "owned_by": "trae"},
-                {"id": "qwen3-coder", "object": "model", "created": 1700000000, "owned_by": "trae"},
-            ]
+            models = []
+            upstream = await _trae_fetch_models(token)
+            if upstream:
+                models = [{"id": mid, "object": "model", "created": 1700000000, "owned_by": "trae"} for mid in upstream]
+            if not models:
+                _tw_tgt = next((t for t in _TARGETS if t.get("label") == "trae-work"), None)
+                for m in (_tw_tgt or {}).get("models", []):
+                    mid = m.get("id") if isinstance(m, dict) else str(m)
+                    if mid:
+                        models.append({"id": mid, "object": "model", "created": 1700000000, "owned_by": "trae"})
+            if not models:
+                # 兜底：配置也缺失时的静态列表
+                for mid in ("glm-5.2", "glm-5.1", "glm-5", "glm-4.7", "glm-4.6",
+                            "DeepSeek-V4-Pro", "DeepSeek-V4-Flash", "Doubao-Seed-2.1-Pro",
+                            "kimi-k3", "kimi-k2.7-code", "minimax-m3", "qwen-3.7-plus",
+                            "qwen-3.5", "qwen3-coder"):
+                    models.append({"id": mid, "object": "model", "created": 1700000000, "owned_by": "trae"})
             payload = _json.dumps({"data": models, "object": "list", "has_more": False}).encode()
             writer.write(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: %d\r\n\r\n%s" % (len(payload), payload))
             await writer.drain()
@@ -6758,7 +6818,7 @@ async def dashboard():
         ]
         # 协议标签：gemini-native 是 OpenAI↔Gemini 转换；其余 target（crack/透传/trae-work）客户端均走 OpenAI 协议
         if t.get("handler") == "gemini-native":
-            meta_badges.append(("OpenAI↔Gemini", "b-meta-gemini"))
+            meta_badges.append(("Gemini协议", "b-meta-gemini"))
         else:
             meta_badges.append(("OpenAI 协议", "b-meta-oa"))
         secret = _cfg.resolve_secret(t, _SECRETS)
@@ -6854,7 +6914,8 @@ async def dashboard():
             port=port,
             meta_badges=meta_badges,
             can_prune=(t.get("handler") == "copilot"),
-            mapping_label=t["label"],
+            # 模型映射（openMappingEditor）是 8081 转发网关专属，普通 target 卡片不显示
+            mapping_label=None,
         )
         if category == "crack":
             crack_cards.append(card)
