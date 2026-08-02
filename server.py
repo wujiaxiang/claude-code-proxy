@@ -1463,7 +1463,10 @@ def _openai_to_trae_body(body: dict) -> dict:
                     if c.get("type") in ("text", "input_text"):
                         parts.append({"type": "text", "text": c.get("text", "")})
                     elif c.get("type") == "image_url":
-                        parts.append({"type": "image", "image": c.get("image_url", {}).get("url", "")})
+                        # Trae 的 content.image_url 字段类型为对象（LLMRawMessageImageUrl），
+                        # 原样透传 OpenAI 格式 {"image_url": {"url": ...}}——不要转成 image 字段（Trae 4001）。
+                        # 注意：实测 Trae Work chat_v3 模型层仍拒绝图片（3003/1005），格式层正确但能力层受限。
+                        parts.append({"type": "image_url", "image_url": c.get("image_url", {})})
                     else:
                         parts.append({"type": "text", "text": str(c)})
                 else:

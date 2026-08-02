@@ -176,6 +176,22 @@ event: output          # 正文输出，data 含 response + reasoning_content
 - 代理需要把 SSE 事件还原为 OpenAI 流式分块格式，并把 `reasoning_content` 映射到
   OpenAI 的 `reasoning` 字段（若客户端支持）
 
+### 5.3 图片/多模态（实测结论，2026-08-02）
+
+**Trae 上游图片格式**（错误消息暴露 Go struct：`LLMRawMessageImageUrl`）：
+
+- content 图片块字段名是 **`image_url`（对象类型）**，不是 `image`：
+  ```json
+  {"type": "image_url", "image_url": {"url": "..."}}
+  ```
+- `image_url` 传**字符串** → HTTP 400（`cannot unmarshal string into ... LLMRawMessageImageUrl`）
+- 传 `image` 字段 / `type:base64` / `data` 字段 → 4001 `param is invalid`
+- 传 `image_url: {url}`（正确格式）→ **通过解析，但模型层失败**：
+  - glm 系：3003 `all models failed`
+  - Doubao 系：1005（空消息 + `{"plan":1}`）
+
+**结论**：格式层修复后（`_openai_to_trae_body` 原样透传 `image_url`），Trae Work `chat_v3` 接口**在模型层拒绝图片请求**（3003/1005）——代理无法绕过，**8086 端口图片任务不可用**（无论模型本身是否支持视觉）。豆包视觉需直连火山引擎官方 API。
+
 ---
 
 ## 6. token 生命周期
