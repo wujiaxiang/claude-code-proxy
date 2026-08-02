@@ -219,6 +219,7 @@ event: queue_*         # 排队事件（request_wait_in_queue 含 position，不
 
 - 透传 `tools`，仅转换：`parameters` object/list → `json.dumps()` 字符串（实测不转 → `4001 bad request: cannot unmarshal object into ... of type string`）
 - 其余字段（type/name/description）原样
+- **tools 提示词注入（2026-08-02，trae-local-api 方式）**：Trae 上游对标准 tools 字段支持不可靠（seed-code 实测不识别 → 输出乱格式），额外把工具定义注入提示词（`_build_trae_tool_prompt`，附加到最后一条 user 消息），指示模型用 `<tool_call>{"name":"...","arguments":{...}}</tool_call>` XML 格式输出工具调用，响应侧解析（`_TOOLCALL_XML_RE`）
 - **工具调用历史文本化（2026-08-02 修复，seed-code 空响应根因）**：assistant 消息的 `tool_calls` 字段上游不识别，直接丢弃会让后续 `role=tool` 消息变成"孤立 tool 消息"，`Doubao-Seed-Code` 因此返回 200 + 空 SSE 流（`stream done, 0 chunks`，客户端收不到任何内容）。转换时：
   - assistant 带 `tool_calls` → 序列化拼入 content：`"[Tool Call: {name}]\nArguments: {args}"`（有 content 则换行拼接）
   - `role=tool` 消息 → 转 `role=user`，content 加前缀：`"[Tool Call Result: {name}]\n{输出}"`（按 `tool_call_id` 匹配工具名，无匹配省略后缀）
@@ -236,17 +237,47 @@ event: queue_*         # 排队事件（request_wait_in_queue 含 position，不
 
 | 类别 | 模型 | 上游形态 | 代理翻译 |
 |------|------|----------|----------|
-| **A 原生 tool_calls** | `glm-5.2` `glm-5.1` `qwen-3.7-plus` `minimax-m3` `DeepSeek-V4-Pro` `DeepSeek-V4-Flash` | `tool_calls[]` JSON 字段（`function_call{name, arguments}`，流式也是全量无分片） | 字段映射：`function_call` → `function`，透出 `id`/`index`（`_trae_tool_calls_to_openai`） |
-| **B DSML 文本标记** | `Doubao-Seed-Code`（seed-code） | `response` 字段输出 `<｜DSML｜><｜function｜><｜function name｜>X</｜function｜><｜parameter｜>{...}</｜parameter｜>` 标记 | 流式缓冲累积到完整块 + regex 解析为 `tool_calls`（`_parse_dsml_tool_calls`），DSML 文本不透给客户端 |
+| **A 原生 tool_calls** | `glm-5.2` `glm-5.1` `qwen-3.7-plus` `minimax-m3` `DeepSeek-V4-Pro` `DeepSeek-V4-Flash` | `tool_calls[]` JSON 字段（`function_call{name, arguments}`，流式也是全量无分片） | 结构化字段，逐 chunk 立即转发：字段映射 `function_call` → `function`，透出 `id`/`index`（`_trae_tool_calls_to_openai`） |
+| **B 文本形态标记**（DSML / `[Tool Call:]` / `{"reasoning_content":...}` JSON 字面量 / `<tool_call>` XML） | `Doubao-Seed-Code`（seed-code） | `response`/`content` 字段里混杂输出各种文本标记，形态不稳定、且可能被截断/分片 | **正文纯累积，流结束后一次性解析**（见下方架构说明），避免半截标记误判 |
 | **C 空响应（不可用）** | `Doubao-Seed-2.1-Pro` `kimi-k3` `DeepSeek-V4-Flash-Official` | 无 response 无 tool_calls（普通对话也空，疑似收费/渠道过滤） | 已从 `/v1/models` 白名单剔除 |
+
+### 流式架构：正文纯累积 + 流结束统一解析（2026-08-02 重构）
+
+**背景**：B 类模型（seed-code）的工具调用/思考文本以**不稳定的文本标记**混在 `response`/`content` 字段里输出，且经常被 SSE 分片、甚至被截断（未闭合）。曾尝试在流式接收过程中"边收边猜这个 chunk 是不是标记的开头/半截"（启发式函数 `_is_potential_toolcall_prefix` 等），结果每堵住一种半截标记就会冒出下一种变种——因为任意长度的文本前缀理论上都可能是"某个标记的未完成前缀"，这是不可判定问题。实测抓包命中过三种变种：
+
+1. `[Tool Call: xxx]` 的开头 `"["` 独立成一个 SSE chunk，被误判为普通正文提前透传，导致后续标记文本缺了开头 `[` 无法匹配，整段工具调用在流结束时被当残段丢弃
+2. `{"reasoning_content":"..."}` JSON 字面量：只要子串 `"reasoning_content"` 曾经出现且未被完整闭合摘除，`_looks_like_dsml` 判断函数就会对缓冲区永远返回 `True`，导致后续所有正文被无限期拖入缓冲区，直到流结束才一次性吐出（表现为卡顿数秒）
+3. reasoning JSON 被模型截断（缺尾部 `"}`），永远无法闭合，同样导致无限期缓冲
+
+**参考 `trae-local-api`（官方逆向实现，`/root/trae-local-api/src/agent.js` `runAgentStream`/`extractToolCalls`）的架构**：该实现从不在流式接收阶段做标记判断，而是把整轮 `response`/`content` 原始累积成 `fullContent`，等上游 SSE 流完全结束（收到 `'end'`）后，才对完整文本一次性跑正则解析 `tool_calls`，此时标记必然完整（或确定不存在），不存在"半截"问题。
+
+**本实现采用同样策略**（`_resolve_trae_text`，`_handle_traework` 流式/非流式两条路径共用）：
+
+- `response`/`content` 正文：流式阶段只做纯字符串累积（`text_buf`），**不逐 chunk 转发给客户端**
+- `reasoning_content`/`reasoning`、原生 `tool_calls` 字段：上游明确给出的结构化字段（非文本猜测），不存在"标记未闭合"的歧义，**逐 chunk 立即转发**
+- 上游 SSE 流结束后，对累积的完整 `text_buf` 调用 `_resolve_trae_text()` 一次性解析：
+  1. 先提取 `{"reasoning_content":"..."}` JSON 字面量（若存在且已闭合）
+  2. 再解析工具调用标记（DSML `<｜function｜>` 块 / `[Tool Call: name]\nArguments: {...}` 文本 / `<tool_call>` XML），三种格式都会被完整清洗出正文
+  3. 清洗后的 `content_text` 与解析出的 `tool_calls`/`reasoning` 分别 flush 给客户端
+
+**代价**：牺牲逐字打字机效果（seed-code 系模型的回复不再是实时流式，而是整轮结束后一次性吐出），换取 100% 正确性——不会再出现半截标记导致的卡顿/丢弃/泄漏。原生 tool_calls 模型（A 类）不受影响，仍然逐 chunk 实时流式。
+
+### 后续两个衍生 bug 及根治（架构重构后仍暴露，2026-08-02 同日修复）
+
+架构重构消除了"半截标记误判"，但暴露出两个更底层的问题——本质都是**用正则去处理本应严谨解析的结构**：
+
+1. **reasoning 多段拼接未完整提取**：`_extract_reasoning_text` 曾用 `.search()` 只找第一个 `{"reasoning_content":"..."}` JSON 字面量、`.sub(count=1)` 只摘除第一个。而 seed-code 会把多段思考拆成**多个独立的** `{"reasoning_content":"..."}` JSON 拼接输出（不是一个整体 JSON 装完），第二段及之后的原样残留在正文里，客户端看到裸露的 JSON 字面量泄漏。修复：改用 `.finditer()`/`.sub()`（不限 count）处理全部片段。
+2. **`<tool_call>` XML 参数提取被嵌套结构截断**：`_TOOLCALL_XML_JSON_RE` 用正则 `\{[\s\S]*?\}` 非贪婪匹配 `arguments` JSON 对象，遇到嵌套花括号（如 `edit` 工具 `oldString`/`newString` 里的 JS 代码 `{{}}`）或转义引号，在第一个 `}` 处提前截断，`json.loads` 校验失败、`tool_calls` 解析为空，导致整段 `<tool_call>...</tool_call>` 原始文本泄漏到正文（表现为客户端 IDE 界面直接显示裸露的工具调用 JSON，未被解析执行）。
+
+**教训（已做代码级审查确认根治）**：任何"提取 JSON 对象子串"的场景一律禁止用正则模拟花括号配对——这是同一类错误第三次出现（DSML 配对正则、reasoning 多段提取、这次的 XML JSON 提取）。统一改用平衡括号扫描 `_extract_balanced_json`（原仅用于 `[Tool Call:]` 文本格式，现 DSML/XML 两条路径同步收编），全代码库 grep 确认无残留同类脆弱正则。
+
+### 判定逻辑
+
+不按模型名硬编码：响应含 `tool_calls` 字段 → A 路径立即转发；否则 `response`/`content` 一律走纯累积 + 流结束统一解析（B 路径，见上）。新模型自动归队。
 
 ### /v1/models 白名单过滤
 
 `GET /v1/models` 上游列表按 targets.json `enabled=true` 过滤（C 类模型不再出现在客户端模型列表）。
-
-### 判定逻辑
-
-不按模型名硬编码：响应含 `tool_calls` 字段 → A 路径；`response` 含 `<｜DSML｜>` 等标记特征（`_looks_like_dsml`）→ B 路径。新模型自动归队。
 
 ### 分片合并（glm-5.2 特殊性）
 
@@ -428,3 +459,18 @@ seed-code 等模型协议转换出问题（空响应/工具调用异常/格式�
   - `src/agent.js` → 工具调用历史编码（文本化回填，上游无 tool_calls/tool 概念）
 - **server.py 转换实现**：`_openai_to_trae_body`（入参）/ `_trae_chunk_to_openai`（出参）/ `_parse_dsml_tool_calls`（seed-code 专有）
 - 排查步骤：开 DEBUG（`systemctl edit` 加 `Environment=DEBUG=true`）→ 看 proxy.log 里 `trae-work upstream POST body=` 转换产物 → 对照上面文件找差异 → 查完恢复 INFO
+
+---
+
+## 附：trae-work 回归测试（2026-08-02 建立）
+
+> trae-work 协议复杂（模型形态各异/工具历史/新旧格式），改完相关代码必须完整跑一遍。
+
+| 脚本 | 覆盖 | 运行 |
+|------|------|------|
+| `test_trae_protocol.py` | 单元：`_openai_to_trae_body` 工具历史文本化/采样透传、`_parse_dsml_tool_calls`（DSML + [Tool Call:] + 平衡括号）、`_trae_chunk_to_openai` 新旧格式。**无网络**，快 | `.venv/bin/python test_trae_protocol.py` |
+| `test_trae_work_e2e.py` | 端到端：14 个用例打 8086（模型×协议×历史矩阵），验证 HTTP 200/非空/tool_calls/无标记泄漏/arguments 合法 JSON。**消耗真实 crack 额度** | `.venv/bin/python test_trae_work_e2e.py`（`--only 前缀` 选跑） |
+
+- 用例集合：`scripts/test-cases/trae-work/*.json`（14 个：glm-5.2 / Doubao-Seed-Code × 流式/非流式 × 简单/工具历史/content+tool_calls/多轮/长 system）
+- 历史关键回归点：`seed-tool-history`（曾 0 chunks 空响应）、`seed-nonstream-toolhistory`（曾 arguments 混入 reasoning）、`seed-*-tool*`（曾 [Tool Call:] 文本泄漏）
+- 排查时临时加流式 `chunk raw=` DEBUG 日志（已内置，`_handle_traework`），看上游原始事件与转换输出

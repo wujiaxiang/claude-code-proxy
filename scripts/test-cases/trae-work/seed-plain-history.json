@@ -1,0 +1,9 @@
+{
+  "model": "Doubao-Seed-Code",
+  "messages": [
+    {"role": "user", "content": "帮我看看当前目录有什么文件"},
+    {"role": "assistant", "content": "当前目录有 server.py、targets.json、.env 等文件"},
+    {"role": "user", "content": "好的，现在总结一下我们做了什么"}
+  ],
+  "stream": true
+}

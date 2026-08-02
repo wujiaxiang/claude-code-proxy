@@ -1,0 +1,10 @@
+{
+  "model": "Doubao-Seed-Code",
+  "messages": [
+    {"role": "user", "content": "帮我看看当前目录有什么文件"},
+    {"role": "assistant", "content": "", "tool_calls": [{"id": "call_x1", "type": "function", "function": {"name": "bash", "arguments": "{\"command\":\"ls -la\"}"}}]},
+    {"role": "tool", "tool_call_id": "call_x1", "content": "server.py targets.json .env"},
+    {"role": "user", "content": "好的，现在总结一下我们做了什么"}
+  ],
+  "stream": true
+}

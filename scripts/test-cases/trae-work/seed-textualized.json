@@ -1,0 +1,10 @@
+{
+  "model": "Doubao-Seed-Code",
+  "messages": [
+    {"role": "user", "content": "帮我看看当前目录有什么文件"},
+    {"role": "assistant", "content": "[Tool Call: bash]\nArguments: {\"command\":\"ls -la\"}\n\nResult: server.py targets.json .env proxy.log"},
+    {"role": "user", "content": "The tool \"bash\" returned the following result:\n```\nserver.py targets.json .env proxy.log\n```\n\n请分析并总结"},
+    {"role": "user", "content": "好的，现在总结一下我们做了什么"}
+  ],
+  "stream": true
+}

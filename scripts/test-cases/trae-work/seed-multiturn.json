@@ -1,0 +1,12 @@
+{
+  "model": "Doubao-Seed-Code",
+  "messages": [
+    {"role": "user", "content": "查看当前目录文件，然后总结"},
+    {"role": "assistant", "content": "", "tool_calls": [{"id": "call_a1", "type": "function", "function": {"name": "bash", "arguments": "{\"command\":\"ls -la\"}"}}]},
+    {"role": "tool", "tool_call_id": "call_a1", "content": "drwxr-xr-x server.py targets.json .env"},
+    {"role": "user", "content": "继续"},
+    {"role": "assistant", "content": "当前目录包含 server.py、targets.json、.env 等文件。"},
+    {"role": "user", "content": "现在写一个函数计算两个数的和"}
+  ],
+  "stream": true
+}

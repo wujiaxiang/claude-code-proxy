@@ -1,0 +1,10 @@
+{
+  "model": "Doubao-Seed-Code",
+  "messages": [
+    {"role": "user", "content": "请查看目录文件列表，然后根据结果写一个总结"},
+    {"role": "assistant", "content": "我先查看一下当前目录的文件。", "tool_calls": [{"id": "call_xy1", "type": "function", "function": {"name": "bash", "arguments": "{\"command\":\"ls -la\"}"}}]},
+    {"role": "tool", "tool_call_id": "call_xy1", "content": "total 128\ndrwxr-xr-x 5 root root 4096 Aug 2 17:00 .\ndrwxr-xr-x 3 root root 4096 Aug 2 16:00 ..\n-rw-r--r-- 1 root root 7000 server.py\n-rw-r--r-- 1 root root 3000 targets.json"},
+    {"role": "user", "content": "好的，现在请根据上面的结果继续"}
+  ],
+  "stream": true
+}

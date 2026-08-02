@@ -1530,9 +1530,11 @@ def _openai_to_trae_body(body: dict) -> dict:
         clean = model.split("/")[-1]
         out["model"] = clean
         out["config_name"] = clean
-    # ── tools 透传 + 格式转换 ──
+    # ── tools 翻译：透传 + 提示词注入 ──
     # OpenAI: tools[].function.parameters = object
     # Trae:   tools[].function.parameters = JSON 字符串（实测 object 直接 4001）
+    # 注：Trae 上游对标准 tools 字段支持不可靠（seed-code 实测不识别 → 输出乱格式），
+    #     按 trae-local-api 方式额外注入提示词（XML <tool_call> 格式），响应侧解析。
     tools = body.get("tools")
     if tools:
         trae_tools = []
@@ -1544,6 +1546,16 @@ def _openai_to_trae_body(body: dict) -> dict:
                 fn2["parameters"] = json.dumps(params, ensure_ascii=False)
             trae_tools.append({**t, "function": fn2})
         out["tools"] = trae_tools
+        # 提示词注入到最后一条 user 消息（trae-local-api buildToolPrompt 方式）
+        tool_prompt = _build_trae_tool_prompt(tools)
+        if tool_prompt and out["messages"]:
+            last = out["messages"][-1]
+            if last.get("role") == "user":
+                last["content"] = last["content"] + [{"type": "text", "text": "\n\n" + tool_prompt}]
+            else:
+                out["messages"].append({"role": "user",
+                                        "content": [{"type": "text", "text": tool_prompt}],
+                                        "role_type": 0})
     # ── 采样参数尽力透传（参考 trae-local-api trae-client.js llmUtilsChat）──
     # 上游 best-effort 支持，不保证全部生效；max_tokens 截断到 128000
     if isinstance(body.get("max_tokens"), (int, float)) and body["max_tokens"]:
@@ -1590,21 +1602,21 @@ def _trae_chunk_to_openai(chunk: dict, model: str) -> dict:
 
 
 def _trae_tool_calls_to_openai(trae_tc: list) -> list:
-    """Trae tool_calls → OpenAI tool_calls。
+    """tool_calls → OpenAI tool_calls（兼容两种输入形态）。
 
-    Trae: {"index":0,"id":"call_x","type":"function",
-           "function_call":{"name":"get_weather","arguments":"{\"city\":\"北京\"}",
-                            "partial_arguments":null,"namespace":null}}
-    OpenAI: {"id":"call_x","type":"function",
-             "function":{"name":"get_weather","arguments":"{\"city\":\"北京\"}"}}
+    Trae 原生: {"index":0,"id":"call_x","type":"function",
+                "function_call":{"name":"get_weather","arguments":"..."}}
+    DSML/XML 解析: {"type":"function","function":{"name":"get_weather","arguments":"..."}}（无 id/index）
 
-    arguments 已是 JSON 字符串（流式也是全量，无增量分片），原样透出。
+    输出统一 OpenAI 格式：{"id","type","function","index"}；缺 id/index 时补生成
+    （OpenAI 协议要求，客户端按 id 关联工具结果；缺 index 时流式无法分片累积）。
     """
     oai = []
-    for tc in trae_tc:
+    for i, tc in enumerate(trae_tc):
         if not isinstance(tc, dict):
             continue
-        fc = tc.get("function_call") or {}
+        # 兼容 function_call（Trae 原生）与 function（DSML/XML 解析）两种键
+        fc = tc.get("function_call") or tc.get("function") or {}
         fn = {}
         if fc.get("name"):
             fn["name"] = fc["name"]
@@ -1613,10 +1625,11 @@ def _trae_tool_calls_to_openai(trae_tc: list) -> list:
         if not fn:
             continue
         item = {"type": tc.get("type", "function"), "function": fn}
+        item["index"] = tc.get("index") if tc.get("index") is not None else i
         if tc.get("id"):
             item["id"] = tc["id"]
-        if tc.get("index") is not None:
-            item["index"] = tc["index"]
+        else:
+            item["id"] = f"call_{int(time.time() * 1000)}_{i}"
         oai.append(item)
     return oai
 
@@ -1629,50 +1642,232 @@ def _trae_tool_calls_to_openai(trae_tc: list) -> list:
 #   <｜parameter｜>{"city":"北京"}</｜parameter｜>
 #   </｜function｜>
 #   </｜DSML｜>
-_DSML_FN_RE = re.compile(r"<[｜|]function[｜|]>(.*?)</[｜|]function[｜|]>", re.S)
-_DSML_NAME_RE = re.compile(r"<[｜|]function name[｜|]>(.*?)</[｜|]function[｜|]>", re.S)
-_DSML_PARAM_RE = re.compile(r"<[｜|]parameter[｜|]>(.*?)</[｜|]parameter[｜|]>", re.S)
+# 注意：<｜function name｜>...</｜function｜> 和外层 <｜function｜>...</｜function｜> 共用
+# 同一个闭合标记 "</｜function｜>"（而非 "</｜function name｜>"），曾用非贪婪
+# "<｜function｜>(.*?)</｜function｜>" 提取整段块，结果非贪婪匹配在第一个
+# </｜function｜>（其实是 name 标签的闭合）处就停止，导致 <｜parameter｜> 从未
+# 被捕获到块内（_DSML_FN_RE 从未真正工作过，2026-08-02 补测试时发现）。
+# 改用一次性配对正则，同时捕获 name + parameter，避免闭合标记歧义。
+_DSML_PAIR_RE = re.compile(
+    r"<[｜|]function[｜|]>\s*<[｜|]function name[｜|]>(.*?)</[｜|]function[｜|]>"
+    r"\s*<[｜|]parameter[｜|]>(.*?)</[｜|]parameter[｜|]>\s*</[｜|]function[｜|]>", re.S)
 _DSML_LIKE_RE = re.compile(r"<[｜|](?:DSML|function|function name|parameter)[｜|]>")
+# seed-code 从历史文本化格式学到的输出形态（2026-08-02 实测）：response 字段输出
+# "[Tool Call: bash]\nArguments: {\"command\":\"...\"}" 纯文本而非 DSML/tool_calls 事件。
+# 识别并解析回 tool_calls，避免把该文本原样透传给客户端（IDE 无法识别）。
+# Arguments 用平衡括号提取（贪婪 \{.*\} 会吞掉后面的 reasoning JSON 文本）。
+_TOOLCALL_TEXT_RE = re.compile(r"\[Tool Call: ([A-Za-z0-9_\-\.:/]+)\]\s*\n?\s*Arguments:\s*(\{)", re.S)
+
+
+def _extract_balanced_json(text: str, start: int) -> str | None:
+    """从 text[start]（'{'）起做平衡括号提取，返回完整 JSON 对象字符串；无匹配返回 None。"""
+    depth = 0
+    in_str = False
+    esc = False
+    for i in range(start, len(text)):
+        ch = text[i]
+        if in_str:
+            if esc:
+                esc = False
+            elif ch == "\\":
+                esc = True
+            elif ch == '"':
+                in_str = False
+            continue
+        if ch == '"':
+            in_str = True
+        elif ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                return text[start:i + 1]
+    return None
+
+
+# 模型以 {"reasoning_content":"..."} JSON 字面量输出思考（2026-08-02 实测），
+# 需提取为 reasoning 而非作为 content 透传（客户端会把 JSON 字面量当正文显示）。
+_DSML_REASONING_RE = re.compile(r'\{"reasoning_content":"((?:[^"\\]|\\.)*)"\}', re.S)
+# trae-local-api 方式：提示词注入后模型用 <tool_call> XML 输出工具调用（2026-08-02）
+_TOOLCALL_XML_RE = re.compile(r"<tool_call\b[^>]*>([\s\S]*?)</tool_call\s*>", re.I)
+# 注：内部 JSON 对象（{"name":...,"arguments":{...}}）不用正则提取，改用
+# _extract_balanced_json 平衡括号扫描（见 _parse_dsml_tool_calls），避免嵌套
+# 花括号/转义引号导致提取截断（2026-08-02 实测：edit 工具的 oldString 含 JS
+# 代码花括号，曾用正则提取导致 JSON 截断校验失败、整段泄漏到正文）
+# DSML 外层完整包裹（含 <｜DSML｜>...</｜DSML｜>），一次性移除时用
+_DSML_BLOCK_RE = re.compile(r"<[｜|]DSML[｜|]>[\s\S]*?</[｜|]DSML[｜|]>", re.S)
+
+
+def _build_trae_tool_prompt(tools: list) -> str:
+    """OpenAI tools 定义 → Trae 提示词文本（trae-local-api buildToolPrompt 方式）。
+
+    Trae 上游 llm_utils_chat 不识别标准 tools 字段（seed-code 实测输出乱格式），
+    把工具定义注入提示词并指示 XML 调用格式，响应侧解析 <tool_call>。
+    """
+    descs = []
+    for t in tools or []:
+        fn = t.get("function") or {}
+        name = fn.get("name") or ""
+        desc = fn.get("description") or ""
+        params = fn.get("parameters") or {}
+        props = (params or {}).get("properties") or {}
+        param_str = ", ".join(
+            f"{k}: {v.get('description') or v.get('type')}" for k, v in props.items())
+        descs.append(f"- {name}({param_str}): {desc}")
+    return ("[Available tools - 使用 XML 格式调用工具]:\n" + "\n".join(descs) +
+            "\n\n调用工具时，在回复中包含以下格式:\n"
+            '<tool_call>\n{"name": "工具名", "arguments": {"参数": "值"}}\n</tool_call>\n'
+            "可以一次回复多个工具调用。收到工具结果后分析并回复用户。仅在需要时调用工具。")
+
+
+def _extract_reasoning_text(text: str) -> str:
+    """从累积文本提取所有 {"reasoning_content":"..."} JSON 字面量的内容并拼接（JSON unescape）。
+
+    seed-code 实测会把多段思考分别包成多个独立的 {"reasoning_content":"..."} JSON
+    （而非一个整体 JSON 装完整思考），曾用 .search() 只提取第一段，导致后续几段
+    原样以 JSON 字面量泄漏到正文（2026-08-02 实测：客户端看到裸露的
+    {"reasoning_content":"..."} 文本）。改用 .finditer() 提取全部并拼接。
+    无匹配返回 ""。
+    """
+    parts = []
+    for m in _DSML_REASONING_RE.finditer(text or ""):
+        try:
+            parts.append(json.loads('"' + m.group(1) + '"'))
+        except Exception:
+            parts.append(m.group(1))
+    return "".join(parts)
 
 
 def _looks_like_dsml(text: str) -> bool:
-    """文本是否含 DSML 工具调用标记特征（seed-code 系模型输出）。"""
-    return bool(_DSML_LIKE_RE.search(text or ""))
+    """文本是否含工具调用标记特征（seed-code 系模型输出）。
+
+    兼容形态：DSML 标记（<｜DSML｜>...）、[Tool Call: name] 文本格式、
+    {"reasoning_content":"..."} JSON 字面量（思考封装），以及各形态的
+    分片半截（尽早进入缓冲累积，避免原始标记/JSON 字面量透传给客户端）。
+    """
+    t = text or ""
+    return bool(_DSML_LIKE_RE.search(t) or _TOOLCALL_TEXT_RE.search(t)
+                or _DSML_REASONING_RE.search(t) or _TOOLCALL_XML_RE.search(t)
+                or "[Tool Call" in t or "Arguments:" in t
+                or '{"reasoning_content"' in t or "reasoning_content" in t
+                or "tool_call" in t or t.startswith('{"'))
+
+
+# ── 架构说明（2026-08-02 重构）──────────────────────────────────────────
+# 曾尝试在流式接收过程中"边收边猜这个 chunk 是不是工具调用标记的开头/半截"
+# （_is_potential_toolcall_prefix 等启发式），结果每堵住一种半截标记（如
+# "[" 单独成 chunk、reasoning JSON 未闭合）就会冒出下一种变种——因为任意
+# 长度的文本前缀理论上都可能是"某个标记的未完成前缀"，这是不可判定问题。
+#
+# 参考 trae-local-api（官方逆向实现，/root/trae-local-api/src/agent.js
+# runAgentStream + extractToolCalls）的架构：从不在流式接收阶段做标记判断，
+# 而是先把整轮的 response/content 原始累积成 fullContent，等上游 SSE 流
+# 完全结束（收到 'end'）后，才对完整文本一次性跑正则解析 tool_calls，
+# 解析完再统一 flush 给客户端。标记必然是完整的，不存在"半截"问题。
+#
+# 本实现采用同样策略：resp_text 流式阶段只做纯累积（不做任何 content 提前
+# 转发），reasoning_content/tool_calls 等结构化字段（上游明确给出、非文本
+# 猜测）仍然逐 chunk 立即转发，因为它们不存在"文本标记未闭合"的歧义。
+def _resolve_trae_text(full_text: str) -> tuple[list, str, str]:
+    """对一整轮已完整接收的 response/content 文本做工具调用/reasoning 解析。
+
+    Returns: (tool_calls, reasoning_text, content_text)
+      - tool_calls: 解析出的工具调用列表（OpenAI tool_calls 格式，可能为空）
+      - reasoning_text: 提取出的 reasoning（{"reasoning_content":"..."} JSON 字面量）
+      - content_text: 清洗掉工具调用/reasoning 标记后的正文（tool_calls 非空时省略，
+        避免把 "[Tool Call: xxx]\nArguments: {...}" 之类的调用文本也当正文回显）
+    """
+    text = full_text or ""
+    reasoning_text = _extract_reasoning_text(text)
+    if reasoning_text:
+        text = _DSML_REASONING_RE.sub("", text)  # 摘除全部（可能有多段），不只第一段
+    tool_calls = _parse_dsml_tool_calls(text)
+    if tool_calls:
+        # 工具调用文本本身不作为正文回显（DSML/[Tool Call:]/<tool_call> 全部清洗掉）
+        content_text = _DSML_BLOCK_RE.sub("", text)
+        content_text = _TOOLCALL_TEXT_RE.sub("", content_text)
+        for m in re.finditer(_TOOLCALL_TEXT_RE, text):
+            args = _extract_balanced_json(text, m.start(2))
+            if args is not None:
+                content_text = content_text.replace(args, "", 1)
+        content_text = _TOOLCALL_XML_RE.sub("", content_text)
+        content_text = content_text.strip()
+    else:
+        content_text = text.strip()
+    return tool_calls, reasoning_text, content_text
 
 
 def _parse_dsml_tool_calls(text: str) -> list:
-    """把 DSML 标记文本解析为 OpenAI tool_calls 列表；无匹配返回 []。
+    """把工具调用标记文本解析为 OpenAI tool_calls 列表；无匹配返回 []。
 
-    每个 <｜function｜>...</｜function｜> 块 = 一次工具调用：
-    name 取自 <｜function name｜>，参数取自 <｜parameter｜>（原样保留为 JSON 字符串）。
+    先试 DSML 标记（<｜function｜> 块），再试 [Tool Call: name]\nArguments: {...} 文本。
     """
     tcs = []
-    for block in _DSML_FN_RE.findall(text):
-        name = ""
-        m_name = _DSML_NAME_RE.search(block)
-        if m_name:
-            name = m_name.group(1).strip()
+    for name_raw, args_raw in _DSML_PAIR_RE.findall(text):
+        name = name_raw.strip()
         if not name:
             continue
-        args = None
-        m_param = _DSML_PARAM_RE.search(block)
-        if m_param:
-            args = m_param.group(1).strip()
+        args = args_raw.strip()
         item = {"type": "function", "function": {"name": name}}
         if args:
             item["function"]["arguments"] = args
         tcs.append(item)
+    if not tcs:
+        # [Tool Call: name]\nArguments: {...} 文本格式（seed-code 从历史学到的输出形态）
+        for m in _TOOLCALL_TEXT_RE.finditer(text):
+            name = m.group(1).strip()
+            args = _extract_balanced_json(text, m.start(2))
+            if args is None:
+                break  # arguments 分片未完整（{ 后还没闭合），等待更多内容累积
+            item = {"type": "function", "function": {"name": name}}
+            if args:
+                item["function"]["arguments"] = args
+            tcs.append(item)
+    if not tcs:
+        # <tool_call> XML 格式（trae-local-api 提示词注入方式，模型遵循提示词输出）：
+        # <tool_call> 内部本应是一个完整 JSON 对象 {"name":...,"arguments":{...}}。
+        # 曾用正则 _TOOLCALL_XML_JSON_RE（\{[\s\S]*?\} 非贪婪匹配 arguments 对象）
+        # 提取 name/arguments，但正则无法正确处理"对象内嵌套花括号"（如 JS 代码片段
+        # 里的 `{{}}`）或"转义引号"——遇到第一个 `}` 就提前截断，导致 arguments 提取
+        # 出半截 JSON、json.loads 校验失败、tcs 为空，整段 <tool_call> 文本原样
+        # 泄漏到正文给客户端（2026-08-02 实测：edit 工具调用的 oldString/newString
+        # 含 JS 花括号代码，被截断泄漏）。
+        # 教训：任何"提取 JSON 对象子串"的场景，一律用平衡括号扫描
+        # （_extract_balanced_json），不能用正则模拟花括号配对——这是本文件里
+        # 反复踩坑的同一类错误（DSML 配对正则、reasoning 多段提取也是类似教训）。
+        for block in _TOOLCALL_XML_RE.findall(text):
+            block = block.strip()
+            obj_start = block.find("{")
+            if obj_start < 0:
+                continue
+            obj_str = _extract_balanced_json(block, obj_start)
+            if obj_str is None:
+                continue  # 未闭合（半截标记），交由上层判定是否继续等待
+            try:
+                obj = json.loads(obj_str)
+            except Exception:
+                continue
+            name = (obj.get("name") or obj.get("tool_name") or "").strip()
+            if not name:
+                continue
+            args_val = obj.get("arguments", {})
+            args_str = json.dumps(args_val, ensure_ascii=False) if not isinstance(args_val, str) else args_val
+            tcs.append({"type": "function", "function": {"name": name, "arguments": args_str}})
     return tcs
 
 
-def _trae_final_to_openai(model: str) -> dict:
-    """流结束标记（OpenAI 兼容 finish）。"""
+def _trae_final_to_openai(model: str, finish_reason: str = "stop") -> dict:
+    """流结束标记（OpenAI 兼容 finish）。
+
+    finish_reason 必须与实际输出匹配：转出过 tool_calls 时为 "tool_calls"
+    （客户端据此执行工具），否则 "stop"（默认）。
+    """
     return {
         "id": "chatcmpl-final",
         "object": "chat.completion.chunk",
         "created": int(time.time()),
         "model": model,
-        "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+        "choices": [{"index": 0, "delta": {}, "finish_reason": finish_reason}],
     }
 
 
@@ -1774,13 +1969,19 @@ async def _handle_traework(writer, target, method, path, headers, body, stats, l
                     return
 
                 # ── 流式：Trae SSE → OpenAI SSE ──
+                # 架构（2026-08-02 重构，对齐 trae-local-api 官方实现）：response/content
+                # 正文只做纯累积（text_buf），不逐 chunk 转发；reasoning_content/tool_calls
+                # 等结构化字段（上游明确给出，非文本猜测）逐 chunk 立即转发。上游流结束后，
+                # 对累积的完整正文一次性解析工具调用/reasoning，再统一 flush（_resolve_trae_text）。
+                # 好处：不存在"标记半截"的判定难题（标记此时必然完整或确定不存在）。
+                # 代价：牺牲逐字打字机效果，换取正确性（不会再出现半截标记导致卡顿/丢弃/泄漏）。
                 if is_stream:
                     writer.write(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: keep-alive\r\n\r\n")
                     await writer.drain()
-                    # seed-code 系模型的 DSML 标记是分片输出的，累积到完整块再解析
-                    dsml_buf = ""
+                    text_buf = ""  # 本轮累积的 response/content 正文（流结束后统一解析）
                     n_chunks = 0
                     busy_aborted = False
+                    emitted_tool_calls = False  # 转出过 tool_calls → 流结束 finish_reason="tool_calls"
                     async for chunk in resp.aiter_bytes():
                         line = chunk.decode("utf-8", errors="replace")
                         for raw in line.split("\n"):
@@ -1827,49 +2028,65 @@ async def _handle_traework(writer, target, method, path, headers, body, stats, l
                                 # 上游 progress 提示（旧格式）过滤，避免当正文输出
                                 if resp_text.startswith("Building prompt:") or resp_text.startswith("Completed building prompt"):
                                     continue
-                                # DSML 文本 → 缓冲累积，完整块解析为 tool_calls
-                                if _looks_like_dsml(resp_text) or dsml_buf:
-                                    if resp_text:
-                                        dsml_buf += resp_text
-                                    tcs = _parse_dsml_tool_calls(dsml_buf)
-                                    if tcs:
-                                        logger.debug(f"[{label}] trae-work DSML parsed {len(tcs)} tool_calls: "
-                                                     f"{_json.dumps(tcs, ensure_ascii=False)[:500]}")
-                                        oai = _trae_chunk_to_openai(
-                                            {"response": "", "tool_calls": [{"type": "function", "function": tc["function"]} for tc in tcs]},
-                                            model,
-                                        )
-                                        n_chunks += 1
-                                        writer.write(("data: " + _json.dumps(oai, ensure_ascii=False) + "\n\n").encode())
-                                        await writer.drain()
-                                        dsml_buf = ""
-                                    # 未闭合时继续累积，不输出 content（避免把 DSML 标记透给客户端）
-                                    continue
-                                oai = _trae_chunk_to_openai(trae_chunk, model)
+                                if resp_text:
+                                    text_buf += resp_text
+                                # reasoning_content/reasoning 是上游明确给出的结构化字段（非文本猜测），
+                                # 不存在"标记未闭合"的歧义，可以立即转发
+                                reasoning = trae_chunk.get("reasoning_content") or trae_chunk.get("reasoning") or ""
+                                if reasoning:
+                                    oai_r = _trae_chunk_to_openai({"reasoning_content": reasoning}, model)
+                                    n_chunks += 1
+                                    writer.write(("data: " + _json.dumps(oai_r, ensure_ascii=False) + "\n\n").encode())
+                                    await writer.drain()
+                                # 上游原生 tool_calls 字段（非文本解析出来的，结构明确）→ 立即转发
                                 if trae_chunk.get("tool_calls"):
+                                    oai_tc = _trae_chunk_to_openai({"tool_calls": trae_chunk["tool_calls"]}, model)
+                                    emitted_tool_calls = True
+                                    n_chunks += 1
                                     logger.debug(f"[{label}] trae-work chunk tool_calls: "
                                                  f"{_json.dumps(trae_chunk.get('tool_calls'), ensure_ascii=False)[:800]}")
-                                n_chunks += 1
-                                writer.write(("data: " + _json.dumps(oai, ensure_ascii=False) + "\n\n").encode())
-                                await writer.drain()
+                                    writer.write(("data: " + _json.dumps(oai_tc, ensure_ascii=False) + "\n\n").encode())
+                                    await writer.drain()
                         if busy_aborted:
                             break
-                    # 流结束：若残留 DSML 未解析完，丢弃（不把半截标记透给客户端）
-                    if dsml_buf:
-                        logger.debug(f"[{label}] trae-work DSML trailing {len(dsml_buf)} bytes dropped: "
-                                     f"{dsml_buf[:300]!r}")
+                    # 上游流结束：对累积的完整正文一次性解析（此时标记必然完整或确定不存在）
+                    if text_buf:
+                        tcs, rtext, content_text = _resolve_trae_text(text_buf)
+                        logger.debug(f"[{label}] trae-work resolved: tool_calls={len(tcs)} "
+                                     f"reasoning={bool(rtext)} content_len={len(content_text)}")
+                        if rtext:
+                            oai_r = _trae_chunk_to_openai({"reasoning_content": rtext}, model)
+                            n_chunks += 1
+                            writer.write(("data: " + _json.dumps(oai_r, ensure_ascii=False) + "\n\n").encode())
+                            await writer.drain()
+                        if content_text:
+                            oai_c = _trae_chunk_to_openai({"response": content_text}, model)
+                            n_chunks += 1
+                            writer.write(("data: " + _json.dumps(oai_c, ensure_ascii=False) + "\n\n").encode())
+                            await writer.drain()
+                        if tcs:
+                            emitted_tool_calls = True
+                            oai_tc = _trae_chunk_to_openai(
+                                {"response": "", "tool_calls": [{"type": "function", "function": tc["function"]} for tc in tcs]},
+                                model,
+                            )
+                            n_chunks += 1
+                            writer.write(("data: " + _json.dumps(oai_tc, ensure_ascii=False) + "\n\n").encode())
+                            await writer.drain()
                     logger.debug(f"[{label}] trae-work stream done, {n_chunks} chunks → client"
                                  + (" (busy abort)" if busy_aborted else ""))
-                    writer.write(("data: " + _json.dumps(_trae_final_to_openai(model), ensure_ascii=False) + "\n\n").encode())
+                    writer.write(("data: " + _json.dumps(
+                        _trae_final_to_openai(model, "tool_calls" if emitted_tool_calls else "stop"),
+                        ensure_ascii=False) + "\n\n").encode())
                     writer.write(b"data: [DONE]\n\n")
                     await writer.drain()
                     stats["passthroughOk"] += 1
                     writer.close(); return
 
-                # ── 非流式：累积 output 事件 ──
+                # ── 非流式：累积 output 事件（架构对齐流式：正文纯累积，流结束后统一解析）──
                 resp_body = await resp.aread()
                 content_parts, reasoning_parts, tool_calls = [], [], []
-                dsml_buf = ""
+                text_buf = ""
                 for raw in resp_body.decode("utf-8", errors="replace").split("\n"):
                     raw = raw.strip()
                     if not raw.startswith("data:"):
@@ -1896,10 +2113,7 @@ async def _handle_traework(writer, target, method, path, headers, body, stats, l
                         # 上游 progress 提示（旧格式）过滤，避免当正文输出
                         if resp_text.startswith("Building prompt:") or resp_text.startswith("Completed building prompt"):
                             continue
-                        if _looks_like_dsml(resp_text) or dsml_buf:
-                            dsml_buf += resp_text
-                        else:
-                            content_parts.append(resp_text)
+                        text_buf += resp_text
                     reasoning = trae_chunk.get("reasoning_content") or trae_chunk.get("reasoning") or ""
                     if reasoning:
                         reasoning_parts.append(reasoning)
@@ -1922,12 +2136,14 @@ async def _handle_traework(writer, target, method, path, headers, body, stats, l
                                     prev["id"] = oai_tc["id"]
                             else:
                                 tool_calls.append(oai_tc)
-                if dsml_buf:
-                    dsml_tcs = _parse_dsml_tool_calls(dsml_buf)
-                    if dsml_tcs:
-                        tool_calls = dsml_tcs
-                    else:
-                        content_parts.append(dsml_buf)  # 非 DSML 残留（如纯文本工具描述）照常输出
+                if text_buf:
+                    resolved_tcs, resolved_r, resolved_content = _resolve_trae_text(text_buf)
+                    if resolved_r:
+                        reasoning_parts.append(resolved_r)
+                    if resolved_tcs:
+                        tool_calls = resolved_tcs
+                    elif resolved_content:
+                        content_parts.append(resolved_content)
                 out = _trae_nonstream_to_openai(model, content_parts, reasoning_parts, tool_calls or None)
                 payload = _json.dumps(out, ensure_ascii=False).encode()
                 logger.debug(f"[{label}] trae-work nonstream done: content_parts={len(content_parts)} "
@@ -6491,12 +6707,33 @@ async def api_get_aggregate_config():
     target = next((t for t in _TARGETS if t.get("handler") == "aggregator"), None)
     if target is None:
         return {"configured": False}
+    # 聚合可用端口列表（用于前端下拉选择 + 联动模型过滤）
+    available_ports = {}
+    for t in _TARGETS:
+        if t.get("handler") == "aggregator":
+            continue
+        port_num = t.get("listenPort")
+        if port_num is None:
+            continue
+        models = []
+        for m in (t.get("models") or []):
+            if isinstance(m, dict):
+                if m.get("enabled", True):
+                    models.append(m.get("id") or m.get("name", ""))
+            elif isinstance(m, str):
+                models.append(m)
+        available_ports[str(port_num)] = {
+            "label": t.get("label") or t.get("name") or str(port_num),
+            "handler": t.get("handler"),
+            "models": models,
+        }
     return {
         "configured": True,
         "name": target.get("name") or target.get("label"),
         "virtualModels": target.get("virtualModels", {}),
         "poolDefaults": target.get("poolDefaults", {}),
         "quotaErrorPatterns": target.get("quotaErrorPatterns", []),
+        "availablePorts": available_ports,
     }
 
 
@@ -7737,13 +7974,76 @@ function aggNumField(key, labelText, val, placeholder) {{
     '</label>';
 }}
 
+// 聚合可用端口缓存（由 buildAggConfigHtml 在打开编辑器时注入）
+var _aggAvailablePorts = {{}};
+// 聚合虚拟模型 id 映射（用于模型下拉补全 agg:xxx 选项）
+var _aggVirtualModelIds = [];
+
+function aggPortSelectHtml(selectedPort) {{
+  var html = '<select class="agg-input agg-mem-port" aria-label="端口" onchange="onAggPortChange(this)">';
+  html += '<option value=""' + (selectedPort ? '' : ' selected') + '>选择端口</option>';
+  var keys = Object.keys(_aggAvailablePorts).sort(function(a, b) {{ return Number(a) - Number(b); }});
+  keys.forEach(function(pk) {{
+    var info = _aggAvailablePorts[pk];
+    var label = pk + ' · ' + (info.label || info.handler || '');
+    var sel = (String(selectedPort) === pk) ? ' selected' : '';
+    html += '<option value="' + pk + '"' + sel + '>' + escHtml(label) + '</option>';
+  }});
+  if (selectedPort !== undefined && selectedPort !== null && selectedPort !== '' && !_aggAvailablePorts[String(selectedPort)]) {{
+    html += '<option value="' + escHtml(String(selectedPort)) + '" selected>' + escHtml(String(selectedPort)) + ' (自定义)</option>';
+  }}
+  html += '</select>';
+  return html;
+}}
+
+function aggModelSelectHtml(selectedPort, selectedModel) {{
+  var html = '<select class="agg-input agg-mem-model" aria-label="模型" onchange="onAggModelChange(this)">';
+  html += '<option value=""' + (selectedModel ? '' : ' selected') + '>选择模型</option>';
+  var models = [];
+  if (selectedPort !== undefined && selectedPort !== null && selectedPort !== '' && _aggAvailablePorts[String(selectedPort)]) {{
+    models = _aggAvailablePorts[String(selectedPort)].models || [];
+  }}
+  // 聚合虚拟模型（agg:xxx）总是可选
+  var all = models.slice();
+  _aggVirtualModelIds.forEach(function(v) {{ if (all.indexOf(v) === -1) all.push(v); }});
+  all.sort();
+  all.forEach(function(m) {{
+    var sel = (m === selectedModel) ? ' selected' : '';
+    html += '<option value="' + escHtml(m) + '"' + sel + '>' + escHtml(m) + '</option>';
+  }});
+  if (selectedModel !== undefined && selectedModel !== null && selectedModel !== '' && all.indexOf(selectedModel) === -1) {{
+    html += '<option value="' + escHtml(String(selectedModel)) + '" selected>' + escHtml(String(selectedModel)) + ' (自定义)</option>';
+  }}
+  html += '</select>';
+  return html;
+}}
+
+function onAggPortChange(selEl) {{
+  var row = selEl.closest('.agg-pool-row');
+  if (!row) return;
+  var modelSel = row.querySelector('.agg-mem-model');
+  if (!modelSel) return;
+  var port = selEl.value;
+  // 重建模型下拉
+  var newHtml = aggModelSelectHtml(port, '');
+  var tmp = document.createElement('div');
+  tmp.innerHTML = newHtml;
+  var newSel = tmp.firstChild;
+  if (newSel) {{
+    modelSel.parentNode.insertBefore(newSel, modelSel);
+    modelSel.parentNode.removeChild(modelSel);
+  }}
+}}
+
+function onAggModelChange(selEl) {{
+  // 保留钩子：未来可扩展 agg:xxx 模型的特殊处理
+}}
+
 function aggPoolMemberRow(port, model, weight) {{
-  var p = (port === undefined || port === null) ? '' : escHtml(String(port));
-  var m = (model === undefined || model === null) ? '' : escHtml(String(model));
   var w = (weight === undefined || weight === null) ? '' : escHtml(String(weight));
   return '<div class="agg-pool-row">' +
-    '<input type="number" class="agg-input agg-mem-port" value="' + p + '" placeholder="端口" aria-label="端口">' +
-    '<input type="text" class="agg-input agg-mem-model" value="' + m + '" placeholder="模型名（如 gpt-4o / agg:xxx）" aria-label="模型">' +
+    aggPortSelectHtml(port) +
+    aggModelSelectHtml(port, model) +
     '<input type="number" class="agg-input agg-mem-weight" value="' + w + '" placeholder="权重" aria-label="权重">' +
     '<button class="mm-del" onclick="removeAggPoolMember(this)" title="删除成员">×</button>' +
     '</div>';
@@ -7811,6 +8111,11 @@ async function openAggConfigEditor(btn) {{
 }}
 
 function buildAggConfigHtml(r) {{
+  // 注入全局缓存，供 aggPortSelectHtml / aggModelSelectHtml 使用
+  _aggAvailablePorts = r.availablePorts || {{}};
+  var _vmMap = r.virtualModels || {{}};
+  _aggVirtualModelIds = [];
+  Object.keys(_vmMap).forEach(function(k) {{ if (k.indexOf('agg:') === 0) _aggVirtualModelIds.push(k); }});
   var pd = r.poolDefaults || {{}};
   var html = '<div class="agg-hint">虚拟模型池配置：成员端口指向本地真实网关端口，模型为上游模型名（可填 agg:xxx 链式聚合）。' +
     '权重与重试留空 = 继承池默认值；保存后热生效。</div>';
@@ -7904,7 +8209,7 @@ async function saveAggConfig(btn) {{
             var portEl = row.querySelector('.agg-mem-port');
             var modelEl = row.querySelector('.agg-mem-model');
             var wEl = row.querySelector('.agg-mem-weight');
-            var port = (portEl ? portEl.value : '').trim();
+                    var port = (portEl ? portEl.value : '').trim();
             var model = (modelEl ? modelEl.value : '').trim();
             var w = (wEl ? wEl.value : '').trim();
             if (!port && !model && !w) return;  // 空行忽略
@@ -7917,6 +8222,7 @@ async function saveAggConfig(btn) {{
               bad = true; return;
             }}
             var mem = {{port: Number(port), model: model}};
+            // 端口已在下拉列表外（自定义）：允许 agg:xxx 等链式聚合，模型也允许自由输入
             if (w !== '') {{
               var wn = Number(w);
               if (isNaN(wn) || wn < 0) {{

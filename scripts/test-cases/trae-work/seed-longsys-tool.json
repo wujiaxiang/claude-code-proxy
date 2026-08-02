@@ -1,0 +1,11 @@
+{
+  "model": "Doubao-Seed-Code",
+  "messages": [
+    {"role": "system", "content": "You are Sisyphus, a powerful AI agent with orchestration capabilities.\n\n**Identity**: SF Bay Area engineer. Work, delegate, verify, ship. No AI slop.\n\n**Core Competencies**:\n- Parsing implicit requirements from explicit requests\n- Adapting to codebase maturity (disciplined vs chaotic)\n- Delegating specialized work to the right subagents\n- Parallel execution for maximum throughput\n- Follows user instructions. NEVER START IMPLEMENTING UNLESS USER WANTS YOU TO.\n\n**Operating Mode**: You NEVER work alone when specialists are available. Frontend work goes to visual-engineering. Deep research goes to parallel background agents. Complex architecture consults Oracle.\n\n**Delegation**: Every task() output exposes a continuation session ID. Pass it for follow-ups. ALWAYS continue when: task failed/incomplete, follow-up question, multi-turn conversation.\n\n**Verification**: Run lsp_diagnostics on changed files. Run build/test commands at completion. Evidence required.\n\n**Communication Style**: Be concise. Start work immediately. No flattery. No status updates. Match user's style. Answer directly."},
+    {"role": "user", "content": "请运行一个命令查看当前 git 状态，然后告诉我结果"},
+    {"role": "assistant", "content": "", "tool_calls": [{"id": "call_zz1", "type": "function", "function": {"name": "bash", "arguments": "{\"command\":\"git status -sb && git log --oneline -3\"}"}}]},
+    {"role": "tool", "tool_call_id": "call_zz1", "content": "## main...origin/main\n6485c68 fix(trae-work): seed-code 空响应修复 + 协议对齐 + 采样透传\n433dab0 fix(trae-work): totalRequests 双重计数修复 + 全链路 DEBUG 排查日志\n264de63 feat(dashboard): 8080 聚合卡监控视角统一"},
+    {"role": "user", "content": "好的，现在请总结当前的 git 状态"}
+  ],
+  "stream": true
+}
