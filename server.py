@@ -522,6 +522,7 @@ async def lifespan(app):
 
     # ── 启动配置热重载 watcher ──
     watcher_task = asyncio.create_task(_config_watcher())
+    aggregator_prober_task = asyncio.create_task(_aggregator_prober())
 
     yield
 
@@ -529,6 +530,13 @@ async def lifespan(app):
     watcher_task.cancel()
     try:
         await watcher_task
+    except asyncio.CancelledError:
+        pass
+
+    # 停止聚合网关探测 task
+    aggregator_prober_task.cancel()
+    try:
+        await aggregator_prober_task
     except asyncio.CancelledError:
         pass
 
@@ -768,6 +776,10 @@ _TARGET_STATS: Dict[str, dict] = {}
 # 模型级统计：{ label: { model_name: {"requests": N, "ok": N, "err": N, "translated429": N} } }
 _MODEL_STATS: Dict[str, Dict[str, Dict[str, int]]] = {}
 _ANTHROPIC_FORWARD_PORT = 8082
+
+# ─── 聚合网关（8080）单例引擎 + 重载去重签名 ───
+_AGGREGATOR_ENGINE = None  # type: ignore
+_AGGREGATOR_CONFIG_SIG: Optional[str] = None
 
 def _bump_model_stats(label: str, model: str, outcome: str):
     """记录模型级统计。outcome: 'ok' | 'err' | 'translated429'"""
@@ -1698,6 +1710,30 @@ async def _reload_targets() -> list:
     _ANTHROPIC_FORWARD_PORT = cfg.get("anthropicForwardPort", 8082)
     _SECRETS = _cfg.load_secrets()
 
+    # ── 聚合网关单例：找到聚合 target 则按需初始化/reload，找不到则清空单例 ──
+    global _AGGREGATOR_ENGINE, _AGGREGATOR_CONFIG_SIG
+    agg_target = next((t for t in _TARGETS if t.get("handler") == "aggregator"), None)
+    if agg_target is None:
+        _AGGREGATOR_ENGINE = None
+        _AGGREGATOR_CONFIG_SIG = None
+    else:
+        sig = json.dumps(agg_target, sort_keys=True, ensure_ascii=False)
+        if _AGGREGATOR_ENGINE is None:
+            try:
+                import aggregator as _agg
+                _AGGREGATOR_ENGINE = _agg.AggregatorEngine.from_target(agg_target)
+                _AGGREGATOR_CONFIG_SIG = sig
+                logger.info("♻️  聚合网关引擎已初始化")
+            except Exception:
+                logger.exception("聚合网关引擎初始化失败")
+        elif sig != _AGGREGATOR_CONFIG_SIG:
+            try:
+                _AGGREGATOR_ENGINE.reload(agg_target)
+                _AGGREGATOR_CONFIG_SIG = sig
+                logger.info("♻️  聚合网关引擎已 reload")
+            except Exception:
+                logger.exception("聚合网关引擎 reload 失败")
+
     # 统计表补新 target
     for t in _TARGETS:
         if t["label"] not in _TARGET_STATS:
@@ -2116,6 +2152,133 @@ async def _anthropic_server(host="0.0.0.0", port=8081):
     return srv
 
 
+async def _handle_aggregate_request(reader, writer, target, method, path, raw_path, headers, body):
+    """聚合网关（8080）请求分发：解析虚拟模型 → AggregatorEngine 路由 → 转发到池成员真实端口。
+
+    仅做路由/熔断编排，不解析任何 secretRef/apikeyEnv（聚合层不持有凭据，
+    转发目标是本地其他 target 端口，鉴权由那些端口自身处理）。
+    """
+    import aggregator as _agg
+
+    label = target["label"]
+    global _AGGREGATOR_ENGINE
+    if _AGGREGATOR_ENGINE is None:
+        try:
+            _AGGREGATOR_ENGINE = _agg.AggregatorEngine.from_target(target)
+        except Exception as e:
+            logger.exception(f"[{label}] AggregatorEngine 初始化失败")
+            await _write_error_response(writer, 500, f"聚合网关初始化失败: {e}")
+            return
+    engine = _AGGREGATOR_ENGINE
+
+    try:
+        body_json = json.loads(body.decode("utf-8")) if body else {}
+    except Exception:
+        body_json = {}
+
+    virtual_model = body_json.get("model") if isinstance(body_json, dict) else None
+    known_models = engine.list_virtual_models()
+    if not virtual_model or virtual_model not in known_models:
+        err_payload = json.dumps({
+            "error": {
+                "type": "invalid_request_error",
+                "message": f"未知或缺失的虚拟模型 '{virtual_model}'，已配置模型: {known_models}",
+            }
+        })
+        writer.write(b"HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: %d\r\n\r\n%s" % (len(err_payload.encode()), err_payload.encode()))
+        await writer.drain(); writer.close(); return
+
+    session_id = (
+        headers.get("x-session-id")
+        or headers.get("x-conversation-id")
+        or (body_json.get("conversation_id") if isinstance(body_json, dict) else None)
+        or (body_json.get("session_id") if isinstance(body_json, dict) else None)
+        or (body_json.get("user") if isinstance(body_json, dict) else None)
+    )
+
+    client_auth = headers.get("authorization")
+
+    async def send_fn(member, info):
+        member_body = dict(body_json)
+        member_body["model"] = member.model
+        member_body_bytes = json.dumps(member_body, ensure_ascii=False).encode("utf-8")
+
+        fwd_headers = {k: v for k, v in headers.items() if k.lower() not in ("host", "connection", "content-length", "transfer-encoding")}
+        fwd_headers["host"] = f"127.0.0.1:{member.port}"
+        if client_auth:
+            fwd_headers["authorization"] = client_auth
+
+        client = await get_http_client()
+        req = client.build_request(method, f"http://127.0.0.1:{member.port}{raw_path}", headers=fwd_headers, content=member_body_bytes)
+        resp = await client.send(req, stream=True)
+        return resp
+
+    stats = _TARGET_STATS.setdefault(label, {
+        "totalRequests": 0, "translated429": 0,
+        "passthroughOk": 0, "passthroughError": 0,
+        "startedAt": datetime.now().isoformat(),
+    })
+    stats["totalRequests"] += 1
+
+    try:
+        member, resp = await engine.route_request(virtual_model, session_id, send_fn)
+    except _agg.AllPoolsExhausted as e:
+        stats["passthroughError"] += 1
+        await _write_error_response(writer, 503, f"聚合网关 '{virtual_model}' 池已耗尽: {e}")
+        return
+    except Exception as e:
+        stats["passthroughError"] += 1
+        logger.exception(f"[{label}] 聚合路由异常")
+        await _write_error_response(writer, 502, f"聚合网关路由失败: {e}")
+        return
+
+    content_type = resp.headers.get("content-type", "")
+    is_stream = "text/event-stream" in content_type
+    if not is_stream:
+        body_text = (await resp.aread()).decode("utf-8", errors="replace")
+        if engine.quota_error(body_text):
+            engine.trip(member.port, "quota_error")
+        resp_headers = "".join(
+            f"{k}: {v}\r\n" for k, v in resp.headers.items()
+            if k.lower() not in ("transfer-encoding", "connection", "content-length")
+        )
+        writer.write(f"HTTP/1.1 {resp.status_code} {resp.reason_phrase or 'OK'}\r\n{resp_headers}Content-Length: {len(body_text.encode())}\r\n\r\n".encode())
+        writer.write(body_text.encode("utf-8"))
+        await writer.drain()
+        writer.close()
+        stats["passthroughOk"] += 1
+        return
+
+    await _write_response(writer, resp, stats=stats)
+
+
+async def _aggregator_prober():
+    """每 5s 检查聚合网关的熔断端口是否到期，到期则发探测请求判定恢复。"""
+    while True:
+        await asyncio.sleep(5)
+        engine = _AGGREGATOR_ENGINE
+        if engine is None:
+            continue
+        try:
+            due_ports = engine.probe_due_ports()
+            for port in due_ports:
+                ok = False
+                try:
+                    client = await get_http_client()
+                    resp = await client.post(
+                        f"http://127.0.0.1:{port}/v1/chat/completions",
+                        json={"model": "probe", "messages": [{"role": "user", "content": "ping"}], "max_tokens": 1},
+                        headers={"Content-Type": "application/json"},
+                        timeout=httpx.Timeout(5.0),
+                    )
+                    ok = resp.status_code < 500
+                except Exception:
+                    ok = False
+                engine.record_probe_result(port, ok)
+        except Exception:
+            logger.exception("aggregator prober error")
+
+
 async def _handle_target_request(reader, writer, target):
     """统一透传引擎：处理单个 target 端口的全部请求。
     与原 _handle_vendor_request 兼容，新增 handler 分发 / 鉴权注入 / 401 缺 token。
@@ -2216,6 +2379,11 @@ async def _handle_target_request(reader, writer, target):
         # ── Trae Work 协议代理（OpenAI 请求 → llm_utils_chat）──
         if target.get("handler") == "trae-work":
             await _handle_traework(writer, target, method, path, headers, body, stats, label)
+            return
+
+        # ── 聚合网关（虚拟模型 → 池成员路由 + 会话粘性 + 熔断）──
+        if target.get("handler") == "aggregator":
+            await _handle_aggregate_request(reader, writer, target, method, path, raw_path, headers, body)
             return
 
         # ── 上游转发（含路径重写 + handler body/header 处理）──
@@ -5115,6 +5283,7 @@ DASHBOARD_STYLE = """
   .card.accent-8083 { border-left: 3px solid #38bdf8; }
   .card.accent-8085 { border-left: 3px solid #f472b6; }
   .card.accent-8086 { border-left: 3px solid #34d399; }
+  .card.accent-8080 { border-left: 3px solid #22d3ee; }
 
   /* ── 卡片头（可点击 toggle）── */
   .card-toggle { display: flex; align-items: center; gap: 10px; width: 100%; padding: 14px 22px; background: none; border: none; color: inherit; font: inherit; cursor: pointer; text-align: left; user-select: none; transition: background 0.2s; }
@@ -5344,6 +5513,21 @@ DASHBOARD_STYLE = """
   .cs-qrow { display: flex; justify-content: space-between; gap: 8px; color: #b6bfd4; }
   .cs-qrow .qname { color: #8b93a7; }
   .cs-qrow .qexp { color: #6b7280; font-size: 11px; }
+
+  /* ── 8080 聚合卡：虚拟模型/会话/熔断状态展示 ── */
+  .agg-dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 6px; vertical-align: 1px; flex-shrink: 0; }
+  .agg-dot.ok { background: var(--success); box-shadow: 0 0 6px rgba(52,211,153,0.6); }
+  .agg-dot.warn { background: var(--warning); box-shadow: 0 0 6px rgba(251,191,36,0.5); }
+  .agg-dot.bad { background: var(--danger); box-shadow: 0 0 6px rgba(248,113,113,0.5); }
+  .agg-dot.dim { background: #4b5563; }
+  .agg-vm { border-top: 1px dashed #262a3a; margin-top: 6px; padding-top: 6px; }
+  .agg-vm-head { color: #7dd3fc; font-weight: 600; font-size: 12px; margin-bottom: 3px; }
+  .agg-vm-row { display: flex; justify-content: space-between; align-items: center; gap: 8px; color: #b6bfd4; padding: 1px 0; font-size: 12px; }
+  .agg-vm-row .m { color: #c9d1e3; font-family: var(--font-mono); font-size: 11px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .agg-vm-row .s { color: #8b93a7; flex-shrink: 0; }
+  .agg-brk { display: flex; align-items: center; gap: 6px; color: #c9d1e3; padding: 1px 0; font-size: 12px; }
+  .agg-brk .m { font-family: var(--font-mono); font-size: 11px; color: #7dd3fc; }
+  .agg-brk .reason { color: #8b93a7; font-size: 11px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
 
   /* ── 凭据管理按钮 ── */
   .te-cred-btn { background: transparent; color: #c2cbdc; border: 1px solid rgba(148,163,184,0.28); border-radius: var(--radius-sm); padding: 7px 14px; cursor: pointer; font-size: 13px; font-weight: 600; transition: background 0.2s, border-color 0.2s, transform 0.15s; }
@@ -5986,6 +6170,15 @@ async def api_update_secret_bulk(label: str, update: SecretBulkUpdate):
     return {"ok": True, "label": label, "imported": count, "secretSet": bool(secrets.get(main_key))}
 
 
+@app.get("/api/aggregate/status")
+async def api_aggregate_status():
+    """聚合网关运行时状态：虚拟模型 per-member 统计、会话粘性命中率、熔断端口。不含任何密钥。"""
+    engine = _AGGREGATOR_ENGINE
+    if engine is None:
+        return {"configured": False}
+    return {"configured": True, **engine.get_stats()}
+
+
 @app.get("/api/crack/{label}/status")
 async def api_crack_status(label: str):
     """破解网关状态查询：额度明细（含过期时间）+ 签到状态 + token 有效期。
@@ -6215,6 +6408,38 @@ async def dashboard():
         label=None,
         port=8081,
         meta_badges=[("聚合网关", "b-meta-agg"), ("Anthropic 协议", "b-meta-normal")],
+    ))
+
+    # ── 8080 聚合网关（AggregatorEngine：虚拟模型路由 + 会话粘性 + 熔断）──
+    # 卡头配置状态由服务端判定（engine 单例是否就绪）；运行时状态由前端 fetch /api/aggregate/status 填充
+    _agg_engine = _AGGREGATOR_ENGINE
+    _agg_configured = _agg_engine is not None
+    agg_cards.append(_build_card_html(
+        name="聚合网关 (8080)",
+        note="虚拟模型聚合路由 · 会话粘性 · 熔断降级（OpenAI /v1 入口）",
+        kind_badge="聚合路由",
+        status_badge="运行中" if _agg_configured else "未配置",
+        status_badge_class="green" if _agg_configured else "gray",
+        kv_items=[
+            ("base_url", f"http://{_lan_ip}:8080"),
+            ("监听地址", "http://0.0.0.0:8080"),
+            ("协议", "OpenAI /v1（虚拟模型 agg:xxx）"),
+            ("路由策略", "权重/会话粘性 · 失败降级 · 熔断摘除"),
+            ("配置状态", "已配置" if _agg_configured else "未配置聚合网关"),
+        ],
+        stats_detail=None,
+        models=None,
+        description="8080 聚合端口：虚拟模型请求按权重与会话粘性路由到池内成员端口（targets.json 的 virtualModels），"
+                    "故障端口自动熔断并从降级池逃生。下方运行时状态每 10s 自动刷新。",
+        accent_class="accent-8080",
+        label=None,
+        port=8080,
+        meta_badges=[("聚合网关", "b-meta-agg"), ("虚拟模型", "b-meta-normal")],
+        raw_html=(
+            '<div class="crack-status" id="agg-status" data-ref="aggregate">'
+            '  <div class="cs-loading">状态加载中…</div>'
+            '</div>'
+        ),
     ))
 
     # ── 动态 target 卡片（targets.json 驱动）──
@@ -6952,6 +7177,94 @@ function initCrackStatus() {{
 }}
 document.addEventListener('DOMContentLoaded', initCrackStatus);
 setTimeout(initCrackStatus, 300);
+
+// ── 聚合网关（8080）：虚拟模型/会话/熔断状态加载 + 10s 自动刷新 ──
+function escHtml(s) {{
+  return String(s == null ? '' : s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+}}
+
+function aggBreakerInfo(state) {{
+  if (state === 'tripped') return {{cls: 'agg-dot bad', label: '已熔断'}};
+  if (state === 'probing') return {{cls: 'agg-dot warn', label: '探测中'}};
+  return {{cls: 'agg-dot ok', label: '正常'}};
+}}
+
+function aggMemberDot(m) {{
+  if (!m || m.requests === 0) return 'agg-dot dim';
+  var bad = (m.err || 0) + (m.degraded || 0);
+  if (bad === 0) return 'agg-dot ok';
+  if ((m.err || 0) > 0 && (m.err || 0) >= m.requests * 0.5) return 'agg-dot bad';
+  return 'agg-dot warn';
+}}
+
+async function loadAggregateStatus() {{
+  var el = document.getElementById('agg-status');
+  if (!el) return;
+  try {{
+    var resp = await fetch('/api/aggregate/status');
+    var r = await resp.json();
+    if (!r.configured) {{
+      el.innerHTML = '<div class="cs-err">聚合网关未配置（targets.json 中缺少聚合 target）</div>';
+      return;
+    }}
+    var sess = r.session || {{}};
+    var hitRate = (sess.hit_rate || 0) * 100;
+    var cacheSize = sess.cache_size || 0;
+    var html = '<div class="cs-head">🔀 聚合网关 · 命中率 ' + hitRate.toFixed(1) + '% · 粘性缓存 ' + cacheSize + ' 条</div>';
+    var vms = r.virtual_models || {{}};
+    var vmKeys = Object.keys(vms);
+    if (vmKeys.length === 0) {{
+      html += '<div class="agg-vm"><div class="agg-vm-head">虚拟模型</div><div class="agg-vm-row"><span class="m">暂无虚拟模型</span></div></div>';
+    }} else {{
+      vmKeys.forEach(function(vmId) {{
+        var members = vms[vmId] || {{}};
+        var memberKeys = Object.keys(members);
+        html += '<div class="agg-vm"><div class="agg-vm-head">' + escHtml(vmId) + '</div>';
+        if (memberKeys.length === 0) {{
+          html += '<div class="agg-vm-row"><span class="m">暂无流量</span></div>';
+        }} else {{
+          memberKeys.forEach(function(mk) {{
+            var m = members[mk] || {{}};
+            var req = m.requests || 0;
+            var lat = (m.avg_latency_ms || 0).toFixed(0) + 'ms';
+            html += '<div class="agg-vm-row"><span class="' + aggMemberDot(m) + '"></span>' +
+              '<span class="m">' + escHtml(mk) + '</span>' +
+              '<span class="s">' + req + ' 请求 · 成功 ' + (m.ok || 0) + ' · 失败 ' + (m.err || 0) +
+              ' · 降级 ' + (m.degraded || 0) + ' · ' + lat + '</span></div>';
+          }});
+        }}
+        html += '</div>';
+      }});
+    }}
+    var brks = r.breakers || {{}};
+    var brkKeys = Object.keys(brks);
+    html += '<div class="agg-vm"><div class="agg-vm-head">熔断状态</div>';
+    if (brkKeys.length === 0) {{
+      html += '<div class="agg-vm-row"><span class="m">无熔断端口</span></div>';
+    }} else {{
+      brkKeys.forEach(function(port) {{
+        var b = brks[port] || {{}};
+        var info = aggBreakerInfo(b.state);
+        html += '<div class="agg-brk"><span class="' + info.cls + '"></span>' +
+          '<span class="m">:' + escHtml(port) + '</span>' +
+          '<span>' + info.label + '</span>' +
+          (b.reason ? '<span class="reason">' + escHtml(b.reason) + '</span>' : '') + '</div>';
+      }});
+    }}
+    html += '</div>';
+    el.innerHTML = html;
+  }} catch (e) {{
+    el.innerHTML = '<div class="cs-err">加载失败: ' + e + '</div>';
+  }}
+}}
+
+// 聚合网关：页面加载立即拉取一次 + 每 10s 自动刷新（仅 8080 卡片，独立于破解卡片刷新）
+(function() {{
+  if (document.getElementById('agg-status')) {{
+    loadAggregateStatus();
+    setInterval(loadAggregateStatus, 10000);
+  }}
+}})();
 </script>
 </body>
 </html>"""
