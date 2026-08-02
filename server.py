@@ -6609,12 +6609,40 @@ async def dashboard():
     # ── 分组：聚合网关(8081) / 破解网关(crack) / 直连网关(free/paid) ──
     agg_cards, crack_cards, direct_cards = [], [], []
 
-    # ── 8080 聚合网关（AggregatorEngine：虚拟模型路由 + 会话粘性 + 熔断）──
-    # 卡头配置状态由服务端判定（engine 单例是否就绪）；运行时状态由前端 fetch /api/aggregate/status 填充
+    # ── 8080 流量聚合（AggregatorEngine：虚拟模型路由 + 会话粘性 + 熔断）──
+    # 监控视角与其他卡片一致：卡头请求数摘要 + 展开区流量统计块 + 虚拟模型列表（model-table）
+    # 配置编辑走「✏️ 编辑配置」进入独立 modal；运行时成员明细由前端 fetch /api/aggregate/status 填充
     _agg_engine = _AGGREGATOR_ENGINE
     _agg_configured = _agg_engine is not None
+    _agg_stats_detail = None
+    _agg_vm_list = []
+    _agg_model_stats = {}
+    if _agg_configured:
+        _agg_full = _agg_engine.get_stats()
+        _agg_vms = _agg_full.get("virtual_models", {})
+        _agg_vm_list = list(_agg_vms.keys())
+        _agg_tot = _agg_ok = _agg_err = _agg_tr = 0
+        for _vm_id, _members in _agg_vms.items():
+            _vm_s = {"requests": 0, "ok": 0, "err": 0, "translated429": 0}
+            for _m in _members.values():
+                _r = _m.get("requests", 0)
+                _vm_s["requests"] += _r
+                _vm_s["ok"] += _m.get("ok", 0)
+                _vm_s["err"] += _m.get("err", 0)
+                _vm_s["translated429"] += _m.get("degraded", 0)
+                _agg_tot += _r
+                _agg_ok += _m.get("ok", 0)
+                _agg_err += _m.get("err", 0)
+                _agg_tr += _m.get("degraded", 0)
+            _agg_model_stats[_vm_id] = _vm_s
+        _agg_rate = round(_agg_ok / _agg_tot * 100, 1) if _agg_tot > 0 else 100.0
+        _agg_stats_detail = {
+            "total": _agg_tot, "ok": _agg_ok, "err": _agg_err,
+            "translated": _agg_tr, "success_rate": _agg_rate,
+            "uptime": "—", "alive": True,
+        }
     agg_cards.append(_build_card_html(
-        name="聚合网关 (8080)",
+        name="流量聚合",
         note="虚拟模型聚合路由 · 会话粘性 · 熔断降级（OpenAI /v1 入口）",
         kind_badge="聚合路由",
         status_badge="运行中" if _agg_configured else "未配置",
@@ -6626,14 +6654,15 @@ async def dashboard():
             ("路由策略", "权重/会话粘性 · 失败降级 · 熔断摘除"),
             ("配置状态", "已配置" if _agg_configured else "未配置聚合网关"),
         ],
-        stats_detail=None,
-        models=None,
-        description="8080 聚合端口：虚拟模型请求按权重与会话粘性路由到池内成员端口（targets.json 的 virtualModels），"
-                    "故障端口自动熔断并从降级池逃生。下方运行时状态每 10s 自动刷新。",
+        stats_detail=_agg_stats_detail,
+        models=_agg_vm_list if _agg_configured else None,
+        model_stats=_agg_model_stats if _agg_configured else None,
+        description="流量聚合端口：客户端用虚拟模型 id（agg:xxx）请求，按权重与会话粘性路由到池内成员端口；"
+                    "故障端口自动熔断并从降级池逃生。下方为各虚拟模型运行监控（成员明细见展开区），配置编辑见「✏️ 编辑配置」。",
         accent_class="accent-8080",
         label=None,
         port=8080,
-        meta_badges=[("聚合网关", "b-meta-agg"), ("OpenAI 协议", "b-meta-oa")],
+        meta_badges=[("流量聚合", "b-meta-agg"), ("OpenAI 协议", "b-meta-oa")],
         raw_html=(
             '<div class="model-ops">'
             '  <button class="model-edit-toggle" onclick="openAggConfigEditor(this)" '
@@ -6654,7 +6683,7 @@ async def dashboard():
     _forward_target = next((t for t in _TARGETS if t.get("listenPort") == _ANTHROPIC_FORWARD_PORT), None)
     _forward_label = _forward_target["label"] if _forward_target else None
     agg_cards.append(_build_card_html(
-        name="anthropic-compatible (8081)",
+        name="anthropic-compatible",
         note="FastAPI · Anthropic 协议入口 · /v1/messages 翻译为 OpenAI 后内部请求 8082",
         kind_badge="协议转换",
         status_badge=f"{_8081_total} 请求" if _8081_total > 0 else "运行中",
