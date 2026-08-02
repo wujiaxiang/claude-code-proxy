@@ -5799,7 +5799,7 @@ def _format_uptime(started_at_str):
         return "—"
 
 
-def _model_details_html(models, model_stats=None, label=None, edit_mode=False, can_prune=False):
+def _model_details_html(models, model_stats=None, label=None, edit_mode=False, can_prune=False, col_429="429"):
     """模型列表表格（正常态）+ 模型编辑 modal 内容（edit_mode）。
 
     支持 models 为字符串列表（默认启用）、dict 列表（含 id/display_name/enabled）。
@@ -5928,7 +5928,7 @@ def _model_details_html(models, model_stats=None, label=None, edit_mode=False, c
         row += '</tr>'
         rows.append(row)
 
-    header_extra = '<th>请求</th><th>成功率</th><th>错误</th><th>429</th>' if has_stats else ''
+    header_extra = f'<th>请求</th><th>成功率</th><th>错误</th><th>{_html_escape(str(col_429))}</th>' if has_stats else ''
     table_html = (
         f'<table class="model-table">'
         f'<thead><tr><th>#</th><th>模型 ID</th><th>名称</th>{header_extra}</tr></thead>'
@@ -5963,7 +5963,7 @@ def _model_details_html(models, model_stats=None, label=None, edit_mode=False, c
 def _build_card_html(name, note, kind_badge, status_badge, status_badge_class,
                      kv_items, stats_detail=None, models=None, model_stats=None, description="",
                      accent_class="", raw_html="", label=None, port=None, meta_badges=None,
-                     can_prune=False, mapping_label=None):
+                     can_prune=False, mapping_label=None, col_429="429"):
     """统一卡片渲染（手风琴折叠）：透传目标和定制服务用同一套视觉风格。
 
     stats_detail: dict with total/ok/err/translated/success_rate/uptime
@@ -6053,7 +6053,7 @@ def _build_card_html(name, note, kind_badge, status_badge, status_badge_class,
             f'</div>'
         )
 
-    model_html = _model_details_html(models, model_stats, label, edit_mode=False, can_prune=can_prune) if models is not None else ""
+    model_html = _model_details_html(models, model_stats, label, edit_mode=False, can_prune=can_prune, col_429=col_429) if models is not None else ""
     # 模型映射编辑按钮（模型区下方独立操作行；8081 卡等 label=None 的场景也可见）
     mm_btn = ""
     if mapping_label:
@@ -6625,12 +6625,21 @@ async def dashboard():
     _agg_stats_detail = None
     _agg_vm_list = []
     _agg_model_stats = {}
+    _agg_member_total = 0
     if _agg_configured:
+        # 虚拟模型列表与池成员数取自配置（总有值），统计取自引擎（无流量时计数为 0）
+        _agg_cfg_target = next((t for t in _TARGETS if t.get("handler") == "aggregator"), None)
+        _agg_cfg_vms = (_agg_cfg_target or {}).get("virtualModels", {})
+        _agg_vm_list = list(_agg_cfg_vms.keys())
+        _agg_member_total = sum(
+            len(v.get("defaultPool") or []) + len(v.get("fallbackPool") or [])
+            for v in _agg_cfg_vms.values()
+        )
         _agg_full = _agg_engine.get_stats()
         _agg_vms = _agg_full.get("virtual_models", {})
-        _agg_vm_list = list(_agg_vms.keys())
         _agg_tot = _agg_ok = _agg_err = _agg_tr = 0
-        for _vm_id, _members in _agg_vms.items():
+        for _vm_id in _agg_vm_list:
+            _members = _agg_vms.get(_vm_id, {})
             _vm_s = {"requests": 0, "ok": 0, "err": 0, "translated429": 0}
             for _m in _members.values():
                 _r = _m.get("requests", 0)
@@ -6652,7 +6661,7 @@ async def dashboard():
     agg_cards.append(_build_card_html(
         name="流量聚合",
         note="虚拟模型聚合路由 · 会话粘性 · 熔断降级（OpenAI /v1 入口）",
-        kind_badge="流量聚合",
+        kind_badge="聚合网关",
         status_badge="运行中" if _agg_configured else "未配置",
         status_badge_class="green" if _agg_configured else "gray",
         kv_items=[
@@ -6660,13 +6669,14 @@ async def dashboard():
             ("监听地址", "http://0.0.0.0:8080"),
             ("协议", "OpenAI /v1（虚拟模型 agg:xxx）"),
             ("路由策略", "权重/会话粘性 · 失败降级 · 熔断摘除"),
-            ("配置状态", "已配置" if _agg_configured else "未配置聚合网关"),
+            ("虚拟模型", f"{len(_agg_vm_list)} 个"),
+            ("池成员", f"{_agg_member_total} 个"),
         ],
         stats_detail=_agg_stats_detail,
         models=_agg_vm_list if _agg_configured else None,
         model_stats=_agg_model_stats if _agg_configured else None,
-        description="流量聚合端口：客户端用虚拟模型 id（agg:xxx）请求，按权重与会话粘性路由到池内成员端口；"
-                    "故障端口自动熔断并从降级池逃生。下方为各虚拟模型运行监控（成员明细见展开区），配置编辑见「✏️ 编辑配置」。",
+        col_429="降级",
+        description="虚拟模型 id（agg:xxx）→ 按权重与会话粘性路由到池内成员端口，故障端口自动熔断并从降级池逃生。",
         accent_class="accent-8080",
         label=None,
         port=8080,
