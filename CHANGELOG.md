@@ -3,6 +3,15 @@
 ## [Unreleased]
 
 ### Added
+- **聚合网关 8080 端口**（`aggregator.py` + `config_store.py` aggregate/aggregator 支持）：
+  - 虚拟模型 id（agg:xxx）→ 默认池（权重/平等）+ 降级池（可为空）路由，可配置重试次数
+  - 会话保持（`(虚拟模型id, session_id)` → 成员，本地缓存 + TTL），防止同会话漂移丢缓存
+  - 熔断摘除：下游响应匹配 `quotaErrorPatterns`（额度/积分不足）→ 按端口摘除全部模型，dashboard 状态展示 + 每 300s 最小探测恢复；与 429 限流（`_VENDOR_ERROR_PATTERNS`）严格区分
+  - 监控：`/api/aggregate/status`（每成员请求/成功/失败/降级/延迟 + 会话命中率 + 熔断状态），dashboard 聚合卡片 10s 自动刷新
+- **8081 转发目标可配置**（`anthropicForward`）：`defaultPort` + 按模型 `modelMap` 映射（可指向聚合模型 agg:xxx 或非聚合），dashboard「转发配置」编辑
+- **dashboard 配置编辑**：8080「编辑配置」modal（虚拟模型/池成员/权重/retries 增删改）+ 8081「转发配置」modal；卡片头/详情区与其他卡片统一（监控视角为主）
+- **trae-work 模型列表自动同步**（`_trae_fetch_models`）：`/v1/models` 从上游 `get_detail_param` 实时拉取（TTL 5 分钟），过滤 `__dev`/不可用/隐藏，失败回退配置 → 静态列表
+- **trae-work 传图支持**：`_openai_to_trae_body` 按标准 OpenAI `image_url:{url}` 格式透传；图片能力仅对内置多模态模型开放（`Doubao_1_6`/`qwen-3.7-plus`/`minimax-m3`/`Doubao-Seed-2.0-Code` 实测成功）
 - **破解网关额度/签到状态查询**（dashboard `GET /api/crack/{label}/status`）：`crack_*_q.py` 模块族 + `crack_common.CRACK_STATUS_HANDLERS` 注册表
   - `crack_copilot_q.py`：copilot-enterprise（GHE，`api.bmw.ghe.com/copilot_internal/user`）+ copilot 个人版（`api.github.com`，quota_snapshots）
   - `crack_qclaw_q.py`：QClaw 积分余额（`jprx.m.qq.com/data/4110/forward`）+ 今日 token（4075）+ 流水（4222），认证从 177 提取（userInfo/jwtToken/device-id）
@@ -32,6 +41,10 @@
 - README 精简为多端口架构视角，Windows 部署坑拆至 docs/windows-deployment.md
 
 ### Fixed
+- 【模型映射】按钮误扩散到所有 target 卡片 —— 改为仅 8081 转发网关专属
+- `config_store.load_targets` 丢弃顶层 `anthropicForward` 字段 —— 保留并校验
+- 聚合引擎启动预初始化（首请求前 `/api/aggregate/status` 即可用）
+- dashboard 卡头状态位显示请求数而非运行状态（8081）—— 固定显示"运行中"
 - 模型编辑弹框保存时总开关行（"全部模型"）被误存为模型 —— 前端跳过无子开关行 + 后端 API 防御性过滤
 - qclaw handler 客户端不带 system message 时上游 400 —— asyncio 端口补齐 system 消息（与 FastAPI 路径一致）
 - config_store.py 合法 handler 校验遗漏 gemini-native

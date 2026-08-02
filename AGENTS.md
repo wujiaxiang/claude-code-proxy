@@ -314,6 +314,8 @@ dashboard → 模型区 → "🧹 清理过期模型"按钮（仅 copilot 系显
 11. **codebuddy refreshToken 轮换**：刷新后必须立即持久化新值，否则旧值失效导致登录态丢失。
 12. **LXC 跑 Docker AppArmor 冲突**：手动 `docker run` 要加 `--security-opt apparmor=unconfined`（部署环境约束，见全局 CLAUDE.md）。
 13. **聚合网关（8080）**：熔断配额模式（`quotaErrorPatterns`，额度/积分不足 → 摘除端口）与 429 限流模式（`_VENDOR_ERROR_PATTERNS`，只翻译不熔断）必须严格区分，新增错误特征时先判断归哪一类；聚合层**不透传 secretRef/apikeyEnv**，只透传客户端 `Authorization`（凭据归各下游端口自己处理）；会话粘性 key = `(虚拟模型id, session_id)`，改粘性逻辑勿动这个隔离约定。
+14. **trae-work（8086）模型列表同步**：`/v1/models` 由 `_trae_fetch_models` 从上游 `get_detail_param` 拉取（TTL 5 分钟，过滤 `__dev`/不可用/隐藏配置），失败回退 targets.json 配置 → 静态列表；上游新增模型 5 分钟内自动出现，无需手改配置。
+15. **trae-work 传图（重要）**：Trae 上游**支持图片**（标准 OpenAI `image_url:{url}` 格式，`_openai_to_trae_body` 原样透传），但**图片能力只对内置多模态模型开放**——`Doubao_1_6`/`qwen-3.7-plus`/`minimax-m3`/`Doubao-Seed-2.0-Code` 可传图；`Doubao-Seed-2.1-Pro`/`glm-5.2`/`kimi-k3` 返回 3003 `all models failed` / 1005（非多模态白名单）。客户端传图必须用内置多模态模型，详见 docs/trae-work.md §5.3。
 
 ---
 
