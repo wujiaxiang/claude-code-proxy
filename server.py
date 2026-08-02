@@ -1371,6 +1371,9 @@ _TRAE_MODELS_CACHE: list = []
 _TRAE_MODELS_CACHE_TIME: float = 0.0
 _TRAE_MODELS_TTL: float = 300.0
 
+# ── 排队处理（简化策略，2026-08-02）──
+# 上游 request_wait_in_queue 事件 → 模型繁忙，直接终止并返回繁忙提示，不做降级重发。
+
 
 def _trae_build_headers(token: str) -> dict:
     """构造 Trae Work API 请求头（Cloud-IDE-JWT + 设备指纹）。"""
@@ -1451,10 +1454,49 @@ async def _trae_fetch_models(token: str) -> list:
 
 
 def _openai_to_trae_body(body: dict) -> dict:
-    """OpenAI chat.completions 请求体 → Trae llm_utils_chat 请求体。"""
+    """OpenAI chat.completions 请求体 → Trae llm_utils_chat 请求体。
+
+    工具调用历史文本化（关键）：
+    Trae 上游 messages 只有 role+content，无 OpenAI 式 tool_calls / role=tool 概念。
+    实测 Doubao-Seed-Code 对"孤立 tool 消息"（assistant.tool_calls 被丢弃后）
+    返回 HTTP 200 + 空 SSE 流（0 output 事件），glm-5.2 等可容忍。参考
+    trae-local-api 逆向编码（agent.js runAgentLoop）：
+      assistant: "[Tool Call: {name}]\nArguments: {args}\n\nResult: ..."
+      tool 消息 → user: "[Tool Call Result: {name}]\n{output}"
+    """
     trae_messages = []
+    tool_refs = {}  # tool_call_id -> 工具名（供后续 role=tool 消息匹配）
     for m in body.get("messages", []):
+        role = m.get("role", "user")
         content = m.get("content")
+
+        # assistant 消息自带的 tool_calls → 文本化拼入 content（Trae 无 tool_calls 字段）
+        calls_text = ""
+        for tc in m.get("tool_calls") or []:
+            if not isinstance(tc, dict):
+                continue
+            fn = tc.get("function") or {}
+            name = fn.get("name") or ""
+            args = fn.get("arguments") or ""
+            calls_text += f"[Tool Call: {name}]\nArguments: {args}\n\n"
+            tid = tc.get("id")
+            if tid:
+                tool_refs[tid] = name
+        if calls_text:
+            if content and isinstance(content, str):
+                content = content.rstrip() + "\n\n" + calls_text.rstrip()
+            else:
+                content = calls_text.rstrip()
+
+        # role=tool 消息：Trae 无此 role，转 user + 文本化，避免上游收到孤立 tool 消息
+        if role == "tool":
+            name = tool_refs.get(m.get("tool_call_id"), "")
+            suffix = f": {name}" if name else ""
+            tool_content = str(content or "").strip()
+            content = f"[Tool Call Result{suffix}]\n{tool_content}" if tool_content \
+                else f"[Tool Call Result{suffix}]"
+            role = "user"
+
         if isinstance(content, list):
             # 已数组化（OpenAI 多模态），转成 Trae 的 {type,text} 列表
             parts = []
@@ -1472,9 +1514,9 @@ def _openai_to_trae_body(body: dict) -> dict:
                         parts.append({"type": "text", "text": str(c)})
                 else:
                     parts.append({"type": "text", "text": str(c)})
-            trae_messages.append({"role": m.get("role", "user"), "content": parts, "role_type": 0})
+            trae_messages.append({"role": role, "content": parts, "role_type": 0})
         else:
-            trae_messages.append({"role": m.get("role", "user"),
+            trae_messages.append({"role": role,
                                   "content": [{"type": "text", "text": str(content or "")}],
                                   "role_type": 0})
     out = {
@@ -1502,13 +1544,32 @@ def _openai_to_trae_body(body: dict) -> dict:
                 fn2["parameters"] = json.dumps(params, ensure_ascii=False)
             trae_tools.append({**t, "function": fn2})
         out["tools"] = trae_tools
+    # ── 采样参数尽力透传（参考 trae-local-api trae-client.js llmUtilsChat）──
+    # 上游 best-effort 支持，不保证全部生效；max_tokens 截断到 128000
+    if isinstance(body.get("max_tokens"), (int, float)) and body["max_tokens"]:
+        out["max_tokens"] = min(int(body["max_tokens"]), 128000)
+    for key in ("temperature", "top_p", "presence_penalty", "frequency_penalty"):
+        val = body.get(key)
+        if isinstance(val, (int, float)) and not isinstance(val, bool):
+            out[key] = val
+    if body.get("stop"):
+        out["stop"] = body["stop"] if isinstance(body["stop"], list) else [str(body["stop"])]
+    if isinstance(body.get("seed"), (int, float)) and body["seed"]:
+        out["seed"] = body["seed"]
+    if isinstance(body.get("n"), int) and body["n"] > 1:
+        out["n"] = body["n"]
     return out
 
 
 def _trae_chunk_to_openai(chunk: dict, model: str) -> dict:
-    """Trae output 事件 → OpenAI chat.completion.chunk。"""
-    content = chunk.get("response", "") or ""
-    reasoning = chunk.get("reasoning_content") or ""
+    """Trae output 事件 → OpenAI chat.completion.chunk。
+
+    兼容上游两种 output 形态（trae-local-api 逆向结论）：
+      旧格式: {"response": "...", "reasoning_content": "...", "tool_calls": [...]}
+      新格式(2026-05): {"type": "text", "content": "...", "reasoning": "..."}
+    """
+    content = chunk.get("response", "") or chunk.get("content", "") or ""
+    reasoning = chunk.get("reasoning_content") or chunk.get("reasoning") or ""
     delta = {}
     if content:
         delta["content"] = content
@@ -1715,9 +1776,11 @@ async def _handle_traework(writer, target, method, path, headers, body, stats, l
                 # ── 流式：Trae SSE → OpenAI SSE ──
                 if is_stream:
                     writer.write(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: keep-alive\r\n\r\n")
+                    await writer.drain()
                     # seed-code 系模型的 DSML 标记是分片输出的，累积到完整块再解析
                     dsml_buf = ""
                     n_chunks = 0
+                    busy_aborted = False
                     async for chunk in resp.aiter_bytes():
                         line = chunk.decode("utf-8", errors="replace")
                         for raw in line.split("\n"):
@@ -1734,9 +1797,36 @@ async def _handle_traework(writer, target, method, path, headers, body, stats, l
                             # 上游 SSE 有非对象 data 行（如 "Processing_xxx" 字符串），跳过
                             if not isinstance(trae_chunk, dict):
                                 continue
-                            # 只转换 output 事件
-                            if "response" in trae_chunk or "reasoning_content" in trae_chunk:
-                                resp_text = trae_chunk.get("response") or ""
+                            # 排队事件 request_wait_in_queue（字节原生）：模型繁忙，直接终止返回提示
+                            _pos = trae_chunk.get("position")
+                            if _pos is None and isinstance(trae_chunk.get("data"), dict):
+                                _pos = trae_chunk["data"].get("position")
+                            if isinstance(_pos, (int, float)) and _pos > 0:
+                                logger.warning(f"[{label}] trae-work busy: queue position #{int(_pos)} (model={model}), aborting")
+                                oai = _trae_chunk_to_openai({"response": f"[模型繁忙，排队位置 #{int(_pos)}，请稍后重试]"}, model)
+                                n_chunks += 1
+                                writer.write(("data: " + _json.dumps(oai, ensure_ascii=False) + "\n\n").encode())
+                                await writer.drain()
+                                busy_aborted = True
+                                break
+                            # SSE error 事件（上游流式错误 {code,message}）：不再静默吞掉
+                            if trae_chunk.get("error") or (trae_chunk.get("code") and "message" in trae_chunk):
+                                err_code = trae_chunk.get("code") or ""
+                                err_msg = trae_chunk.get("message") or trae_chunk.get("error") or ""
+                                logger.warning(f"[{label}] trae-work SSE error: code={err_code} msg={str(err_msg)[:300]}")
+                                oai = _trae_chunk_to_openai({"response": f"[Trae error {err_code}: {err_msg}]"}, model)
+                                n_chunks += 1
+                                writer.write(("data: " + _json.dumps(oai, ensure_ascii=False) + "\n\n").encode())
+                                await writer.drain()
+                                continue
+                            # 只转换 output 事件（旧格式 response/reasoning_content + 新格式 type=text/content/reasoning）
+                            if ("response" in trae_chunk or "reasoning_content" in trae_chunk
+                                    or "content" in trae_chunk or "reasoning" in trae_chunk
+                                    or trae_chunk.get("type") == "text"):
+                                resp_text = trae_chunk.get("response") or trae_chunk.get("content") or ""
+                                # 上游 progress 提示（旧格式）过滤，避免当正文输出
+                                if resp_text.startswith("Building prompt:") or resp_text.startswith("Completed building prompt"):
+                                    continue
                                 # DSML 文本 → 缓冲累积，完整块解析为 tool_calls
                                 if _looks_like_dsml(resp_text) or dsml_buf:
                                     if resp_text:
@@ -1762,11 +1852,14 @@ async def _handle_traework(writer, target, method, path, headers, body, stats, l
                                 n_chunks += 1
                                 writer.write(("data: " + _json.dumps(oai, ensure_ascii=False) + "\n\n").encode())
                                 await writer.drain()
+                        if busy_aborted:
+                            break
                     # 流结束：若残留 DSML 未解析完，丢弃（不把半截标记透给客户端）
                     if dsml_buf:
                         logger.debug(f"[{label}] trae-work DSML trailing {len(dsml_buf)} bytes dropped: "
                                      f"{dsml_buf[:300]!r}")
-                    logger.debug(f"[{label}] trae-work stream done, {n_chunks} chunks → client")
+                    logger.debug(f"[{label}] trae-work stream done, {n_chunks} chunks → client"
+                                 + (" (busy abort)" if busy_aborted else ""))
                     writer.write(("data: " + _json.dumps(_trae_final_to_openai(model), ensure_ascii=False) + "\n\n").encode())
                     writer.write(b"data: [DONE]\n\n")
                     await writer.drain()
@@ -1791,14 +1884,25 @@ async def _handle_traework(writer, target, method, path, headers, body, stats, l
                     # 上游 SSE 有非对象 data 行（如 "Processing_xxx" 字符串），跳过
                     if not isinstance(trae_chunk, dict):
                         continue
-                    resp_text = trae_chunk.get("response")
+                    # SSE error 事件（上游流式错误 {code,message}）：不再静默吞掉
+                    if trae_chunk.get("error") or (trae_chunk.get("code") and "message" in trae_chunk):
+                        err_code = trae_chunk.get("code") or ""
+                        err_msg = trae_chunk.get("message") or trae_chunk.get("error") or ""
+                        logger.warning(f"[{label}] trae-work SSE error: code={err_code} msg={str(err_msg)[:300]}")
+                        content_parts.append(f"[Trae error {err_code}: {err_msg}]")
+                        continue
+                    resp_text = trae_chunk.get("response") or trae_chunk.get("content") or ""
                     if resp_text:
+                        # 上游 progress 提示（旧格式）过滤，避免当正文输出
+                        if resp_text.startswith("Building prompt:") or resp_text.startswith("Completed building prompt"):
+                            continue
                         if _looks_like_dsml(resp_text) or dsml_buf:
                             dsml_buf += resp_text
                         else:
                             content_parts.append(resp_text)
-                    if trae_chunk.get("reasoning_content"):
-                        reasoning_parts.append(trae_chunk["reasoning_content"])
+                    reasoning = trae_chunk.get("reasoning_content") or trae_chunk.get("reasoning") or ""
+                    if reasoning:
+                        reasoning_parts.append(reasoning)
                     tc = trae_chunk.get("tool_calls")
                     if tc:
                         # 上游非流式可能把同一工具调用分片输出（如 glm-5.2 的 arguments

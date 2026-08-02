@@ -162,6 +162,8 @@ POST /api/agent/v3/llm_utils_chat
 - `role_type: 0` 表示普通用户消息
 - `model` 与 `config_name` 相同（如 `glm-5.2`）
 
+**角色支持（2026-08-02 逆向结论）**：上游 messages 只有 `role + content`，**无 OpenAI 式 `tool_calls` / `role=tool` 概念**。`system/user/assistant` 直接透传；`role=tool` 必须**转 `user` 并文本化**（见 §5.4 请求侧），否则 `Doubao-Seed-Code` 返回 200 + 空 SSE 流（0 output 事件），`glm-5.2` 等可容忍。
+
 ### 5.2 SSE 响应事件
 
 响应为 SSE 流，关键事件：
@@ -170,9 +172,17 @@ POST /api/agent/v3/llm_utils_chat
 event: metadata        # 元数据（模型、会话等）
 event: timing_cost     # 耗时统计
 event: output          # 正文输出，data 含 response + reasoning_content
+event: error           # 错误 {code, message, extra}
+event: progress_notice # 进度提示（"Processing_xxx" 字符串，跳过）
+event: queue_*         # 排队事件（request_wait_in_queue 含 position，不转发）
 ```
 
-- `event:output` 的 data 是 JSON，包含 `response`（正文）与 `reasoning_content`（思考内容）
+- `event:output` 的 data 是 JSON，兼容**两种形态**（trae-local-api 逆向结论）：
+  - 旧格式：`{"response": ..., "reasoning_content": ..., "tool_calls": [...]}`
+  - 新格式（2026-05）：`{"type": "text", "content": ..., "reasoning": ...}`
+- 代理需把两种形态都还原为 OpenAI 流式分块（`_trae_chunk_to_openai`：`response|content` → `content`，`reasoning_content|reasoning` → `reasoning_content`）
+- **`event:error` 不再静默**：`{code, message}` → WARNING 日志 + 转成 `[Trae error {code}: {message}]` 文本 chunk 透给客户端（2026-08-02 修复）
+- **progress 过滤**：旧格式 response 以 `Building prompt:` / `Completed building prompt` 开头 → 丢弃（上游进度提示，不当正文输出）
 - 代理需要把 SSE 事件还原为 OpenAI 流式分块格式，并把 `reasoning_content` 映射到
   OpenAI 的 `reasoning` 字段（若客户端支持）
 
@@ -209,6 +219,16 @@ event: output          # 正文输出，data 含 response + reasoning_content
 
 - 透传 `tools`，仅转换：`parameters` object/list → `json.dumps()` 字符串（实测不转 → `4001 bad request: cannot unmarshal object into ... of type string`）
 - 其余字段（type/name/description）原样
+- **工具调用历史文本化（2026-08-02 修复，seed-code 空响应根因）**：assistant 消息的 `tool_calls` 字段上游不识别，直接丢弃会让后续 `role=tool` 消息变成"孤立 tool 消息"，`Doubao-Seed-Code` 因此返回 200 + 空 SSE 流（`stream done, 0 chunks`，客户端收不到任何内容）。转换时：
+  - assistant 带 `tool_calls` → 序列化拼入 content：`"[Tool Call: {name}]\nArguments: {args}"`（有 content 则换行拼接）
+  - `role=tool` 消息 → 转 `role=user`，content 加前缀：`"[Tool Call Result: {name}]\n{输出}"`（按 `tool_call_id` 匹配工具名，无匹配省略后缀）
+  - 编码参考 trae-local-api（逆向 Trae 客户端）`agent.js runAgentLoop` 的文本化回填方式
+- 采样参数（`temperature/top_p/presence_penalty/frequency_penalty/stop/seed/n`）**尽力透传**（2026-08-02），`max_tokens` 截断到 128000（参考 trae-client.js）
+
+### 排队处理（简化策略，2026-08-02）
+
+- 上游 `request_wait_in_queue` 事件（字节原生排队能力，data 含 position）→ **模型繁忙，直接终止**返回 `[模型繁忙，排队位置 #N，请稍后重试]`，**不做降级重发**
+- 曾实现排队感知降级（参考 trae-local-api 分档重发），用户评估后撤回——排队即繁忙，保持简单
 
 ### 响应侧（按模型分两类）
 
@@ -394,3 +414,17 @@ setsid .venv/bin/python server.py > /tmp/proxy.log 2>&1 < /dev/null &
 | `config_store.py` | `VALID_HANDLERS` 含 `trae-work` |
 | `targets.json` | trae-work target 定义（8086、19 模型 + modelMapping） |
 | `trae_work_daily.sh` | cron 每日签到 + token 剩 <3 天刷新 |
+
+---
+
+
+## 附：协议转换问题排查定位
+
+seed-code 等模型协议转换出问题（空响应/工具调用异常/格式不兼容）时，对照以下文件定位：
+
+- **字节真实协议参考**：`/root/trae-local-api/`（git 源 `ZedeX/trae-local-api`）
+  - `src/trae-client.js` → 入参格式（llm_utils_chat 请求构造）
+  - `src/openai-format.js` → 出参格式（SSE 事件解析，output 新旧两种形态）
+  - `src/agent.js` → 工具调用历史编码（文本化回填，上游无 tool_calls/tool 概念）
+- **server.py 转换实现**：`_openai_to_trae_body`（入参）/ `_trae_chunk_to_openai`（出参）/ `_parse_dsml_tool_calls`（seed-code 专有）
+- 排查步骤：开 DEBUG（`systemctl edit` 加 `Environment=DEBUG=true`）→ 看 proxy.log 里 `trae-work upstream POST body=` 转换产物 → 对照上面文件找差异 → 查完恢复 INFO

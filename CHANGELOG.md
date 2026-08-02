@@ -49,6 +49,9 @@
 - qclaw handler 客户端不带 system message 时上游 400 —— asyncio 端口补齐 system 消息（与 FastAPI 路径一致）
 - config_store.py 合法 handler 校验遗漏 gemini-native
 - **codebuddy 非流式请求自动转流式聚合**：上游（copilot.tencent.com）对所有模型拒绝非流式 chat（11101），代理检测后自动 `stream:true` 重试并聚合 SSE 为完整 JSON（含 reasoning_content/tool_calls/usage），非流式客户端也可用
+- **trae-work 工具历史协议（seed-code 空响应修复）**：`_openai_to_trae_body` 将 assistant `tool_calls` 文本化拼入 content（`[Tool Call: name]\nArguments: args`）、`role=tool` 消息转 `user` 加前缀（`[Tool Call Result: name]`）——修复 `Doubao-Seed-Code` 对孤立 tool 消息返回 200+空 SSE 流（0 chunks）问题；响应侧兼容 output 新格式（`type:text/content/reasoning`，2026-05）、SSE `error` 事件不再静默（WARNING+文本透传）、过滤 `Building prompt:` 进度提示（逆向 trae-local-api 对照）
+- **trae-work 采样参数透传**：`temperature/top_p/presence_penalty/frequency_penalty/stop/seed/n` 尽力透传，`max_tokens` 截断 128000
+- **trae-work 排队处理（简化）**：上游 `request_wait_in_queue` 事件 → 直接返回繁忙提示终止（不做降级重发，曾实现分档降级后撤回）
 
 ---
 
