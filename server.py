@@ -520,6 +520,15 @@ async def lifespan(app):
         srv = await _vendor_server("0.0.0.0", t["listenPort"], t)
         _target_servers[t["listenPort"]] = srv
 
+    # ── 预初始化聚合网关引擎（避免首请求前 /api/aggregate/status 显示"未配置"）──
+    _agg_preinit = next((t for t in _TARGETS if t.get("handler") == "aggregator" and t.get("enabled", True)), None)
+    if _agg_preinit is not None:
+        global _AGGREGATOR_ENGINE, _AGGREGATOR_CONFIG_SIG
+        import aggregator as _agg
+        _AGGREGATOR_ENGINE = _agg.AggregatorEngine.from_target(_agg_preinit)
+        _AGGREGATOR_CONFIG_SIG = json.dumps(_agg_preinit, sort_keys=True, ensure_ascii=False)
+        print(f"🚀 [aggregator] 聚合网关引擎预初始化（{len(_agg_preinit.get('virtualModels', {}))} 个虚拟模型）")
+
     # ── 启动配置热重载 watcher ──
     watcher_task = asyncio.create_task(_config_watcher())
     aggregator_prober_task = asyncio.create_task(_aggregator_prober())
@@ -776,6 +785,9 @@ _TARGET_STATS: Dict[str, dict] = {}
 # 模型级统计：{ label: { model_name: {"requests": N, "ok": N, "err": N, "translated429": N} } }
 _MODEL_STATS: Dict[str, Dict[str, Dict[str, int]]] = {}
 _ANTHROPIC_FORWARD_PORT = 8082
+# 8081 转发目标配置：defaultPort 兜底端口，modelMap 按 Anthropic 请求 model 精确映射到 {port, model}
+# （支持指向聚合网关 8080 + 虚拟模型 id，如 "agg:sonnet"）
+_ANTHROPIC_FORWARD_CFG: dict = {"defaultPort": 8082, "modelMap": {}}
 
 # ─── 聚合网关（8080）单例引擎 + 重载去重签名 ───
 _AGGREGATOR_ENGINE = None  # type: ignore
@@ -1663,7 +1675,7 @@ def _rewrite_upstream_path(handler: str, raw_path: str, route_prefix: str) -> st
 
 def _load_vendor_targets():
     """加载 targets.json + secrets.json，规范化并初始化统计。"""
-    global _TARGETS, _SECRETS, _ANTHROPIC_FORWARD_PORT
+    global _TARGETS, _SECRETS, _ANTHROPIC_FORWARD_PORT, _ANTHROPIC_FORWARD_CFG
     cfg = _cfg.load_targets()
     errors = _cfg.validate_targets(cfg)
     if errors:
@@ -1671,6 +1683,9 @@ def _load_vendor_targets():
             logger.warning(f"targets.json 配置错误: {e}")
     _TARGETS = cfg.get("targets", [])
     _ANTHROPIC_FORWARD_PORT = cfg.get("anthropicForwardPort", 8082)
+    _ANTHROPIC_FORWARD_CFG = cfg.get("anthropicForward") or {}
+    _ANTHROPIC_FORWARD_CFG.setdefault("defaultPort", _ANTHROPIC_FORWARD_PORT)
+    _ANTHROPIC_FORWARD_CFG.setdefault("modelMap", {})
     _SECRETS = _cfg.load_secrets()
     for t in _TARGETS:
         label = t["label"]
@@ -1699,7 +1714,7 @@ _config_mtimes: Dict[str, float] = {}
 
 async def _reload_targets() -> list:
     """重载 targets.json / secrets.json，diff 端口并动态增删 server。"""
-    global _TARGETS, _SECRETS, _ANTHROPIC_FORWARD_PORT
+    global _TARGETS, _SECRETS, _ANTHROPIC_FORWARD_PORT, _ANTHROPIC_FORWARD_CFG
     changes = []
     cfg = _cfg.load_targets()
     errors = _cfg.validate_targets(cfg)
@@ -1708,6 +1723,9 @@ async def _reload_targets() -> list:
         return [f"❌ 校验失败: {errors}"]
     _TARGETS = cfg.get("targets", [])
     _ANTHROPIC_FORWARD_PORT = cfg.get("anthropicForwardPort", 8082)
+    _ANTHROPIC_FORWARD_CFG = cfg.get("anthropicForward") or {}
+    _ANTHROPIC_FORWARD_CFG.setdefault("defaultPort", _ANTHROPIC_FORWARD_PORT)
+    _ANTHROPIC_FORWARD_CFG.setdefault("modelMap", {})
     _SECRETS = _cfg.load_secrets()
 
     # ── 聚合网关单例：找到聚合 target 则按需初始化/reload，找不到则清空单例 ──
@@ -2058,11 +2076,20 @@ async def _handle_anthropic_proxy_request(reader, writer):
             original_model = anthropic_body.get("model", "unknown")
             is_stream = anthropic_body.get("stream", False)
             openai_body = convert_anthropic_request_to_openai(anthropic_body)
+
+            # 8081 转发目标映射：modelMap 命中则用配置的端口+模型（支持聚合 agg:xxx → 8080）
+            fwd_cfg = _ANTHROPIC_FORWARD_CFG
+            fwd_port = int(fwd_cfg.get("defaultPort", _ANTHROPIC_FORWARD_PORT) or _ANTHROPIC_FORWARD_PORT)
+            mapped = (fwd_cfg.get("modelMap") or {}).get(original_model)
+            if mapped:
+                fwd_port = int(mapped.get("port", fwd_port))
+                openai_body["model"] = mapped.get("model", openai_body.get("model"))
+
             openai_payload = json.dumps(openai_body).encode("utf-8")
 
             fwd_headers = {
                 "content-type": "application/json",
-                "host": f"127.0.0.1:{_ANTHROPIC_FORWARD_PORT}",
+                "host": f"127.0.0.1:{fwd_port}",
                 "content-length": str(len(openai_payload)),
             }
             if headers.get("authorization"):
@@ -2070,7 +2097,7 @@ async def _handle_anthropic_proxy_request(reader, writer):
             if headers.get("x-api-key"):
                 fwd_headers["x-api-key"] = headers["x-api-key"]
 
-            upstream_url = f"http://127.0.0.1:{_ANTHROPIC_FORWARD_PORT}/v1/chat/completions"
+            upstream_url = f"http://127.0.0.1:{fwd_port}/v1/chat/completions"
 
             async with httpx.AsyncClient(timeout=httpx.Timeout(300.0, connect=10.0), trust_env=False) as client:
                 req = client.build_request("POST", upstream_url, headers=fwd_headers, content=openai_payload)
@@ -2387,14 +2414,6 @@ async def _handle_target_request(reader, writer, target):
             return
 
         # ── 上游转发（含路径重写 + handler body/header 处理）──
-        transport = "https" if target.get("targetProtocol", "https") == "https" else "http"
-        upstream_path = _rewrite_upstream_path(
-            target.get("handler", "passthrough"),
-            raw_path,
-            target.get("routePrefix", ""),
-        )
-        upstream_url = f"{transport}://{target['targetHost']}:{target.get('targetPort', 443)}{upstream_path}"
-
         body_bytes, body_json = _handler_prepare_body(target, body)
         # 模型级统计：解析请求模型名（映射后真实模型）
         _req_model = None
@@ -2405,9 +2424,30 @@ async def _handle_target_request(reader, writer, target):
                 _req_model = json.loads(body).get("model")
             except Exception:
                 pass
-        fwd_headers = _resolve_auth(headers, target=target)
-        fwd_headers["host"] = target["targetHost"]
-        fwd_headers = _handler_prepare_headers(target, fwd_headers, body_json)
+
+        # ── agg:xxx 目标：modelMapping 映射到聚合模型 → 改路由到本地聚合网关 ──
+        # 聚合网关不透传 secretRef/apikeyEnv，只透传客户端 Authorization（凭据归池内
+        # 成员端口自己处理）；且成员端口会各自重写 path/鉴权，因此这里保留原始 path、
+        # 透传原始客户端 headers，不注入本 target 凭据/extraHeaders。
+        _agg_target = next((t for t in _TARGETS if t.get("handler") == "aggregator" and t.get("enabled", True)), None)
+        _to_agg = bool(_agg_target and _req_model and str(_req_model).startswith("agg:"))
+        if _to_agg:
+            _agg_port = _agg_target["listenPort"]
+            upstream_url = f"http://127.0.0.1:{_agg_port}{raw_path}"
+            fwd_headers = {k: v for k, v in headers.items() if k.lower() not in ("host", "connection", "content-length", "transfer-encoding")}
+            fwd_headers["host"] = f"127.0.0.1:{_agg_port}"
+            logger.info(f"[{label}] modelMapping → 聚合路由: {_req_model} → 127.0.0.1:{_agg_port}{raw_path}")
+        else:
+            transport = "https" if target.get("targetProtocol", "https") == "https" else "http"
+            upstream_path = _rewrite_upstream_path(
+                target.get("handler", "passthrough"),
+                raw_path,
+                target.get("routePrefix", ""),
+            )
+            upstream_url = f"{transport}://{target['targetHost']}:{target.get('targetPort', 443)}{upstream_path}"
+            fwd_headers = _resolve_auth(headers, target=target)
+            fwd_headers["host"] = target["targetHost"]
+            fwd_headers = _handler_prepare_headers(target, fwd_headers, body_json)
 
         async with httpx.AsyncClient(timeout=httpx.Timeout(300.0, connect=10.0), trust_env=False) as client:
             req = client.build_request(method, upstream_url, headers=fwd_headers, content=body_bytes if body_bytes else None)
@@ -5448,6 +5488,56 @@ DASHBOARD_STYLE = """
   .model-msg.ok { color: #4ade80; }
   .model-msg.err { color: #f87171; }
 
+  /* ── 模型编辑：每行删除按钮 + 底部添加行 ── */
+  .mrow-del { background: none; border: none; color: var(--text-tertiary); cursor: pointer; font-size: 15px; line-height: 1; padding: 4px 8px; border-radius: 6px; flex-shrink: 0; transition: color 0.2s, background 0.2s; }
+  .mrow-del:hover { color: var(--danger); background: rgba(248,113,113,0.12); }
+  .mrow-add { display: flex; gap: 8px; margin-top: 12px; align-items: center; }
+  .mrow-add-input { flex: 1; min-width: 0; background: var(--bg-inset); border: 1px solid var(--border); border-radius: var(--radius-sm); color: var(--text-primary); padding: 7px 10px; font-size: 12.5px; font-family: var(--font-mono); transition: border-color 0.2s, box-shadow 0.2s; }
+  .mrow-add-input:focus { outline: none; border-color: var(--brand-cyan); box-shadow: 0 0 0 2px rgba(34,211,238,0.15); }
+  .mrow-add-btn { background: var(--brand-grad); color: #fff; border: none; border-radius: var(--radius-sm); padding: 7px 14px; cursor: pointer; font-size: 12.5px; font-weight: 600; white-space: nowrap; flex-shrink: 0; box-shadow: 0 3px 12px rgba(59,130,246,0.30); transition: filter 0.2s, transform 0.15s; }
+  .mrow-add-btn:hover { filter: brightness(1.1); }
+  .mrow-add-btn:active { transform: scale(0.98); }
+
+  /* ── 模型映射编辑器（🔀 按钮 + modal 行式表格）── */
+  .mm-open-btn { border-radius: var(--radius-sm); padding: 5px 12px; cursor: pointer; font-size: 12.5px; font-weight: 600; white-space: nowrap; transition: background 0.2s, border-color 0.2s, transform 0.15s, box-shadow 0.2s; background: transparent; color: var(--brand-cyan); border: 1px solid rgba(34,211,238,0.28); }
+  .mm-open-btn:hover { background: rgba(34,211,238,0.10); border-color: rgba(34,211,238,0.5); transform: translateY(-1px); }
+  .mm-open-btn:active { transform: scale(0.98); }
+  .mm-hint { font-size: 11.5px; color: var(--text-tertiary); margin: 2px 0 10px; line-height: 1.5; }
+  .mm-row { display: flex; align-items: center; gap: 8px; padding: 7px 0; border-bottom: 1px solid #1f2233; }
+  .mm-row:last-child { border-bottom: none; }
+  .mm-key, .mm-val { flex: 1; min-width: 0; background: var(--bg-inset); border: 1px solid var(--border); border-radius: var(--radius-sm); color: var(--text-primary); padding: 7px 10px; font-size: 12.5px; font-family: var(--font-mono); transition: border-color 0.2s, box-shadow 0.2s; }
+  .mm-key:focus, .mm-val:focus { outline: none; border-color: var(--brand-cyan); box-shadow: 0 0 0 2px rgba(34,211,238,0.15); }
+  .mm-arrow { color: var(--text-tertiary); font-size: 12px; flex-shrink: 0; }
+  .mm-del { background: none; border: none; color: var(--text-tertiary); cursor: pointer; font-size: 16px; line-height: 1; padding: 4px 8px; border-radius: 6px; flex-shrink: 0; transition: color 0.2s, background 0.2s; }
+  .mm-del:hover { color: var(--danger); background: rgba(248,113,113,0.12); }
+  .mm-add-row { margin-top: 10px; }
+  .mm-add-btn { border-radius: var(--radius-sm); padding: 6px 14px; cursor: pointer; font-size: 12.5px; font-weight: 600; white-space: nowrap; transition: background 0.2s, border-color 0.2s, transform 0.15s; background: transparent; color: var(--brand-cyan); border: 1px dashed rgba(34,211,238,0.35); }
+  .mm-add-btn:hover { background: rgba(34,211,238,0.08); border-color: rgba(34,211,238,0.6); transform: translateY(-1px); }
+  .mm-add-btn:active { transform: scale(0.98); }
+
+  /* ── 聚合网关 / 转发配置编辑 modal ── */
+  .modal-wide { max-width: 860px; }
+  .agg-section { margin-bottom: 16px; }
+  .agg-section-title { font-size: 11.5px; color: var(--text-tertiary); text-transform: uppercase; letter-spacing: 0.6px; font-weight: 600; margin-bottom: 8px; }
+  .agg-hint { font-size: 11.5px; color: var(--text-tertiary); margin: 2px 0 10px; line-height: 1.5; }
+  .agg-fields { display: grid; grid-template-columns: repeat(auto-fill, minmax(190px, 1fr)); gap: 10px; }
+  .agg-field { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
+  .agg-label { font-size: 11px; color: var(--text-secondary); }
+  .agg-input { background: var(--bg-inset); border: 1px solid var(--border); border-radius: var(--radius-sm); color: var(--text-primary); padding: 7px 10px; font-size: 12.5px; font-family: var(--font-mono); transition: border-color 0.2s, box-shadow 0.2s; min-width: 0; }
+  .agg-input:focus { outline: none; border-color: var(--brand-cyan); box-shadow: 0 0 0 2px rgba(34,211,238,0.15); }
+  .agg-vm { border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 12px 14px; margin-bottom: 12px; background: linear-gradient(180deg, rgba(255,255,255,0.02), rgba(255,255,255,0.004)), var(--bg-inset); }
+  .agg-vm-head { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
+  .agg-vm-id { flex: 1; min-width: 0; }
+  .agg-pool { margin: 8px 0 2px 0; }
+  .agg-pool-title { font-size: 11.5px; color: var(--text-tertiary); font-weight: 600; margin-bottom: 6px; }
+  .agg-pool-row { display: flex; align-items: center; gap: 8px; padding: 5px 0; }
+  .agg-mem-port { width: 96px; flex-shrink: 0; }
+  .agg-mem-model { flex: 1; min-width: 0; }
+  .agg-mem-weight { width: 84px; flex-shrink: 0; }
+  .agg-add-row { margin: 6px 0 10px 0; }
+  .agg-vm-retries { display: flex; gap: 12px; flex-wrap: wrap; margin-top: 8px; padding-top: 8px; border-top: 1px dashed var(--border); }
+  .agg-vm-retries .agg-field { flex: 1; min-width: 140px; }
+
   /* ── 卡片内联 token 编辑 ── */
   .token-edit { margin-top: 8px; padding-top: 8px; border-top: 1px dashed rgba(148,163,184,0.16); }
   .te-status { font-size: 12px; color: var(--text-secondary); margin-bottom: 6px; }
@@ -5727,13 +5817,13 @@ def _model_details_html(models, model_stats=None, label=None, edit_mode=False, c
 
     visible = [n for n in norm if n.get("enabled", True)]
 
-    # ── 编辑态（modal 内容）：全部模型 + 滑动开关，无删除按钮 ──
+    # ── 编辑态（modal 内容）：全部模型 + 滑动开关 + 每行删除 + 底部添加行 ──
     if edit_mode:
         esc_label = _html_escape(label or "")
         enabled_count = sum(1 for n in norm if n.get("enabled", True))
         rows_html = ""
         if not norm:
-            rows_html = '<div class="no-models">(暂无模型数据)</div>'
+            rows_html = '<div class="no-models">(暂无模型数据，在下方添加)</div>'
         for n in norm:
             checked = 'checked' if n.get("enabled", True) else ''
             rows_html += (
@@ -5746,8 +5836,17 @@ def _model_details_html(models, model_stats=None, label=None, edit_mode=False, c
                 f'    <input type="checkbox" class="model-show" data-model="{_html_escape(n["id"])}" {checked}>'
                 f'    <span class="switch-slider"></span>'
                 f'  </label>'
+                f'  <button class="mrow-del" onclick="removeModelRow(this)" title="删除此模型">×</button>'
                 f'</div>'
             )
+        # 底部添加模型行（自由输入新模型名，保存后进 models 列表）
+        add_row = (
+            '<div class="mrow-add">'
+            '<input type="text" class="mrow-add-input" id="model-add-input" '
+            'placeholder="输入新模型名，保存后加入列表…" aria-label="新模型名">'
+            '<button class="mrow-add-btn" onclick="addModelRow()">+ 添加模型</button>'
+            '</div>'
+        )
         hint = f'<div class="mrow-all-hint">共 {len(norm)} 个模型，开启的 {enabled_count} 个将被展示</div>' if norm else ''
         # 总开关：全开/全关/部分开（indeterminate），联动所有子开关
         master = ""
@@ -5775,6 +5874,7 @@ def _model_details_html(models, model_stats=None, label=None, edit_mode=False, c
         ) if len(norm) > 8 else ''
         return (
             f'{search}{master}{hint}{rows_html}'
+            f'{add_row}'
             f'<div class="model-msg" data-label="{esc_label}"></div>'
         )
 
@@ -5855,7 +5955,7 @@ def _model_details_html(models, model_stats=None, label=None, edit_mode=False, c
 def _build_card_html(name, note, kind_badge, status_badge, status_badge_class,
                      kv_items, stats_detail=None, models=None, model_stats=None, description="",
                      accent_class="", raw_html="", label=None, port=None, meta_badges=None,
-                     can_prune=False):
+                     can_prune=False, mapping_label=None):
     """统一卡片渲染（手风琴折叠）：透传目标和定制服务用同一套视觉风格。
 
     stats_detail: dict with total/ok/err/translated/success_rate/uptime
@@ -5864,6 +5964,8 @@ def _build_card_html(name, note, kind_badge, status_badge, status_badge_class,
     port: 端口号，显示在卡片头
     meta_badges: 额外的分类标签列表 [("文本", "样式类"), ...]，如 [("破解", "b-crack"), ("免费", "b-free")...]
     can_prune: 上游是否支持 /models 清理（copilot 系 true；codebuddy/qclaw/trae-work false 不显示清理按钮）
+    mapping_label: 模型映射编辑按钮指向的 target label（8081 卡指向 anthropicForwardPort 对应 target）；
+                   None 时不显示"🔀 模型映射"按钮
     """
     # ── 卡片头 badges（分类 badge 带图标点 + 渐变底；状态 badge 带状态点）──
     kind_badge_class = {"破解": "b-crack", "免费": "b-free", "收费": "b-paid"}.get(str(kind_badge), "b-generic")
@@ -5944,6 +6046,16 @@ def _build_card_html(name, note, kind_badge, status_badge, status_badge_class,
         )
 
     model_html = _model_details_html(models, model_stats, label, edit_mode=False, can_prune=can_prune) if models is not None else ""
+    # 模型映射编辑按钮（模型区下方独立操作行；8081 卡等 label=None 的场景也可见）
+    mm_btn = ""
+    if mapping_label:
+        mm_btn = (
+            f'<div class="model-ops">'
+            f'  <button class="mm-open-btn" data-label="{_html_escape(mapping_label)}" '
+            f'    onclick="openMappingEditor(this)" title="编辑该 target 的 modelMapping（请求模型名 → 转发目标模型，可指向聚合模型 agg:xxx）">'
+            f'    🔀 模型映射</button>'
+            f'</div>'
+        )
     card_class = f'card {accent_class}'.strip()
 
     return f"""<div class="{card_class}" data-label="{_html_escape(label or '')}">
@@ -5953,6 +6065,7 @@ def _build_card_html(name, note, kind_badge, status_badge, status_badge_class,
   {f'<div class="card-desc">{_html_escape(description)}</div>' if description else ""}
   {stats_html}
   <div class="model-section" data-label="{_html_escape(label or '')}">{model_html}</div>
+  {mm_btn}
   {raw_html}
   </div>
 </div>"""
@@ -5983,6 +6096,83 @@ async def api_targets():
     }
 
 
+@app.get("/api/anthropic-forward")
+async def api_get_anthropic_forward():
+    """返回 8081 转发目标配置（默认端口 + 按模型映射）。"""
+    return {
+        "defaultPort": _ANTHROPIC_FORWARD_CFG.get("defaultPort", _ANTHROPIC_FORWARD_PORT),
+        "modelMap": _ANTHROPIC_FORWARD_CFG.get("modelMap", {}),
+    }
+
+
+class AnthropicForwardUpdate(BaseModel):
+    defaultPort: Optional[int] = None
+    modelMap: Optional[Dict[str, Dict[str, object]]] = None
+
+
+@app.put("/api/anthropic-forward")
+async def api_update_anthropic_forward(update: AnthropicForwardUpdate):
+    """更新 8081 转发目标配置，写 targets.json 顶层 anthropicForward 并热重载。"""
+    cfg = _cfg.load_targets()
+    current = cfg.get("anthropicForward") or {}
+    if update.defaultPort is not None:
+        current["defaultPort"] = update.defaultPort
+    if update.modelMap is not None:
+        current["modelMap"] = update.modelMap
+    cfg["anthropicForward"] = current
+    errors = _cfg.validate_targets(cfg)
+    if errors:
+        raise HTTPException(status_code=422, detail=errors)
+    _cfg.save_targets(cfg)
+    await _reload_targets()
+    return {"ok": True}
+
+
+@app.get("/api/aggregate/config")
+async def api_get_aggregate_config():
+    """返回聚合网关（handler=aggregator）target 的可编辑配置。"""
+    target = next((t for t in _TARGETS if t.get("handler") == "aggregator"), None)
+    if target is None:
+        return {"configured": False}
+    return {
+        "configured": True,
+        "name": target.get("name") or target.get("label"),
+        "virtualModels": target.get("virtualModels", {}),
+        "poolDefaults": target.get("poolDefaults", {}),
+        "quotaErrorPatterns": target.get("quotaErrorPatterns", []),
+    }
+
+
+class AggregateConfigUpdate(BaseModel):
+    name: Optional[str] = None
+    virtualModels: Optional[Dict[str, dict]] = None
+    poolDefaults: Optional[Dict[str, object]] = None
+    quotaErrorPatterns: Optional[List[str]] = None
+
+
+@app.put("/api/aggregate/config")
+async def api_update_aggregate_config(update: AggregateConfigUpdate):
+    """更新聚合网关虚拟模型/池默认值/配额熔断特征，写 targets.json 并热重载（引擎自动 reload）。"""
+    cfg = _cfg.load_targets()
+    target = next((t for t in cfg["targets"] if t.get("handler") == "aggregator"), None)
+    if target is None:
+        raise HTTPException(status_code=404, detail="未配置聚合网关 target（handler=aggregator）")
+    if update.name is not None:
+        target["name"] = update.name
+    if update.virtualModels is not None:
+        target["virtualModels"] = update.virtualModels
+    if update.poolDefaults is not None:
+        target["poolDefaults"] = update.poolDefaults
+    if update.quotaErrorPatterns is not None:
+        target["quotaErrorPatterns"] = update.quotaErrorPatterns
+    errors = _cfg.validate_targets(cfg)
+    if errors:
+        raise HTTPException(status_code=422, detail=errors)
+    _cfg.save_targets(cfg)
+    await _reload_targets()
+    return {"ok": True}
+
+
 class TargetUpdate(BaseModel):
     label: Optional[str] = None
     listenPort: Optional[int] = None
@@ -5995,6 +6185,7 @@ class TargetUpdate(BaseModel):
     targetProtocol: Optional[str] = None
     routePrefix: Optional[str] = None
     models: Optional[List] = None
+    modelMapping: Optional[Dict[str, str]] = None
     crackTool: Optional[str] = None
     secretRef: Optional[str] = None
     apikeyEnv: Optional[str] = None
@@ -6015,6 +6206,16 @@ async def api_update_target(label: str, update: TargetUpdate):
                     if not (isinstance(m, dict) and m.get("id") == "全部模型")
                     and not (isinstance(m, str) and m == "全部模型")
                 ]
+            # ── modelMapping 防御：空 dict 表示清空映射；过滤非字符串 key/value ──
+            if "modelMapping" in payload:
+                mm = payload["modelMapping"]
+                if not isinstance(mm, dict):
+                    payload.pop("modelMapping")
+                else:
+                    payload["modelMapping"] = {
+                        str(k): str(v) for k, v in mm.items()
+                        if k is not None and v is not None
+                    }
             t.update(payload)
             break
     else:
@@ -6048,9 +6249,12 @@ async def api_prune_models(label: str):
         raise HTTPException(status_code=404, detail=f"target '{label}' 不存在")
     # modelMapping 保护：映射目标在上游存在则保留对应模型；上游不存在的映射目标
     # 不能保留（会映射到死模型导致请求失败），把映射修正为上游存在的同族模型。
+    # 注意：agg: 开头的映射目标是聚合虚拟模型（非上游模型），跳过不修正。
     mm = cfg_target.get("modelMapping") or {}
     # 映射目标 → 上游存在性
     for role, target_model in list(mm.items()):
+        if target_model and str(target_model).startswith("agg:"):
+            continue
         if target_model and target_model not in live_set:
             # 尝试同族回退：把 role 映射到上游存在的模型（优先 sonnet/haiku 等稳定模型）
             fallback = None
@@ -6079,6 +6283,33 @@ async def api_prune_models(label: str):
         _cfg.save_targets(cfg)
         await _reload_targets()
     return {"ok": True, "label": label, "removed": removed, "keptCount": len(kept)}
+
+
+@app.get("/api/targets/{label}/mapping")
+async def api_target_mapping(label: str):
+    """返回 target 的 modelMapping 编辑数据：现有映射 + 本 target 模型列表 + 聚合虚拟模型列表。
+
+    前端据此渲染"模型映射"弹框：键=请求模型名/别名，值=转发目标模型
+    （值可为本 target 模型、聚合模型 agg:xxx，或自由输入的其他真实模型）。
+    """
+    target = next((t for t in _TARGETS if t["label"] == label), None)
+    if target is None:
+        raise HTTPException(status_code=404, detail=f"target '{label}' 不存在")
+    model_ids = []
+    for m in target.get("models", []) or []:
+        mid = m.get("id") if isinstance(m, dict) else str(m)
+        if mid:
+            model_ids.append(mid)
+    agg_models = []
+    for t in _TARGETS:
+        if t.get("handler") == "aggregator" and t.get("enabled", True):
+            agg_models.extend(sorted((t.get("virtualModels") or {}).keys()))
+    return {
+        "label": label,
+        "modelMapping": target.get("modelMapping") or {},
+        "models": model_ids,
+        "aggModels": agg_models,
+    }
 
 
 class SecretUpdate(BaseModel):
@@ -6378,38 +6609,6 @@ async def dashboard():
     # ── 分组：聚合网关(8081) / 破解网关(crack) / 直连网关(free/paid) ──
     agg_cards, crack_cards, direct_cards = [], [], []
 
-    # ── 8081 Anthropic（FastAPI，本 App 自身）—— 聚合网关 ──
-    _8081_total = _ANTHROPIC_STATS.get("totalRequests", 0)
-    _8081_ok = _ANTHROPIC_STATS.get("passthroughOk", 0)
-    _8081_err = _ANTHROPIC_STATS.get("passthroughError", 0)
-    _8081_rate = round(_8081_ok / _8081_total * 100, 1) if _8081_total > 0 else 100.0
-    agg_cards.append(_build_card_html(
-        name="anthropic-compatible (8081)",
-        note="FastAPI · Anthropic 协议入口 · /v1/messages 翻译为 OpenAI 后内部请求 8082",
-        kind_badge="协议转换",
-        status_badge=f"{_8081_total} 请求" if _8081_total > 0 else "运行中",
-        status_badge_class="purple",
-        kv_items=[
-            ("base_url", f"http://{_lan_ip}:8081"),
-            ("监听地址", "http://0.0.0.0:8081"),
-            ("内部回调", "http://127.0.0.1:8082/v1/chat/completions"),
-            ("协议", "Anthropic /v1/messages → OpenAI 翻译"),
-            ("模型数量", f"{len(_ANTHROPIC_PORT_MODELS)} 个（仅 Anthropic）"),
-            ("systemd 服务", "anthropic-compatible"),
-        ],
-        models=_ANTHROPIC_PORT_MODELS,
-        model_stats=_MODEL_STATS.get("anthropic", {}),
-        stats_detail={
-            "total": _8081_total, "ok": _8081_ok, "err": _8081_err,
-            "translated": 0, "success_rate": _8081_rate,
-            "uptime": _format_uptime(_ANTHROPIC_STATS.get("startedAt", "")), "alive": True,
-        },
-        description="接收 Anthropic 客户端请求，结构化解码后转换为 OpenAI 格式，内部转发到 8082（copilot 透传）。响应译回 Anthropic 格式。",
-        label=None,
-        port=8081,
-        meta_badges=[("聚合网关", "b-meta-agg"), ("Anthropic 协议", "b-meta-normal")],
-    ))
-
     # ── 8080 聚合网关（AggregatorEngine：虚拟模型路由 + 会话粘性 + 熔断）──
     # 卡头配置状态由服务端判定（engine 单例是否就绪）；运行时状态由前端 fetch /api/aggregate/status 填充
     _agg_engine = _AGGREGATOR_ENGINE
@@ -6434,12 +6633,58 @@ async def dashboard():
         accent_class="accent-8080",
         label=None,
         port=8080,
-        meta_badges=[("聚合网关", "b-meta-agg"), ("虚拟模型", "b-meta-normal")],
+        meta_badges=[("聚合网关", "b-meta-agg"), ("OpenAI 协议", "b-meta-oa")],
         raw_html=(
+            '<div class="model-ops">'
+            '  <button class="model-edit-toggle" onclick="openAggConfigEditor(this)" '
+            '    title="编辑聚合网关虚拟模型 / 池默认值 / 重试策略">✏️ 编辑配置</button>'
+            '</div>'
             '<div class="crack-status" id="agg-status" data-ref="aggregate">'
             '  <div class="cs-loading">状态加载中…</div>'
             '</div>'
         ),
+    ))
+
+    # ── 8081 Anthropic（FastAPI，本 App 自身）—— 转发网关 ──
+    _8081_total = _ANTHROPIC_STATS.get("totalRequests", 0)
+    _8081_ok = _ANTHROPIC_STATS.get("passthroughOk", 0)
+    _8081_err = _ANTHROPIC_STATS.get("passthroughError", 0)
+    _8081_rate = round(_8081_ok / _8081_total * 100, 1) if _8081_total > 0 else 100.0
+    # 8081 使用的 modelMapping 即 anthropicForwardPort 对应 target 的映射（翻译后转发到该端口）
+    _forward_target = next((t for t in _TARGETS if t.get("listenPort") == _ANTHROPIC_FORWARD_PORT), None)
+    _forward_label = _forward_target["label"] if _forward_target else None
+    agg_cards.append(_build_card_html(
+        name="anthropic-compatible (8081)",
+        note="FastAPI · Anthropic 协议入口 · /v1/messages 翻译为 OpenAI 后内部请求 8082",
+        kind_badge="协议转换",
+        status_badge=f"{_8081_total} 请求" if _8081_total > 0 else "运行中",
+        status_badge_class="purple",
+        kv_items=[
+            ("base_url", f"http://{_lan_ip}:8081"),
+            ("监听地址", "http://0.0.0.0:8081"),
+            ("内部回调", "http://127.0.0.1:8082/v1/chat/completions"),
+            ("协议", "Anthropic /v1/messages → OpenAI 翻译"),
+            ("模型数量", f"{len(_ANTHROPIC_PORT_MODELS)} 个（仅 Anthropic）"),
+            ("systemd 服务", "anthropic-compatible"),
+        ],
+        models=_ANTHROPIC_PORT_MODELS,
+        model_stats=_MODEL_STATS.get("anthropic", {}),
+        stats_detail={
+            "total": _8081_total, "ok": _8081_ok, "err": _8081_err,
+            "translated": 0, "success_rate": _8081_rate,
+            "uptime": _format_uptime(_ANTHROPIC_STATS.get("startedAt", "")), "alive": True,
+        },
+        description="接收 Anthropic 客户端请求，结构化解码后转换为 OpenAI 格式，内部转发到 8082（copilot 透传）。响应译回 Anthropic 格式。",
+        label=None,
+        port=8081,
+        raw_html=(
+            '<div class="model-ops">'
+            '  <button class="model-edit-toggle" onclick="openForwardConfigEditor(this)" '
+            '    title="编辑 8081 Anthropic 转发目标（默认端口 + 按模型映射）">✏️ 转发配置</button>'
+            '</div>'
+        ),
+        meta_badges=[("转发网关", "b-meta-agg"), ("Anthropic 协议", "b-meta-normal")],
+        mapping_label=_forward_label,
     ))
 
     # ── 动态 target 卡片（targets.json 驱动）──
@@ -6562,9 +6807,13 @@ async def dashboard():
             port=port,
             meta_badges=meta_badges,
             can_prune=(t.get("handler") == "copilot"),
+            mapping_label=t["label"],
         )
         if category == "crack":
             crack_cards.append(card)
+        elif category == "aggregate":
+            # 聚合网关卡片已手动构建（含状态区/编辑按钮），循环跳过避免重复
+            pass
         else:
             direct_cards.append(card)
 
@@ -6646,6 +6895,54 @@ async def dashboard():
         <span class="modal-msg" id="model-modal-msg"></span>
         <button class="modal-btn" onclick="closeModelEditor()">取消</button>
         <button class="modal-btn modal-btn-primary" id="model-modal-save" onclick="saveModelEditor(this)">保存</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- 模型映射编辑 modal（modelMapping：请求模型名 → 转发目标模型） -->
+  <div class="modal-overlay" id="mm-modal" role="dialog" aria-modal="true" aria-label="编辑模型映射">
+    <div class="modal">
+      <div class="modal-head">
+        <h3 id="mm-modal-title">模型映射</h3>
+        <button class="modal-close" onclick="closeMappingEditor()" aria-label="关闭">×</button>
+      </div>
+      <div class="modal-body" id="mm-modal-body"></div>
+      <div class="modal-foot">
+        <span class="modal-msg" id="mm-modal-msg"></span>
+        <button class="modal-btn" onclick="closeMappingEditor()">取消</button>
+        <button class="modal-btn modal-btn-primary" onclick="saveMappingEditor(this)">保存</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- 聚合网关配置编辑 modal -->
+  <div class="modal-overlay" id="agg-modal" role="dialog" aria-modal="true" aria-label="编辑聚合网关配置">
+    <div class="modal modal-wide">
+      <div class="modal-head">
+        <h3 id="agg-modal-title">聚合网关配置</h3>
+        <button class="modal-close" onclick="closeAggConfigEditor()" aria-label="关闭">×</button>
+      </div>
+      <div class="modal-body" id="agg-modal-body"></div>
+      <div class="modal-foot">
+        <span class="modal-msg" id="agg-modal-msg"></span>
+        <button class="modal-btn" onclick="closeAggConfigEditor()">取消</button>
+        <button class="modal-btn modal-btn-primary" onclick="saveAggConfig(this)">保存</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- 8081 转发配置编辑 modal -->
+  <div class="modal-overlay" id="fw-modal" role="dialog" aria-modal="true" aria-label="编辑转发配置">
+    <div class="modal">
+      <div class="modal-head">
+        <h3 id="fw-modal-title">8081 转发配置</h3>
+        <button class="modal-close" onclick="closeForwardConfigEditor()" aria-label="关闭">×</button>
+      </div>
+      <div class="modal-body" id="fw-modal-body"></div>
+      <div class="modal-foot">
+        <span class="modal-msg" id="fw-modal-msg"></span>
+        <button class="modal-btn" onclick="closeForwardConfigEditor()">取消</button>
+        <button class="modal-btn modal-btn-primary" onclick="saveForwardConfig(this)">保存</button>
       </div>
     </div>
   </div>
@@ -6857,6 +7154,595 @@ function filterModels(input) {{
     empty.remove();
   }}
 }}
+
+// ── modal 内模型行：删除（×）──
+function removeModelRow(btn) {{
+  var row = btn.closest('.mrow');
+  if (row) row.remove();
+  syncMasterState();
+}}
+
+// ── modal 内模型行：底部添加（自由输入新模型名）──
+function addModelRow() {{
+  var body = document.getElementById('model-modal-body');
+  if (!body) return;
+  var input = document.getElementById('model-add-input');
+  var mid = (input && input.value || '').trim();
+  if (!mid) {{
+    var msgEl = body.querySelector('.model-msg');
+    if (msgEl) {{ msgEl.textContent = '⚠️ 请输入模型名'; msgEl.className = 'model-msg err'; }}
+    return;
+  }}
+  var dup = false;
+  body.querySelectorAll('.mrow .mrow-id').forEach(function(idEl) {{
+    if (idEl.textContent === mid) dup = true;
+  }});
+  if (dup) {{
+    var msgEl = body.querySelector('.model-msg');
+    if (msgEl) {{ msgEl.textContent = '⚠️ 模型已存在: ' + mid; msgEl.className = 'model-msg err'; }}
+    return;
+  }}
+  var html = '<div class="mrow" data-model="' + escHtml(mid) + '">' +
+    '<div class="mrow-info">' +
+    '  <div class="mrow-id">' + escHtml(mid) + '</div>' +
+    '  <div class="mrow-name">' + escHtml(mid) + '</div>' +
+    '</div>' +
+    '<label class="switch" title="展示此模型">' +
+    '  <input type="checkbox" class="model-show" data-model="' + escHtml(mid) + '" checked>' +
+    '  <span class="switch-slider"></span>' +
+    '</label>' +
+    '<button class="mrow-del" onclick="removeModelRow(this)" title="删除此模型">×</button>' +
+    '</div>';
+  var addRow = body.querySelector('.mrow-add');
+  if (addRow) {{
+    addRow.insertAdjacentHTML('beforebegin', html);
+  }} else {{
+    body.insertAdjacentHTML('beforeend', html);
+  }}
+  var nm = body.querySelector('.no-models');
+  if (nm) nm.remove();
+  if (input) input.value = '';
+  bindModelEvents();
+}}
+
+// ── 模型映射编辑 modal（modelMapping 行式编辑）──
+var mmLabel = '';
+
+async function openMappingEditor(btn) {{
+  mmLabel = btn.dataset.label;
+  var overlay = document.getElementById('mm-modal');
+  var body = document.getElementById('mm-modal-body');
+  var title = document.getElementById('mm-modal-title');
+  var msg = document.getElementById('mm-modal-msg');
+  if (!overlay || !body) return;
+  title.textContent = '模型映射 — ' + mmLabel;
+  msg.textContent = '';
+  body.innerHTML = '<div class="no-models">加载中...</div>';
+  overlay.classList.add('open');
+  try {{
+    var resp = await fetch('/api/targets/' + encodeURIComponent(mmLabel) + '/mapping');
+    var r = await resp.json();
+    if (!resp.ok) {{
+      body.innerHTML = '<div class="no-models">加载失败: ' + (r.detail || JSON.stringify(r)) + '</div>';
+      return;
+    }}
+    body.innerHTML = buildMappingEditorHtml(r);
+  }} catch (e) {{
+    body.innerHTML = '<div class="no-models">加载异常: ' + e + '</div>';
+  }}
+}}
+
+function buildMappingEditorHtml(r) {{
+  var html = '<div class="mm-hint">键 = 请求模型名/别名（如 opus / sonnet / haiku），值 = 转发目标模型。' +
+    '值以 agg: 开头时请求将路由到 8080 聚合网关。键或值为空的行不保存；全部删除 = 清空映射。</div>';
+  var mm = r.modelMapping || {{}};
+  var keys = Object.keys(mm);
+  if (keys.length === 0) {{
+    html += mappingRowHtml('', '');
+  }} else {{
+    keys.forEach(function(k) {{ html += mappingRowHtml(k, mm[k]); }});
+  }}
+  // 值列可输入下拉：本 target 模型 + 聚合虚拟模型（agg:xxx）+ 自由输入
+  var opts = (r.models || []).concat(r.aggModels || []);
+  html += '<datalist id="mm-value-list">';
+  opts.forEach(function(m) {{ html += '<option value="' + escHtml(m) + '"></option>'; }});
+  html += '</datalist>';
+  html += '<div class="mm-add-row"><button class="mm-add-btn" onclick="addMappingRow()">+ 添加映射行</button></div>';
+  return html;
+}}
+
+function mappingRowHtml(k, v) {{
+  return '<div class="mm-row">' +
+    '<input type="text" class="mm-key" value="' + escHtml(k) + '" placeholder="请求模型名（如 haiku）" aria-label="请求模型名">' +
+    '<span class="mm-arrow">→</span>' +
+    '<input type="text" class="mm-val" value="' + escHtml(v) + '" list="mm-value-list" placeholder="转发目标模型（可填 agg:xxx）" aria-label="转发目标模型">' +
+    '<button class="mm-del" onclick="removeMappingRow(this)" title="删除此行">×</button>' +
+    '</div>';
+}}
+
+function addMappingRow() {{
+  var body = document.getElementById('mm-modal-body');
+  if (!body) return;
+  var addRow = body.querySelector('.mm-add-row');
+  var html = mappingRowHtml('', '');
+  if (addRow) {{
+    addRow.insertAdjacentHTML('beforebegin', html);
+  }} else {{
+    body.insertAdjacentHTML('beforeend', html);
+  }}
+  var keys = body.querySelectorAll('.mm-key');
+  if (keys.length) keys[keys.length - 1].focus();
+}}
+
+function removeMappingRow(btn) {{
+  var row = btn.closest('.mm-row');
+  if (row) row.remove();
+}}
+
+async function saveMappingEditor(btn) {{
+  var body = document.getElementById('mm-modal-body');
+  var msg = document.getElementById('mm-modal-msg');
+  if (!body || !msg || !mmLabel) return;
+  var mapping = {{}};
+  body.querySelectorAll('.mm-row').forEach(function(row) {{
+    var kEl = row.querySelector('.mm-key');
+    var vEl = row.querySelector('.mm-val');
+    var k = (kEl ? kEl.value : '').trim();
+    var v = (vEl ? vEl.value : '').trim();
+    if (k && v) mapping[k] = v;
+  }});
+  btn.disabled = true; btn.textContent = '保存中...';
+  try {{
+    var resp = await fetch('/api/targets/' + encodeURIComponent(mmLabel), {{
+      method: 'PUT', headers: {{'Content-Type': 'application/json'}},
+      body: JSON.stringify({{modelMapping: mapping}}),
+    }});
+    var r = await resp.json();
+    if (resp.ok) {{
+      msg.textContent = '✅ 已保存，热生效';
+      msg.className = 'modal-msg success';
+      setTimeout(function() {{ location.reload(); }}, 800);
+    }} else {{
+      msg.textContent = '❌ 保存失败: ' + JSON.stringify(r.detail || r);
+      msg.className = 'modal-msg danger';
+      btn.disabled = false; btn.textContent = '保存';
+    }}
+  }} catch (e) {{
+    msg.textContent = '❌ 保存异常: ' + e;
+    msg.className = 'modal-msg danger';
+    btn.disabled = false; btn.textContent = '保存';
+  }}
+}}
+
+function closeMappingEditor() {{
+  var overlay = document.getElementById('mm-modal');
+  if (overlay) overlay.classList.remove('open');
+}}
+
+// 点击遮罩关闭映射弹框
+(function() {{
+  var overlay = document.getElementById('mm-modal');
+  if (overlay) {{
+    overlay.addEventListener('click', function(e) {{
+      if (e.target === overlay) overlay.classList.remove('open');
+    }});
+  }}
+}})();
+
+// ── 聚合网关（8080）配置编辑 modal ──
+function aggNumField(key, labelText, val, placeholder) {{
+  var v = (val === undefined || val === null) ? '' : escHtml(String(val));
+  return '<label class="agg-field">' +
+    '<span class="agg-label">' + labelText + '</span>' +
+    '<input type="number" class="agg-input agg-pd-num" data-key="' + key + '" value="' + v + '" placeholder="' + (placeholder || '') + '" aria-label="' + labelText + '">' +
+    '</label>';
+}}
+
+function aggPoolMemberRow(port, model, weight) {{
+  var p = (port === undefined || port === null) ? '' : escHtml(String(port));
+  var m = (model === undefined || model === null) ? '' : escHtml(String(model));
+  var w = (weight === undefined || weight === null) ? '' : escHtml(String(weight));
+  return '<div class="agg-pool-row">' +
+    '<input type="number" class="agg-input agg-mem-port" value="' + p + '" placeholder="端口" aria-label="端口">' +
+    '<input type="text" class="agg-input agg-mem-model" value="' + m + '" placeholder="模型名（如 gpt-4o / agg:xxx）" aria-label="模型">' +
+    '<input type="number" class="agg-input agg-mem-weight" value="' + w + '" placeholder="权重" aria-label="权重">' +
+    '<button class="mm-del" onclick="removeAggPoolMember(this)" title="删除成员">×</button>' +
+    '</div>';
+}}
+
+function aggVmBlock(id, vm) {{
+  var d = (vm && vm.defaultPool) || [];
+  var f = (vm && vm.fallbackPool) || [];
+  var dr = (vm && vm.defaultRetries !== undefined && vm.defaultRetries !== null) ? escHtml(String(vm.defaultRetries)) : '';
+  var fr = (vm && vm.fallbackRetries !== undefined && vm.fallbackRetries !== null) ? escHtml(String(vm.fallbackRetries)) : '';
+  var html = '<div class="agg-vm">' +
+    '<div class="agg-vm-head">' +
+    '  <span class="agg-label">虚拟模型 id</span>' +
+    '  <input type="text" class="agg-input agg-vm-id" value="' + escHtml(String(id)) + '" placeholder="如 agg:sonnet" aria-label="虚拟模型 id">' +
+    '  <button class="mm-del" onclick="removeAggVm(this)" title="删除此虚拟模型">🗑</button>' +
+    '</div>';
+  html += '<div class="agg-pool" data-pool="default">' +
+    '<div class="agg-pool-title">默认池 defaultPool</div>';
+  if (d.length) {{ d.forEach(function(mem) {{ html += aggPoolMemberRow(mem.port, mem.model, mem.weight); }}); }}
+  else {{ html += aggPoolMemberRow('', '', ''); }}
+  html += '<div class="agg-add-row"><button class="mm-add-btn" onclick="addAggPoolMember(this, &quot;default&quot;)">+ 添加成员</button></div></div>';
+  html += '<div class="agg-pool" data-pool="fallback">' +
+    '<div class="agg-pool-title">降级池 fallbackPool</div>';
+  if (f.length) {{ f.forEach(function(mem) {{ html += aggPoolMemberRow(mem.port, mem.model, mem.weight); }}); }}
+  html += '<div class="agg-add-row"><button class="mm-add-btn" onclick="addAggPoolMember(this, &quot;fallback&quot;)">+ 添加降级成员</button></div></div>';
+  html += '<div class="agg-vm-retries">' +
+    '<label class="agg-field">' +
+    '  <span class="agg-label">defaultRetries（空=继承池默认）</span>' +
+    '  <input type="number" class="agg-input agg-vm-dr" value="' + dr + '" placeholder="继承" aria-label="defaultRetries">' +
+    '</label>' +
+    '<label class="agg-field">' +
+    '  <span class="agg-label">fallbackRetries（空=继承池默认）</span>' +
+    '  <input type="number" class="agg-input agg-vm-fr" value="' + fr + '" placeholder="继承" aria-label="fallbackRetries">' +
+    '</label>' +
+    '</div>' +
+    '</div>';
+  return html;
+}}
+
+async function openAggConfigEditor(btn) {{
+  var overlay = document.getElementById('agg-modal');
+  var body = document.getElementById('agg-modal-body');
+  var title = document.getElementById('agg-modal-title');
+  var msg = document.getElementById('agg-modal-msg');
+  if (!overlay || !body) return;
+  title.textContent = '聚合网关配置 — 8080';
+  msg.textContent = '';
+  body.innerHTML = '<div class="no-models">加载中...</div>';
+  overlay.classList.add('open');
+  try {{
+    var resp = await fetch('/api/aggregate/config');
+    var r = await resp.json();
+    if (!resp.ok) {{
+      body.innerHTML = '<div class="no-models">加载失败: ' + (r.detail || JSON.stringify(r)) + '</div>';
+      return;
+    }}
+    if (!r.configured) {{
+      body.innerHTML = '<div class="no-models">聚合网关未配置（targets.json 中缺少 handler=aggregator 的 target）</div>';
+      return;
+    }}
+    body.innerHTML = buildAggConfigHtml(r);
+  }} catch (e) {{
+    body.innerHTML = '<div class="no-models">加载异常: ' + e + '</div>';
+  }}
+}}
+
+function buildAggConfigHtml(r) {{
+  var pd = r.poolDefaults || {{}};
+  var html = '<div class="agg-hint">虚拟模型池配置：成员端口指向本地真实网关端口，模型为上游模型名（可填 agg:xxx 链式聚合）。' +
+    '权重与重试留空 = 继承池默认值；保存后热生效。</div>';
+  html += '<div class="agg-section"><div class="agg-section-title">池默认值 poolDefaults</div><div class="agg-fields">' +
+    aggNumField('defaultRetries', 'defaultRetries', pd.defaultRetries, '如 2') +
+    aggNumField('fallbackRetries', 'fallbackRetries', pd.fallbackRetries, '如 1') +
+    aggNumField('sessionAffinityTtlSeconds', 'sessionAffinityTtlSeconds', pd.sessionAffinityTtlSeconds, '如 3600') +
+    aggNumField('probeIntervalSeconds', 'probeIntervalSeconds', pd.probeIntervalSeconds, '如 300') +
+    aggNumField('weight', 'weight（成员默认权重）', pd.weight, '如 1') +
+    '</div></div>';
+  html += '<div class="agg-section" id="agg-vm-section"><div class="agg-section-title">虚拟模型 virtualModels</div>';
+  var vms = r.virtualModels || {{}};
+  var keys = Object.keys(vms);
+  if (keys.length === 0) {{
+    html += '<div class="no-models">(暂无虚拟模型，点击下方「+ 新增虚拟模型」添加)</div>';
+  }} else {{
+    keys.forEach(function(k) {{ html += aggVmBlock(k, vms[k]); }});
+  }}
+  html += '<button class="mm-add-btn" onclick="addAggVm()">+ 新增虚拟模型</button></div>';
+  return html;
+}}
+
+function addAggVm() {{
+  var body = document.getElementById('agg-modal-body');
+  var section = document.getElementById('agg-vm-section');
+  if (!body || !section) return;
+  var html = aggVmBlock('', {{defaultPool: [], fallbackPool: []}});
+  var addBtn = section.querySelector('.mm-add-btn');
+  if (addBtn) {{ addBtn.insertAdjacentHTML('beforebegin', html); }}
+  else {{ section.insertAdjacentHTML('beforeend', html); }}
+  var ids = body.querySelectorAll('.agg-vm-id');
+  if (ids.length) ids[ids.length - 1].focus();
+}}
+
+function removeAggVm(btn) {{
+  var block = btn.closest('.agg-vm');
+  if (block) block.remove();
+}}
+
+function addAggPoolMember(btn, poolKey) {{
+  var pool = btn.closest('.agg-pool');
+  if (!pool) return;
+  var html = aggPoolMemberRow('', '', '');
+  var addRow = pool.querySelector('.agg-add-row');
+  if (addRow) {{ addRow.insertAdjacentHTML('beforebegin', html); }}
+  else {{ pool.insertAdjacentHTML('beforeend', html); }}
+}}
+
+function removeAggPoolMember(btn) {{
+  var row = btn.closest('.agg-pool-row');
+  if (row) row.remove();
+}}
+
+async function saveAggConfig(btn) {{
+  var body = document.getElementById('agg-modal-body');
+  var msg = document.getElementById('agg-modal-msg');
+  if (!body || !msg) return;
+  var poolDefaults = {{}};
+  var bad = false;
+  body.querySelectorAll('.agg-pd-num').forEach(function(inp) {{
+    if (bad) return;
+    var key = inp.dataset.key;
+    var v = inp.value.trim();
+    if (v === '') return;
+    var n = Number(v);
+    if (isNaN(n) || n < 0) {{
+      msg.textContent = '⚠️ poolDefaults.' + key + ' 必须为非负数字'; msg.className = 'modal-msg danger';
+      bad = true; return;
+    }}
+    poolDefaults[key] = n;
+  }});
+  var virtualModels = {{}};
+  if (!bad) {{
+    body.querySelectorAll('.agg-vm').forEach(function(vm) {{
+      if (bad) return;
+      var idEl = vm.querySelector('.agg-vm-id');
+      var vid = (idEl ? idEl.value : '').trim();
+      if (!vid) return;  // 空 id 块忽略
+      if (virtualModels[vid]) {{
+        msg.textContent = '⚠️ 虚拟模型 id 重复: ' + vid; msg.className = 'modal-msg danger';
+        bad = true; return;
+      }}
+      var entry = {{}};
+      ['default', 'fallback'].forEach(function(poolKey) {{
+        if (bad) return;
+        var list = [];
+        var pool = vm.querySelector('.agg-pool[data-pool="' + poolKey + '"]');
+        if (pool) {{
+          pool.querySelectorAll('.agg-pool-row').forEach(function(row) {{
+            if (bad) return;
+            var portEl = row.querySelector('.agg-mem-port');
+            var modelEl = row.querySelector('.agg-mem-model');
+            var wEl = row.querySelector('.agg-mem-weight');
+            var port = (portEl ? portEl.value : '').trim();
+            var model = (modelEl ? modelEl.value : '').trim();
+            var w = (wEl ? wEl.value : '').trim();
+            if (!port && !model && !w) return;  // 空行忽略
+            if (port === '' || isNaN(Number(port)) || Number(port) < 0) {{
+              msg.textContent = '⚠️ 虚拟模型 ' + vid + ' 的成员端口必须为非负整数'; msg.className = 'modal-msg danger';
+              bad = true; return;
+            }}
+            if (!model) {{
+              msg.textContent = '⚠️ 虚拟模型 ' + vid + ' 的成员模型名不能为空'; msg.className = 'modal-msg danger';
+              bad = true; return;
+            }}
+            var mem = {{port: Number(port), model: model}};
+            if (w !== '') {{
+              var wn = Number(w);
+              if (isNaN(wn) || wn < 0) {{
+                msg.textContent = '⚠️ 虚拟模型 ' + vid + ' 的成员权重必须为非负数字'; msg.className = 'modal-msg danger';
+                bad = true; return;
+              }}
+              mem.weight = wn;
+            }}
+            list.push(mem);
+          }});
+        }}
+        entry[poolKey === 'default' ? 'defaultPool' : 'fallbackPool'] = list;
+      }});
+      if (bad) return;
+      var drEl = vm.querySelector('.agg-vm-dr');
+      var frEl = vm.querySelector('.agg-vm-fr');
+      var dr = drEl ? drEl.value.trim() : '';
+      var fr = frEl ? frEl.value.trim() : '';
+      if (dr !== '') {{
+        var drn = Number(dr);
+        if (isNaN(drn) || drn < 0 || drn % 1 !== 0) {{
+          msg.textContent = '⚠️ 虚拟模型 ' + vid + ' 的 defaultRetries 必须为非负整数'; msg.className = 'modal-msg danger';
+          bad = true; return;
+        }}
+        entry.defaultRetries = drn;
+      }}
+      if (fr !== '') {{
+        var frn = Number(fr);
+        if (isNaN(frn) || frn < 0 || frn % 1 !== 0) {{
+          msg.textContent = '⚠️ 虚拟模型 ' + vid + ' 的 fallbackRetries 必须为非负整数'; msg.className = 'modal-msg danger';
+          bad = true; return;
+        }}
+        entry.fallbackRetries = frn;
+      }}
+      virtualModels[vid] = entry;
+    }});
+  }}
+  if (bad) return;
+  if (Object.keys(virtualModels).length === 0) {{
+    msg.textContent = '⚠️ 至少需要一个虚拟模型'; msg.className = 'modal-msg danger';
+    return;
+  }}
+  var payload = {{virtualModels: virtualModels}};
+  if (Object.keys(poolDefaults).length) payload.poolDefaults = poolDefaults;
+  btn.disabled = true; btn.textContent = '保存中...';
+  try {{
+    var resp = await fetch('/api/aggregate/config', {{
+      method: 'PUT', headers: {{'Content-Type': 'application/json'}},
+      body: JSON.stringify(payload),
+    }});
+    var r = await resp.json();
+    if (resp.ok) {{
+      msg.textContent = '✅ 已保存，聚合引擎热重载'; msg.className = 'modal-msg success';
+      btn.textContent = '✅ 已保存'; btn.style.background = '#4ade80';
+      setTimeout(function() {{ location.reload(); }}, 2000);
+    }} else {{
+      var errs = Array.isArray(r.detail) ? r.detail.join('；') : JSON.stringify(r.detail || r);
+      msg.textContent = '❌ 保存失败: ' + errs; msg.className = 'modal-msg danger';
+      btn.disabled = false; btn.textContent = '保存'; btn.style.background = '';
+    }}
+  }} catch (e) {{
+    msg.textContent = '❌ 保存异常: ' + e; msg.className = 'modal-msg danger';
+    btn.disabled = false; btn.textContent = '保存'; btn.style.background = '';
+  }}
+}}
+
+function closeAggConfigEditor() {{
+  var overlay = document.getElementById('agg-modal');
+  if (overlay) overlay.classList.remove('open');
+}}
+
+// 点击遮罩关闭聚合配置弹框
+(function() {{
+  var overlay = document.getElementById('agg-modal');
+  if (overlay) {{
+    overlay.addEventListener('click', function(e) {{
+      if (e.target === overlay) overlay.classList.remove('open');
+    }});
+  }}
+}})();
+
+// ── 8081 转发配置编辑 modal ──
+async function openForwardConfigEditor(btn) {{
+  var overlay = document.getElementById('fw-modal');
+  var body = document.getElementById('fw-modal-body');
+  var title = document.getElementById('fw-modal-title');
+  var msg = document.getElementById('fw-modal-msg');
+  if (!overlay || !body) return;
+  title.textContent = '8081 转发配置';
+  msg.textContent = '';
+  body.innerHTML = '<div class="no-models">加载中...</div>';
+  overlay.classList.add('open');
+  try {{
+    var resp = await fetch('/api/anthropic-forward');
+    var r = await resp.json();
+    if (!resp.ok) {{
+      body.innerHTML = '<div class="no-models">加载失败: ' + (r.detail || JSON.stringify(r)) + '</div>';
+      return;
+    }}
+    body.innerHTML = buildForwardConfigHtml(r);
+  }} catch (e) {{
+    body.innerHTML = '<div class="no-models">加载异常: ' + e + '</div>';
+  }}
+}}
+
+function buildForwardConfigHtml(r) {{
+  var html = '<div class="agg-hint">Anthropic 模型名 → 内部转发目标（端口 + 模型名）。' +
+    'defaultPort 为未匹配映射时的默认转发端口；空行不保存。</div>';
+  html += '<div class="agg-section"><div class="agg-section-title">默认转发</div><div class="agg-fields">' +
+    '<label class="agg-field">' +
+    '  <span class="agg-label">defaultPort（默认转发端口）</span>' +
+    '  <input type="number" class="agg-input fw-default-port" value="' + escHtml(String(r.defaultPort)) + '" aria-label="默认转发端口">' +
+    '</label>' +
+    '</div></div>';
+  html += '<div class="agg-section"><div class="agg-section-title">按模型映射 modelMap</div>';
+  var mm = r.modelMap || {{}};
+  var keys = Object.keys(mm);
+  if (keys.length === 0) {{
+    html += forwardRowHtml('', '', '');
+  }} else {{
+    keys.forEach(function(k) {{ html += forwardRowHtml(k, mm[k].port, mm[k].model); }});
+  }}
+  html += '<div class="agg-add-row"><button class="mm-add-btn" onclick="addForwardRow()">+ 添加映射</button></div></div>';
+  return html;
+}}
+
+function forwardRowHtml(name, port, model) {{
+  var n = (name === undefined || name === null) ? '' : escHtml(String(name));
+  var p = (port === undefined || port === null) ? '' : escHtml(String(port));
+  var m = (model === undefined || model === null) ? '' : escHtml(String(model));
+  return '<div class="mm-row">' +
+    '<input type="text" class="agg-input fw-key" value="' + n + '" placeholder="Anthropic 模型名（如 sonnet）" aria-label="Anthropic 模型名">' +
+    '<span class="mm-arrow">→</span>' +
+    '<input type="number" class="agg-input fw-port" value="' + p + '" placeholder="转发端口" aria-label="转发端口">' +
+    '<input type="text" class="agg-input fw-model" value="' + m + '" placeholder="转发模型" aria-label="转发模型">' +
+    '<button class="mm-del" onclick="removeForwardRow(this)" title="删除此行">×</button>' +
+    '</div>';
+}}
+
+function addForwardRow() {{
+  var body = document.getElementById('fw-modal-body');
+  if (!body) return;
+  var addRow = body.querySelector('.agg-add-row');
+  var html = forwardRowHtml('', '', '');
+  if (addRow) {{ addRow.insertAdjacentHTML('beforebegin', html); }}
+  else {{ body.insertAdjacentHTML('beforeend', html); }}
+}}
+
+function removeForwardRow(btn) {{
+  var row = btn.closest('.mm-row');
+  if (row) row.remove();
+}}
+
+async function saveForwardConfig(btn) {{
+  var body = document.getElementById('fw-modal-body');
+  var msg = document.getElementById('fw-modal-msg');
+  if (!body || !msg) return;
+  var defaultPortEl = body.querySelector('.fw-default-port');
+  var defaultPort = defaultPortEl ? defaultPortEl.value.trim() : '';
+  if (defaultPort === '' || isNaN(Number(defaultPort)) || Number(defaultPort) < 0 || Number(defaultPort) % 1 !== 0) {{
+    msg.textContent = '⚠️ defaultPort 必须为非负整数'; msg.className = 'modal-msg danger';
+    return;
+  }}
+  var modelMap = {{}};
+  var bad = false;
+  body.querySelectorAll('.mm-row').forEach(function(row) {{
+    if (bad) return;
+    var kEl = row.querySelector('.fw-key');
+    var pEl = row.querySelector('.fw-port');
+    var mEl = row.querySelector('.fw-model');
+    var k = (kEl ? kEl.value : '').trim();
+    var p = (pEl ? pEl.value : '').trim();
+    var m = (mEl ? mEl.value : '').trim();
+    if (!k && !p && !m) return;  // 空行忽略
+    if (!k) {{
+      msg.textContent = '⚠️ 映射行的 Anthropic 模型名不能为空'; msg.className = 'modal-msg danger';
+      bad = true; return;
+    }}
+    if (p === '' || isNaN(Number(p)) || Number(p) < 0 || Number(p) % 1 !== 0) {{
+      msg.textContent = '⚠️ 映射行 ' + k + ' 的转发端口必须为非负整数'; msg.className = 'modal-msg danger';
+      bad = true; return;
+    }}
+    if (!m) {{
+      msg.textContent = '⚠️ 映射行 ' + k + ' 的转发模型不能为空'; msg.className = 'modal-msg danger';
+      bad = true; return;
+    }}
+    modelMap[k] = {{port: Number(p), model: m}};
+  }});
+  if (bad) return;
+  btn.disabled = true; btn.textContent = '保存中...';
+  try {{
+    var resp = await fetch('/api/anthropic-forward', {{
+      method: 'PUT', headers: {{'Content-Type': 'application/json'}},
+      body: JSON.stringify({{defaultPort: Number(defaultPort), modelMap: modelMap}}),
+    }});
+    var r = await resp.json();
+    if (resp.ok) {{
+      msg.textContent = '✅ 已保存，热生效'; msg.className = 'modal-msg success';
+      btn.textContent = '✅ 已保存'; btn.style.background = '#4ade80';
+      setTimeout(function() {{ location.reload(); }}, 2000);
+    }} else {{
+      var errs = Array.isArray(r.detail) ? r.detail.join('；') : JSON.stringify(r.detail || r);
+      msg.textContent = '❌ 保存失败: ' + errs; msg.className = 'modal-msg danger';
+      btn.disabled = false; btn.textContent = '保存'; btn.style.background = '';
+    }}
+  }} catch (e) {{
+    msg.textContent = '❌ 保存异常: ' + e; msg.className = 'modal-msg danger';
+    btn.disabled = false; btn.textContent = '保存'; btn.style.background = '';
+  }}
+}}
+
+function closeForwardConfigEditor() {{
+  var overlay = document.getElementById('fw-modal');
+  if (overlay) overlay.classList.remove('open');
+}}
+
+// 点击遮罩关闭转发配置弹框
+(function() {{
+  var overlay = document.getElementById('fw-modal');
+  if (overlay) {{
+    overlay.addEventListener('click', function(e) {{
+      if (e.target === overlay) overlay.classList.remove('open');
+    }});
+  }}
+}})();
 
 // ── 破解 token 重试 ──
 async function recrackCard(label, btn) {{
