@@ -148,7 +148,30 @@ Anthropic 协议：base_url = http://192.168.2.128:8081，api_key = "dummy"
 - `GET /api/aggregate/status`：返回 `configured` + 每虚拟模型每成员的 `requests / ok / err / degraded / avg_latency_ms` + 会话粘性（`cache_size / hits / lookups / hit_rate`）+ 熔断端口（`breakers`）。不包含任何密钥
 - dashboard「聚合网关」分组新增 8080 卡片，运行时状态由前端 fetch `/api/aggregate/status` 填充，**10s 自动刷新**
 
-实现：`aggregator.py`（`AggregatorEngine`，纯路由/熔断/统计逻辑，无网络 I/O）+ `server.py`（`_handle_aggregate_request` 分发 / `_aggregator_prober` 探测 / reload 钩子 / `/api/aggregate/status`）+ `config_store.py`（aggregate/aggregator 校验）。
+### 配置编辑（dashboard，非黑盒）
+
+- `GET/PUT /api/aggregate/config`：读写聚合 target 的 `virtualModels / poolDefaults / quotaErrorPatterns / name`。PUT 为**整体替换语义**（`virtualModels` 传完整 map；未提供的字段保留现值），校验后写 targets.json 并热重载（引擎自动 reload，保留会话/熔断状态）
+- `GET/PUT /api/anthropic-forward`：读写 8081 转发目标配置（见下节）
+- dashboard：8080 卡片「✏️ 编辑配置」modal（虚拟模型增删/池成员 port/model/weight/retries/降级池编辑）、8081 卡片「✏️ 转发配置」modal（defaultPort + 按模型映射增删改）
+
+### 8081 转发配置（anthropicForward）
+
+8081 收到 `/v1/messages` 后翻译为 OpenAI 并转发，默认发往 `anthropicForwardPort`（8082），`model` 字段原样透传。通过 targets.json 顶层 `anthropicForward` 可**按模型配置转发目标**（聚合模型或非聚合模型）：
+
+```json
+"anthropicForward": {
+  "defaultPort": 8082,
+  "modelMap": {
+    "sonnet": { "port": 8080, "model": "agg:sonnet" },
+    "haiku":  { "port": 8082, "model": "claude-haiku-4.5" }
+  }
+}
+```
+
+- 客户端请求 `model` 命中 `modelMap` → 按配置的 `port` + `model` 转发（如 `sonnet` → 8080 聚合网关的 `agg:sonnet`，走权重/会话粘性/熔断全链路）；未命中 → 走 `defaultPort` + 原样模型（现状行为）
+- `defaultPort` 缺省回退 `anthropicForwardPort`；`modelMap` 为空 = 全部走默认端口
+
+实现：`aggregator.py`（`AggregatorEngine`，纯路由/熔断/统计逻辑，无网络 I/O）+ `server.py`（`_handle_aggregate_request` 分发 / `_aggregator_prober` 探测 / reload 钩子 / `/api/aggregate/status`、`/api/aggregate/config`、`/api/anthropic-forward` / lifespan 预初始化引擎）+ `config_store.py`（aggregate/aggregator 校验 + 顶层 `anthropicForward` 校验与保留加载）。
 
 ## 路径重写（_rewrite_upstream_path）
 
