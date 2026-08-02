@@ -1488,6 +1488,20 @@ def _openai_to_trae_body(body: dict) -> dict:
         clean = model.split("/")[-1]
         out["model"] = clean
         out["config_name"] = clean
+    # ── tools 透传 + 格式转换 ──
+    # OpenAI: tools[].function.parameters = object
+    # Trae:   tools[].function.parameters = JSON 字符串（实测 object 直接 4001）
+    tools = body.get("tools")
+    if tools:
+        trae_tools = []
+        for t in tools:
+            fn = t.get("function") or {}
+            params = fn.get("parameters")
+            fn2 = dict(fn)
+            if isinstance(params, (dict, list)):
+                fn2["parameters"] = json.dumps(params, ensure_ascii=False)
+            trae_tools.append({**t, "function": fn2})
+        out["tools"] = trae_tools
     return out
 
 
@@ -1500,8 +1514,11 @@ def _trae_chunk_to_openai(chunk: dict, model: str) -> dict:
         delta["content"] = content
     if reasoning:
         delta["reasoning_content"] = reasoning
-    if chunk.get("tool_calls"):
-        delta["tool_calls"] = chunk["tool_calls"]
+    trae_tc = chunk.get("tool_calls")
+    if trae_tc:
+        oai_tc = _trae_tool_calls_to_openai(trae_tc)
+        if oai_tc:
+            delta["tool_calls"] = oai_tc
     return {
         "id": f"chatcmpl-{abs(hash(str(chunk.get('session_id', ''))))}",
         "object": "chat.completion.chunk",
@@ -1509,6 +1526,82 @@ def _trae_chunk_to_openai(chunk: dict, model: str) -> dict:
         "model": model,
         "choices": [{"index": 0, "delta": delta, "finish_reason": None}],
     }
+
+
+def _trae_tool_calls_to_openai(trae_tc: list) -> list:
+    """Trae tool_calls → OpenAI tool_calls。
+
+    Trae: {"index":0,"id":"call_x","type":"function",
+           "function_call":{"name":"get_weather","arguments":"{\"city\":\"北京\"}",
+                            "partial_arguments":null,"namespace":null}}
+    OpenAI: {"id":"call_x","type":"function",
+             "function":{"name":"get_weather","arguments":"{\"city\":\"北京\"}"}}
+
+    arguments 已是 JSON 字符串（流式也是全量，无增量分片），原样透出。
+    """
+    oai = []
+    for tc in trae_tc:
+        if not isinstance(tc, dict):
+            continue
+        fc = tc.get("function_call") or {}
+        fn = {}
+        if fc.get("name"):
+            fn["name"] = fc["name"]
+        if fc.get("arguments") is not None:
+            fn["arguments"] = fc["arguments"]
+        if not fn:
+            continue
+        item = {"type": tc.get("type", "function"), "function": fn}
+        if tc.get("id"):
+            item["id"] = tc["id"]
+        if tc.get("index") is not None:
+            item["index"] = tc["index"]
+        oai.append(item)
+    return oai
+
+
+# ── DSML 标记解析（seed-code 系模型：工具调用以文本标记输出在 response 字段）──
+# 实测形态（Doubao-Seed-Code，2026-08-02）：
+#   <｜DSML｜>
+#   <｜function｜>
+#   <｜function name｜>get_weather</｜function｜>
+#   <｜parameter｜>{"city":"北京"}</｜parameter｜>
+#   </｜function｜>
+#   </｜DSML｜>
+_DSML_FN_RE = re.compile(r"<[｜|]function[｜|]>(.*?)</[｜|]function[｜|]>", re.S)
+_DSML_NAME_RE = re.compile(r"<[｜|]function name[｜|]>(.*?)</[｜|]function[｜|]>", re.S)
+_DSML_PARAM_RE = re.compile(r"<[｜|]parameter[｜|]>(.*?)</[｜|]parameter[｜|]>", re.S)
+_DSML_LIKE_RE = re.compile(r"<[｜|](?:DSML|function|function name|parameter)[｜|]>")
+
+
+def _looks_like_dsml(text: str) -> bool:
+    """文本是否含 DSML 工具调用标记特征（seed-code 系模型输出）。"""
+    return bool(_DSML_LIKE_RE.search(text or ""))
+
+
+def _parse_dsml_tool_calls(text: str) -> list:
+    """把 DSML 标记文本解析为 OpenAI tool_calls 列表；无匹配返回 []。
+
+    每个 <｜function｜>...</｜function｜> 块 = 一次工具调用：
+    name 取自 <｜function name｜>，参数取自 <｜parameter｜>（原样保留为 JSON 字符串）。
+    """
+    tcs = []
+    for block in _DSML_FN_RE.findall(text):
+        name = ""
+        m_name = _DSML_NAME_RE.search(block)
+        if m_name:
+            name = m_name.group(1).strip()
+        if not name:
+            continue
+        args = None
+        m_param = _DSML_PARAM_RE.search(block)
+        if m_param:
+            args = m_param.group(1).strip()
+        item = {"type": "function", "function": {"name": name}}
+        if args:
+            item["function"]["arguments"] = args
+        tcs.append(item)
+    return tcs
 
 
 def _trae_final_to_openai(model: str) -> dict:
@@ -1522,8 +1615,15 @@ def _trae_final_to_openai(model: str) -> dict:
     }
 
 
-def _trae_nonstream_to_openai(model: str, content_parts: list, reasoning_parts: list) -> dict:
-    """非流式：把累积的 response/reasoning 拼成 OpenAI 完成响应。"""
+def _trae_nonstream_to_openai(model: str, content_parts: list, reasoning_parts: list, tool_calls: list | None = None) -> dict:
+    """非流式：把累积的 response/reasoning 拼成 OpenAI 完成响应；含 tool_calls 时附上。"""
+    message: dict = {
+        "role": "assistant",
+        "content": "".join(content_parts),
+        "reasoning_content": "".join(reasoning_parts) or None,
+    }
+    if tool_calls:
+        message["tool_calls"] = tool_calls
     return {
         "id": "chatcmpl-trae",
         "object": "chat.completion",
@@ -1531,12 +1631,8 @@ def _trae_nonstream_to_openai(model: str, content_parts: list, reasoning_parts: 
         "model": model,
         "choices": [{
             "index": 0,
-            "message": {
-                "role": "assistant",
-                "content": "".join(content_parts),
-                "reasoning_content": "".join(reasoning_parts) or None,
-            },
-            "finish_reason": "stop",
+            "message": message,
+            "finish_reason": "tool_calls" if tool_calls else "stop",
         }],
         "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
     }
@@ -1556,24 +1652,29 @@ async def _handle_traework(writer, target, method, path, headers, body, stats, l
     api_headers = _trae_build_headers(token)
 
     try:
-        # ── /v1/models：优先上游 get_detail_param 实时同步（TTL 缓存），失败回退 targets.json 配置，再兜底静态列表 ──
+        # ── /v1/models：优先上游 get_detail_param 实时同步（TTL 缓存），
+        #    再按 targets.json enabled=true 白名单过滤（屏蔽空响应/收费模型，如
+        #    Doubao-Seed-2.1-Pro / kimi-k3 / DeepSeek-V4-Flash-Official），
+        #    失败回退配置白名单，再兜底静态列表 ──
         if path == "/v1/models" and method == "GET":
             models = []
+            _tw_tgt = next((t for t in _TARGETS if t.get("label") == "trae-work"), None)
+            # 配置白名单：仅 enabled=true 的模型（dashboard 可编辑）
+            _cfg_whitelist = []
+            for m in (_tw_tgt or {}).get("models", []):
+                mid = m.get("id") if isinstance(m, dict) else str(m)
+                if mid and (m.get("enabled", False) if isinstance(m, dict) else True):
+                    _cfg_whitelist.append(mid)
             upstream = await _trae_fetch_models(token)
             if upstream:
-                models = [{"id": mid, "object": "model", "created": 1700000000, "owned_by": "trae"} for mid in upstream]
+                models = [{"id": mid, "object": "model", "created": 1700000000, "owned_by": "trae"}
+                          for mid in upstream if mid in _cfg_whitelist]
             if not models:
-                _tw_tgt = next((t for t in _TARGETS if t.get("label") == "trae-work"), None)
-                for m in (_tw_tgt or {}).get("models", []):
-                    mid = m.get("id") if isinstance(m, dict) else str(m)
-                    if mid:
-                        models.append({"id": mid, "object": "model", "created": 1700000000, "owned_by": "trae"})
+                for mid in _cfg_whitelist:
+                    models.append({"id": mid, "object": "model", "created": 1700000000, "owned_by": "trae"})
             if not models:
-                # 兜底：配置也缺失时的静态列表
-                for mid in ("glm-5.2", "glm-5.1", "glm-5", "glm-4.7", "glm-4.6",
-                            "DeepSeek-V4-Pro", "DeepSeek-V4-Flash", "Doubao-Seed-2.1-Pro",
-                            "kimi-k3", "kimi-k2.7-code", "minimax-m3", "qwen-3.7-plus",
-                            "qwen-3.5", "qwen3-coder"):
+                # 兜底：配置缺失时的静态列表（仅可用模型）
+                for mid in ("glm-5.2", "DeepSeek-V4-Pro", "DeepSeek-V4-Flash", "Doubao-Seed-Code"):
                     models.append({"id": mid, "object": "model", "created": 1700000000, "owned_by": "trae"})
             payload = _json.dumps({"data": models, "object": "list", "has_more": False}).encode()
             writer.write(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: %d\r\n\r\n%s" % (len(payload), payload))
@@ -1607,6 +1708,8 @@ async def _handle_traework(writer, target, method, path, headers, body, stats, l
                 # ── 流式：Trae SSE → OpenAI SSE ──
                 if is_stream:
                     writer.write(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: keep-alive\r\n\r\n")
+                    # seed-code 系模型的 DSML 标记是分片输出的，累积到完整块再解析
+                    dsml_buf = ""
                     async for chunk in resp.aiter_bytes():
                         line = chunk.decode("utf-8", errors="replace")
                         for raw in line.split("\n"):
@@ -1625,9 +1728,26 @@ async def _handle_traework(writer, target, method, path, headers, body, stats, l
                                 continue
                             # 只转换 output 事件
                             if "response" in trae_chunk or "reasoning_content" in trae_chunk:
+                                resp_text = trae_chunk.get("response") or ""
+                                # DSML 文本 → 缓冲累积，完整块解析为 tool_calls
+                                if _looks_like_dsml(resp_text) or dsml_buf:
+                                    if resp_text:
+                                        dsml_buf += resp_text
+                                    tcs = _parse_dsml_tool_calls(dsml_buf)
+                                    if tcs:
+                                        oai = _trae_chunk_to_openai(
+                                            {"response": "", "tool_calls": [{"type": "function", "function": tc["function"]} for tc in tcs]},
+                                            model,
+                                        )
+                                        writer.write(("data: " + _json.dumps(oai, ensure_ascii=False) + "\n\n").encode())
+                                        await writer.drain()
+                                        dsml_buf = ""
+                                    # 未闭合时继续累积，不输出 content（避免把 DSML 标记透给客户端）
+                                    continue
                                 oai = _trae_chunk_to_openai(trae_chunk, model)
                                 writer.write(("data: " + _json.dumps(oai, ensure_ascii=False) + "\n\n").encode())
                                 await writer.drain()
+                    # 流结束：若残留 DSML 未解析完，丢弃（不把半截标记透给客户端）
                     writer.write(("data: " + _json.dumps(_trae_final_to_openai(model), ensure_ascii=False) + "\n\n").encode())
                     writer.write(b"data: [DONE]\n\n")
                     await writer.drain()
@@ -1636,7 +1756,8 @@ async def _handle_traework(writer, target, method, path, headers, body, stats, l
 
                 # ── 非流式：累积 output 事件 ──
                 resp_body = await resp.aread()
-                content_parts, reasoning_parts = [], []
+                content_parts, reasoning_parts, tool_calls = [], [], []
+                dsml_buf = ""
                 for raw in resp_body.decode("utf-8", errors="replace").split("\n"):
                     raw = raw.strip()
                     if not raw.startswith("data:"):
@@ -1651,11 +1772,40 @@ async def _handle_traework(writer, target, method, path, headers, body, stats, l
                     # 上游 SSE 有非对象 data 行（如 "Processing_xxx" 字符串），跳过
                     if not isinstance(trae_chunk, dict):
                         continue
-                    if trae_chunk.get("response"):
-                        content_parts.append(trae_chunk["response"])
+                    resp_text = trae_chunk.get("response")
+                    if resp_text:
+                        if _looks_like_dsml(resp_text) or dsml_buf:
+                            dsml_buf += resp_text
+                        else:
+                            content_parts.append(resp_text)
                     if trae_chunk.get("reasoning_content"):
                         reasoning_parts.append(trae_chunk["reasoning_content"])
-                out = _trae_nonstream_to_openai(model, content_parts, reasoning_parts)
+                    tc = trae_chunk.get("tool_calls")
+                    if tc:
+                        # 上游非流式可能把同一工具调用分片输出（如 glm-5.2 的 arguments
+                        # 拆成多个 tool_calls 事件），按 index 合并 name/arguments
+                        for oai_tc in _trae_tool_calls_to_openai(tc):
+                            idx = oai_tc.get("index", len(tool_calls))
+                            if idx < len(tool_calls):
+                                prev = tool_calls[idx]
+                                fn = prev.get("function", {})
+                                cur = oai_tc.get("function", {})
+                                if cur.get("name") and not fn.get("name"):
+                                    fn["name"] = cur["name"]
+                                if cur.get("arguments"):
+                                    fn["arguments"] = (fn.get("arguments") or "") + cur["arguments"]
+                                prev["function"] = fn
+                                if oai_tc.get("id") and not prev.get("id"):
+                                    prev["id"] = oai_tc["id"]
+                            else:
+                                tool_calls.append(oai_tc)
+                if dsml_buf:
+                    dsml_tcs = _parse_dsml_tool_calls(dsml_buf)
+                    if dsml_tcs:
+                        tool_calls = dsml_tcs
+                    else:
+                        content_parts.append(dsml_buf)  # 非 DSML 残留（如纯文本工具描述）照常输出
+                out = _trae_nonstream_to_openai(model, content_parts, reasoning_parts, tool_calls or None)
                 payload = _json.dumps(out, ensure_ascii=False).encode()
                 writer.write(f"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {len(payload)}\r\n\r\n".encode())
                 writer.write(payload)

@@ -201,6 +201,39 @@ event: output          # 正文输出，data 含 response + reasoning_content
 
 ---
 
+## 5.4 工具调用（Function Calling）翻译层（2026-08-02 实现）
+
+**问题**：客户端传标准 OpenAI `tools`，Trae 上游要求 `tools[].function.parameters` 是 **JSON 字符串**（object 直接 4001）；且响应侧不同模型输出形态完全不同，代理需要统一翻译成 OpenAI `tool_calls`。
+
+### 请求侧（`_openai_to_trae_body`）
+
+- 透传 `tools`，仅转换：`parameters` object/list → `json.dumps()` 字符串（实测不转 → `4001 bad request: cannot unmarshal object into ... of type string`）
+- 其余字段（type/name/description）原样
+
+### 响应侧（按模型分两类）
+
+上游实测（2026-08-02，9 模型全测）：
+
+| 类别 | 模型 | 上游形态 | 代理翻译 |
+|------|------|----------|----------|
+| **A 原生 tool_calls** | `glm-5.2` `glm-5.1` `qwen-3.7-plus` `minimax-m3` `DeepSeek-V4-Pro` `DeepSeek-V4-Flash` | `tool_calls[]` JSON 字段（`function_call{name, arguments}`，流式也是全量无分片） | 字段映射：`function_call` → `function`，透出 `id`/`index`（`_trae_tool_calls_to_openai`） |
+| **B DSML 文本标记** | `Doubao-Seed-Code`（seed-code） | `response` 字段输出 `<｜DSML｜><｜function｜><｜function name｜>X</｜function｜><｜parameter｜>{...}</｜parameter｜>` 标记 | 流式缓冲累积到完整块 + regex 解析为 `tool_calls`（`_parse_dsml_tool_calls`），DSML 文本不透给客户端 |
+| **C 空响应（不可用）** | `Doubao-Seed-2.1-Pro` `kimi-k3` `DeepSeek-V4-Flash-Official` | 无 response 无 tool_calls（普通对话也空，疑似收费/渠道过滤） | 已从 `/v1/models` 白名单剔除 |
+
+### /v1/models 白名单过滤
+
+`GET /v1/models` 上游列表按 targets.json `enabled=true` 过滤（C 类模型不再出现在客户端模型列表）。
+
+### 判定逻辑
+
+不按模型名硬编码：响应含 `tool_calls` 字段 → A 路径；`response` 含 `<｜DSML｜>` 等标记特征（`_looks_like_dsml`）→ B 路径。新模型自动归队。
+
+### 分片合并（glm-5.2 特殊性）
+
+glm-5.2 **非流式**时上游把同一工具调用的 `arguments` 分片输出（多个 `tool_calls` 事件，第二个只有 `{"arguments":"}"}`）。代理非流式累积时按 `index` 合并 name/arguments（`tool_calls` 数组原地拼接）。流式下上游输出全量，无需合并。
+
+---
+
 ## 6. token 生命周期
 
 ### 6.1 有效期
