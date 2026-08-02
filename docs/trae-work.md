@@ -176,21 +176,28 @@ event: output          # 正文输出，data 含 response + reasoning_content
 - 代理需要把 SSE 事件还原为 OpenAI 流式分块格式，并把 `reasoning_content` 映射到
   OpenAI 的 `reasoning` 字段（若客户端支持）
 
-### 5.3 图片/多模态（实测结论，2026-08-02）
+### 5.3 图片/多模态（实测结论，2026-08-02 修订）
 
-**Trae 上游图片格式**（错误消息暴露 Go struct：`LLMRawMessageImageUrl`）：
+**Trae 上游支持图片**，格式为标准 OpenAI 格式（错误消息暴露 Go struct：`LLMRawMessageImageUrl`）：
 
-- content 图片块字段名是 **`image_url`（对象类型）**，不是 `image`：
-  ```json
-  {"type": "image_url", "image_url": {"url": "..."}}
-  ```
-- `image_url` 传**字符串** → HTTP 400（`cannot unmarshal string into ... LLMRawMessageImageUrl`）
-- 传 `image` 字段 / `type:base64` / `data` 字段 → 4001 `param is invalid`
-- 传 `image_url: {url}`（正确格式）→ **通过解析，但模型层失败**：
-  - glm 系：3003 `all models failed`
-  - Doubao 系：1005（空消息 + `{"plan":1}`）
+```json
+{"type": "image_url", "image_url": {"url": "https://公网图片或data URI"}}
+```
 
-**结论**：格式层修复后（`_openai_to_trae_body` 原样透传 `image_url`），Trae Work `chat_v3` 接口**在模型层拒绝图片请求**（3003/1005）——代理无法绕过，**8086 端口图片任务不可用**（无论模型本身是否支持视觉）。豆包视觉需直连火山引擎官方 API。
+**关键：图片能力只对 Trae 内置多模态模型开放**（官方 FAQ + 实测确认）：
+
+| 模型 | 传图实测 |
+|---|---|
+| `Doubao_1_6` | ✅ 成功（"图中呈现出湛蓝的天空…"） |
+| `qwen-3.7-plus` / `minimax-m3` / `Doubao-Seed-2.0-Code` | ✅ 成功 |
+| `Doubao-Seed-2.1-Pro` / `glm-5.2`（非多模态名单） | ❌ 3003 `all models failed` / 1005 |
+| `kimi-k3` | ❌ 1005（不在多模态名单） |
+
+- 传图失败与图片 URL 域名关系不大（gstatic 公网 URL 实测可用）；**根因是模型不在 Trae 多模态白名单**，Trae 层直接拒绝其图片请求
+- 错误格式排查记录：`image_url` 传字符串 → HTTP 400；`image` 字段 / `type:base64` / `data` → 4001 `param is invalid`；`image_url:{url}`（标准格式）→ 通过解析
+- IDE 客户端内部有 `multimodal/report_image_content` 图片上报 RPC（先传 Trae 存储），但**直接传公网 URL 即可绕过**（对内置多模态模型）
+
+**代理使用要求**：8086 端口传图可用，但客户端必须用**内置多模态模型**（如 `Doubao_1_6`），`_openai_to_trae_body` 已按标准格式原样透传 `image_url`。
 
 ---
 
