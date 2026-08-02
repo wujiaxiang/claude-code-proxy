@@ -5629,12 +5629,20 @@ DASHBOARD_STYLE = """
   /* ── 模型表格 ── */
   .model-count { display: inline-block; background: rgba(59,130,246,0.12); color: #93c5fd; font-size: 11px; padding: 2px 8px; border-radius: 999px; margin-left: 6px; font-weight: 600; border: 1px solid rgba(59,130,246,0.28); }
   .no-models { font-size: 12.5px; color: var(--text-tertiary); margin-top: 6px; font-style: italic; }
-  .model-table { width: 100%; border-collapse: collapse; margin-top: 8px; font-size: 12.5px; }
-  .model-table th { text-align: left; padding: 8px 12px; color: var(--text-tertiary); font-weight: 600; font-size: 11px; text-transform: uppercase; letter-spacing: 0.5px; border-bottom: 1px solid var(--border); }
-  .model-table td { padding: 7px 12px; border-bottom: 1px solid rgba(148,163,184,0.10); }
-  .model-table td.num { color: var(--text-tertiary); font-family: var(--font-mono); width: 32px; }
-  .model-table td.mid { font-family: var(--font-mono); }
+  .model-table { width: 100%; border-collapse: collapse; margin-top: 8px; font-size: 12.5px; table-layout: fixed; }
+  .model-table th { text-align: left; padding: 8px 12px; color: var(--text-tertiary); font-weight: 600; font-size: 11px; text-transform: uppercase; letter-spacing: 0.5px; border-bottom: 1px solid var(--border); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .model-table th:nth-child(1) { width: 3%; text-align: center; }
+  .model-table th:nth-child(2) { width: 18%; }
+  .model-table th:nth-child(3) { width: 22%; }
+  .model-table th:nth-child(4) { width: 10%; text-align: center; }
+  .model-table th:nth-child(5) { width: 12%; text-align: center; }
+  .model-table th:nth-child(6) { width: 10%; text-align: center; }
+  .model-table th:nth-child(7) { width: 10%; text-align: center; }
+  .model-table td { padding: 7px 12px; border-bottom: 1px solid rgba(148,163,184,0.10); overflow-wrap: anywhere; }
+  .model-table td.num { color: var(--text-tertiary); font-family: var(--font-mono); text-align: center; }
+  .model-table td.mid { font-family: var(--font-mono); overflow-wrap: anywhere; }
   .model-table td.name { color: #c9cedd; }
+  .model-table td.mstat { text-align: center; }
   .model-table td.act { width: 36px; text-align: center; }
   .model-table tbody tr:nth-child(even) { background: rgba(255,255,255,0.02); }
   .model-table tbody tr:hover { background: rgba(34,211,238,0.05); }
@@ -6286,7 +6294,7 @@ def _build_card_html(name, note, kind_badge, status_badge, status_badge_class,
   <div class="kv">{kv}</div>
   {f'<div class="card-desc">{_html_escape(description)}</div>' if description else ""}
   {stats_html}
-  <div class="model-section" data-label="{_html_escape(label or '')}">{model_html}</div>
+  {f'<div class="model-section" data-label="{_html_escape(label or "")}">{model_html}</div>' if model_html else ""}
   {mm_btn}
   {raw_html}
   </div>
@@ -6832,14 +6840,16 @@ async def dashboard():
     agg_cards, crack_cards, direct_cards = [], [], []
 
     # ── 8080 流量聚合（AggregatorEngine：虚拟模型路由 + 会话粘性 + 熔断）──
-    # 监控视角与其他卡片一致：卡头请求数摘要 + 展开区流量统计块 + 虚拟模型列表（model-table）
-    # 配置编辑走「✏️ 编辑配置」进入独立 modal；运行时成员明细由前端 fetch /api/aggregate/status 填充
+    # 监控视角与其他卡片一致：卡头请求数摘要 + 展开区流量统计块 + 成员级 model-table 单表
+    # （虚拟模型 + 成员明细整合为一张表：模型 ID 列=虚拟模型，名称列=成员，列与监控表一致 + 延迟）
+    # 配置编辑走「✏️ 编辑配置」进入独立 modal；单表由前端 fetch /api/aggregate/status 每 10s 渲染
     _agg_engine = _AGGREGATOR_ENGINE
     _agg_configured = _agg_engine is not None
     _agg_stats_detail = None
     _agg_vm_list = []
-    _agg_model_stats = {}
     _agg_member_total = 0
+    _agg_started_at = 0
+    _agg_pool_cfg_json = "{}"
     if _agg_configured:
         # 虚拟模型列表与池成员数取自配置（总有值），统计取自引擎（无流量时计数为 0）
         _agg_cfg_target = next((t for t in _TARGETS if t.get("handler") == "aggregator"), None)
@@ -6854,24 +6864,22 @@ async def dashboard():
         _agg_tot = _agg_ok = _agg_err = _agg_tr = 0
         for _vm_id in _agg_vm_list:
             _members = _agg_vms.get(_vm_id, {})
-            _vm_s = {"requests": 0, "ok": 0, "err": 0, "translated429": 0}
             for _m in _members.values():
-                _r = _m.get("requests", 0)
-                _vm_s["requests"] += _r
-                _vm_s["ok"] += _m.get("ok", 0)
-                _vm_s["err"] += _m.get("err", 0)
-                _vm_s["translated429"] += _m.get("degraded", 0)
-                _agg_tot += _r
+                _agg_tot += _m.get("requests", 0)
                 _agg_ok += _m.get("ok", 0)
                 _agg_err += _m.get("err", 0)
                 _agg_tr += _m.get("degraded", 0)
-            _agg_model_stats[_vm_id] = _vm_s
+        _agg_started_at = _agg_full.get("started_at", 0)
         _agg_rate = round(_agg_ok / _agg_tot * 100, 1) if _agg_tot > 0 else 100.0
+        # _format_uptime 接受 ISO 字符串（与 8082 等透传卡一致）；引擎返回 float timestamp，调用点转换
+        _agg_started_iso = datetime.fromtimestamp(_agg_started_at).isoformat() if _agg_started_at else ""
         _agg_stats_detail = {
             "total": _agg_tot, "ok": _agg_ok, "err": _agg_err,
             "translated": _agg_tr, "success_rate": _agg_rate,
-            "uptime": "—", "alive": True,
+            "uptime": _format_uptime(_agg_started_iso), "alive": True,
         }
+        # 池配置 JSON 注入前端（供 loadAggregateStatus 渲染池详情折叠）
+        _agg_pool_cfg_json = json.dumps(_agg_cfg_vms, ensure_ascii=False)
     agg_cards.append(_build_card_html(
         name="流量聚合",
         note="虚拟模型聚合路由 · 会话粘性 · 熔断降级（OpenAI /v1 入口）",
@@ -6887,8 +6895,9 @@ async def dashboard():
             ("池成员", f"{_agg_member_total} 个"),
         ],
         stats_detail=_agg_stats_detail,
-        models=_agg_vm_list if _agg_configured else None,
-        model_stats=_agg_model_stats if _agg_configured else None,
+        # 模型区整合：虚拟模型 + 成员明细统一由前端渲染单表（loadAggregateStatus），服务端不再输出 model-table
+        models=None,
+        model_stats=None,
         col_429="降级",
         description="虚拟模型 id（agg:xxx）→ 按权重与会话粘性路由到池内成员端口，故障端口自动熔断并从降级池逃生。",
         accent_class="accent-8080",
@@ -6903,6 +6912,7 @@ async def dashboard():
             '<div class="crack-status" id="agg-status" data-ref="aggregate">'
             '  <div class="cs-loading">状态加载中…</div>'
             '</div>'
+            f'<script type="application/json" id="agg-pool-data">{_agg_pool_cfg_json}</script>'
         ),
     ))
 
@@ -8345,9 +8355,19 @@ function aggMemberDot(m) {{
   return 'agg-dot warn';
 }}
 
+function togglePoolDetail(rowEl) {{
+  var vmId = rowEl.getAttribute('data-vmid');
+  if (!vmId) return;
+  var d = document.getElementById('pool-' + vmId);
+  if (d) d.open = !d.open;
+}}
+
 async function loadAggregateStatus() {{
   var el = document.getElementById('agg-status');
   if (!el) return;
+  // 保留用户当前展开的池详情 id（10s 刷新会重写 innerHTML，需恢复 open 状态）
+  var openIds = [];
+  el.querySelectorAll('details.agg-vm-detail[open]').forEach(function(d){{ openIds.push(d.id); }});
   try {{
     var resp = await fetch('/api/aggregate/status');
     var r = await resp.json();
@@ -8359,41 +8379,94 @@ async function loadAggregateStatus() {{
     var hitRate = (sess.hit_rate || 0) * 100;
     var cacheSize = sess.cache_size || 0;
     var html = '<div class="cs-head">🔀 聚合网关 · 命中率 ' + hitRate.toFixed(1) + '% · 粘性缓存 ' + cacheSize + ' 条</div>';
+    // 池配置 JSON（注入自服务端 <script id="agg-pool-data">）
+    var cfgScript = document.getElementById('agg-pool-data');
+    var cfg = {{}};
+    try {{ cfg = cfgScript ? JSON.parse(cfgScript.textContent || '{{}}') : {{}}; }} catch(e) {{ cfg = {{}}; }}
+    // ── 主表：每虚拟模型一行（配置全貌，含无流量 vm）──
     var vms = r.virtual_models || {{}};
-    var vmKeys = Object.keys(vms);
-    if (vmKeys.length === 0) {{
-      html += '<div class="agg-vm-detail"><summary class="agg-vm-head">虚拟模型：暂无</summary></div>';
-    }} else {{
-      vmKeys.forEach(function(vmId) {{
-        var members = vms[vmId] || {{}};
-        var memberKeys = Object.keys(members);
-        var mTotal = 0, mOk = 0, mErr = 0, mDeg = 0;
-        memberKeys.forEach(function(mk) {{
-          var mm = members[mk] || {{}};
-          mTotal += mm.requests || 0; mOk += mm.ok || 0; mErr += mm.err || 0; mDeg += mm.degraded || 0;
-        }});
-        var bodyHtml = '';
-        if (memberKeys.length === 0) {{
-          bodyHtml = '<div class="agg-vm-row"><span class="m">暂无流量</span></div>';
-        }} else {{
-          memberKeys.forEach(function(mk) {{
-            var m = members[mk] || {{}};
-            var req = m.requests || 0;
-            var lat = (m.avg_latency_ms || 0).toFixed(0) + 'ms';
-            bodyHtml += '<div class="agg-vm-row"><span class="' + aggMemberDot(m) + '"></span>' +
-              '<span class="m">' + escHtml(mk) + '</span>' +
-              '<span class="s">' + req + ' 请求 · 成功 ' + (m.ok || 0) + ' · 失败 ' + (m.err || 0) +
-              ' · 降级 ' + (m.degraded || 0) + ' · ' + lat + '</span></div>';
-          }});
-        }}
-        html += '<details class="agg-vm-detail">' +
-          '<summary><span class="agg-dot ok"></span>' + escHtml(vmId) +
-          '<span class="agg-vm-sum">' + memberKeys.length + ' 成员 · ' + mTotal + ' 请求 · 成功 ' + mOk +
-          ' · 失败 ' + mErr + ' · 降级 ' + mDeg + '</span>' +
-          '<span class="agg-arrow">▼</span></summary>' +
-          '<div class="agg-vm-body">' + bodyHtml + '</div></details>';
+    var vmIds = Object.keys(cfg);
+    var vmRowHtml = '';
+    var i = 0;
+    vmIds.forEach(function(vmId) {{
+      i++;
+      var cfgVm = cfg[vmId] || {{}};
+      var defPool = cfgVm.defaultPool || [];
+      var fbPool = cfgVm.fallbackPool || [];
+      var membersStats = vms[vmId] || {{}};
+      var totReq=0, totOk=0, totErr=0, totDeg=0;
+      Object.keys(membersStats).forEach(function(mk){{
+        var m = membersStats[mk] || {{}};
+        totReq += m.requests||0; totOk += m.ok||0; totErr += m.err||0; totDeg += m.degraded||0;
       }});
+      var hasTraf = totReq > 0;
+      var rate = hasTraf ? (totOk/totReq*100).toFixed(1) + '%' : '—';
+      vmRowHtml += '<tr data-vmid="' + escHtml(vmId) + '" onclick="togglePoolDetail(this)" style="cursor:pointer;" title="点击展开池详情">' +
+        '<td class="num">' + i + '</td>' +
+        '<td class="mid"><code>' + escHtml(vmId) + '</code></td>' +
+        '<td class="name">默认池 ' + defPool.length + ' · 降级池 ' + fbPool.length + '</td>' +
+        '<td class="mstat">' + (hasTraf?totReq:'—') + '</td>' +
+        '<td class="mstat">' + rate + '</td>' +
+        '<td class="mstat err">' + (hasTraf?totErr:'—') + '</td>' +
+        '<td class="mstat warn">' + (hasTraf?totDeg:'—') + '</td>' +
+        '</tr>';
+    }});
+    if (vmIds.length === 0) {{
+      html += '<div class="no-models">(暂无虚拟模型配置)</div>';
+    }} else {{
+      html += '<table class="model-table"><thead><tr>' +
+        '<th>#</th><th>模型 ID</th><th>名称</th><th>请求</th><th>成功率</th><th>错误</th><th>降级</th>' +
+        '</tr></thead><tbody>' + vmRowHtml + '</tbody></table>';
     }}
+    // ── 池详情折叠：每个 vm 一个 details（默认收起，点击主表行 toggle）──
+    vmIds.forEach(function(vmId) {{
+      var cfgVm = cfg[vmId] || {{}};
+      var defPool = cfgVm.defaultPool || [];
+      var fbPool = cfgVm.fallbackPool || [];
+      var membersStats = vms[vmId] || {{}};
+      function renderPool(pool, label) {{
+        if (pool.length === 0) return '<div class="no-models">(' + label + ' 为空)</div>';
+        var rows = '';
+        for (var j=0; j<pool.length; j++) {{
+          var p = pool[j] || {{}};
+          var port = p.port;
+          var model = p.model || '';
+          var w = p.weight;
+          var mk = port + ':' + model;
+          var ms = membersStats[mk] || {{}};
+          var req = ms.requests || 0;
+          var ok = ms.ok || 0;
+          var err = ms.err || 0;
+          var deg = ms.degraded || 0;
+          var lraw = ms.avg_latency_ms || 0;
+          var hasTraf = req > 0;
+          var rateStr = hasTraf ? (ok/req*100).toFixed(1) + '%' : '—';
+          var latStr = hasTraf ? lraw.toFixed(0) + 'ms' : '—';
+          var wStr = (w === undefined || w === null) ? '—' : String(w);
+          rows += '<tr>' +
+            '<td class="num">' + (j+1) + '</td>' +
+            '<td class="mid"><code>:' + port + '</code> · <code>' + escHtml(model) + '</code></td>' +
+            '<td class="mstat">' + wStr + '</td>' +
+            '<td class="mstat">' + (hasTraf?req:'—') + '</td>' +
+            '<td class="mstat">' + rateStr + '</td>' +
+            '<td class="mstat err">' + (hasTraf?err:'—') + '</td>' +
+            '<td class="mstat warn">' + (hasTraf?deg:'—') + '</td>' +
+            '<td class="mstat">' + latStr + '</td>' +
+            '</tr>';
+        }}
+        return '<div class="agg-pool-block"><div class="agg-vm-head">' + label + '（' + pool.length + ' 成员）</div>' +
+          '<table class="model-table"><thead><tr>' +
+          '<th>#</th><th>端口 · 模型</th><th>权重</th><th>请求</th><th>成功率</th><th>错误</th><th>降级</th><th>延迟</th>' +
+          '</tr></thead><tbody>' + rows + '</tbody></table></div>';
+      }}
+      html += '<details class="agg-vm-detail" id="pool-' + escHtml(vmId) + '">' +
+        '<summary><span class="agg-vm-head" style="margin:0; font-size:12.5px;">📦 ' + escHtml(vmId) + ' · ' + defPool.length + ' 默认 + ' + fbPool.length + ' 降级</span></summary>' +
+        '<div class="agg-vm-body">' +
+        renderPool(defPool, '默认池') +
+        renderPool(fbPool, '降级池') +
+        '</div></details>';
+    }});
+    // ── 熔断状态区（保留）──
     var brks = r.breakers || {{}};
     var brkKeys = Object.keys(brks);
     html += '<div class="agg-vm"><div class="agg-vm-head">熔断状态</div>';
@@ -8411,6 +8484,11 @@ async function loadAggregateStatus() {{
     }}
     html += '</div>';
     el.innerHTML = html;
+    // 恢复用户展开的池详情（10s 刷新重写 innerHTML 后 open 状态会丢失）
+    openIds.forEach(function(id){{
+      var d = document.getElementById(id);
+      if (d) d.open = true;
+    }});
   }} catch (e) {{
     el.innerHTML = '<div class="cs-err">加载失败: ' + e + '</div>';
   }}

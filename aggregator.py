@@ -99,6 +99,7 @@ class AggregatorEngine:
         self._quota_patterns: list[re.Pattern] = []
         self._session_ttl: float = 3600.0
         self._probe_interval: float = 300.0
+        self._started_at: float = self._clock()
         self.reload(target)
 
     @classmethod
@@ -411,8 +412,11 @@ class AggregatorEngine:
                 if s is not None:
                     members_stats[f"{m.port}:{m.model}"] = s.as_dict()
             per_vm[vm_id] = members_stats
+        uptime_seconds = self._clock() - self._started_at
         return {
             "virtual_models": per_vm,
             "session": self.session_stats(),
             "breakers": {port: {"state": b.state, "reason": b.reason} for port, b in self._breakers.items()},
+            "started_at": self._started_at,
+            "uptime_seconds": uptime_seconds,
         }
