@@ -16,7 +16,7 @@
       "models": [
         {
           "id": "claude-sonnet-4.6",
-          "enabled": true
+          "enabled": false
         },
         {
           "id": "claude-sonnet-5",
@@ -48,7 +48,7 @@
         },
         {
           "id": "kimi-k2.7-code",
-          "enabled": true
+          "enabled": false
         },
         {
           "id": "mai-code-1-flash-picker",
@@ -96,7 +96,7 @@
         },
         {
           "id": "gpt-4o-mini",
-          "enabled": false
+          "enabled": true
         },
         {
           "id": "text-embedding-ada-002",
@@ -2540,7 +2540,7 @@
         },
         {
           "id": "kimi-k3",
-          "enabled": false
+          "enabled": true
         },
         {
           "id": "kimi-k2.7-code",
@@ -2628,6 +2628,66 @@
         }
       ],
       "enabled": true
+    },
+    {
+      "label": "aggregator",
+      "listenPort": 8080,
+      "category": "aggregate",
+      "handler": "aggregator",
+      "targetHost": "",
+      "targetPort": 0,
+      "targetProtocol": "http",
+      "routePrefix": "",
+      "enabled": true,
+      "name": "聚合网关",
+      "poolDefaults": {
+        "defaultRetries": 2,
+        "fallbackRetries": 1,
+        "sessionAffinityTtlSeconds": 3600,
+        "probeIntervalSeconds": 300,
+        "weight": 1
+      },
+      "quotaErrorPatterns": [
+        "insufficient credit",
+        "quota exceeded",
+        "credits exhausted",
+        "余额不足",
+        "积分不足",
+        "配额不足",
+        "resource exhausted"
+      ],
+      "virtualModels": {
+        "agg:sonnet": {
+          "defaultPool": [
+            {"port": 8082, "model": "claude-sonnet-5", "weight": 3},
+            {"port": 8084, "model": "deepseek-v4-pro", "weight": 2},
+            {"port": 8090, "model": "openrouter/auto"}
+          ],
+          "fallbackPool": [
+            {"port": 8094, "model": "gpt-5.6-luna"}
+          ],
+          "defaultRetries": 3,
+          "fallbackRetries": 1
+        },
+        "agg:opus": {
+          "defaultPool": [
+            {"port": 8082, "model": "claude-sonnet-5"},
+            {"port": 8084, "model": "deepseek-v4-pro"}
+          ],
+          "fallbackPool": [],
+          "defaultRetries": 2,
+          "fallbackRetries": 1
+        },
+        "agg:haiku": {
+          "defaultPool": [
+            {"port": 8082, "model": "claude-haiku-4.5"},
+            {"port": 8084, "model": "glm-5.1"}
+          ],
+          "fallbackPool": [
+            {"port": 8093, "model": "claude-haiku-4-5"}
+          ]
+        }
+      }
     }
   ]
 }

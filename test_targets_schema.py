@@ -99,6 +99,73 @@ def test_validate_clean_config_passes():
     assert errors == [], f"合法配置不应有错误，实际: {errors}"
 
 
+# ─── 聚合网关（aggregator）校验 ───
+def test_validate_aggregator_target():
+    """合法聚合 target：无 targetHost + 有效 virtualModels → 校验通过。"""
+    cfg = {"anthropicForwardPort": 8082, "targets": [
+        {"label": "aggregator", "listenPort": 8080, "category": "aggregate", "handler": "aggregator",
+         "enabled": True,
+         "poolDefaults": {"defaultRetries": 2, "fallbackRetries": 1, "sessionAffinityTtlSeconds": 3600, "probeIntervalSeconds": 300},
+         "quotaErrorPatterns": ["insufficient credit", "quota exceeded", "余额不足"],
+         "virtualModels": {
+             "agg:sonnet": {"defaultPool": [{"port": 8082, "model": "claude-sonnet-5", "weight": 3}, {"port": 8084, "model": "deepseek-v4-pro"}],
+                            "fallbackPool": [{"port": 8090, "model": "openrouter/auto"}], "defaultRetries": 3, "fallbackRetries": 1},
+             "agg:haiku": {"defaultPool": [{"port": 8082, "model": "claude-haiku-4.5"}], "fallbackPool": []}
+         }}
+    ]}
+    errors = config_store.validate_targets(cfg)
+    assert errors == [], f"合法聚合配置不应有错误，实际: {errors}"
+
+
+def test_validate_aggregator_missing_virtual_models():
+    """聚合 target 缺 virtualModels → 报错（含 label）。"""
+    cfg = {"anthropicForwardPort": 8082, "targets": [
+        {"label": "aggregator", "listenPort": 8080, "category": "aggregate", "handler": "aggregator"},
+    ]}
+    errors = config_store.validate_targets(cfg)
+    assert any("aggregator" in e and "virtualModels" in e for e in errors), f"应报缺少 virtualModels，实际: {errors}"
+
+
+def test_validate_aggregator_empty_virtual_models():
+    """聚合 target 的 virtualModels 为空 dict → 报错。"""
+    cfg = {"anthropicForwardPort": 8082, "targets": [
+        {"label": "aggregator", "listenPort": 8080, "category": "aggregate", "handler": "aggregator",
+         "virtualModels": {}},
+    ]}
+    errors = config_store.validate_targets(cfg)
+    assert any("aggregator" in e and "virtualModels" in e for e in errors), f"应报空 virtualModels，实际: {errors}"
+
+
+def test_validate_aggregator_empty_default_pool():
+    """虚拟模型条目 defaultPool 为空 list → 报错（含虚拟模型 id）。"""
+    cfg = {"anthropicForwardPort": 8082, "targets": [
+        {"label": "aggregator", "listenPort": 8080, "category": "aggregate", "handler": "aggregator",
+         "virtualModels": {"agg:sonnet": {"defaultPool": []}}},
+    ]}
+    errors = config_store.validate_targets(cfg)
+    assert any("agg:sonnet" in e and "defaultPool" in e for e in errors), f"应报 defaultPool 为空，实际: {errors}"
+
+
+def test_validate_aggregator_bad_pool_member():
+    """池成员缺 port/model → 报错。"""
+    cfg = {"anthropicForwardPort": 8082, "targets": [
+        {"label": "aggregator", "listenPort": 8080, "category": "aggregate", "handler": "aggregator",
+         "virtualModels": {"agg:sonnet": {"defaultPool": [{"port": 8082}]}}},
+    ]}
+    errors = config_store.validate_targets(cfg)
+    assert any("agg:sonnet" in e and "model" in e for e in errors), f"应报成员缺 model，实际: {errors}"
+
+
+def test_validate_aggregator_bad_weight():
+    """池成员 weight 为负数 → 报错。"""
+    cfg = {"anthropicForwardPort": 8082, "targets": [
+        {"label": "aggregator", "listenPort": 8080, "category": "aggregate", "handler": "aggregator",
+         "virtualModels": {"agg:sonnet": {"defaultPool": [{"port": 8082, "model": "m", "weight": -1}]}}},
+    ]}
+    errors = config_store.validate_targets(cfg)
+    assert any("agg:sonnet" in e and "weight" in e for e in errors), f"应报 weight 非法，实际: {errors}"
+
+
 # ─── secrets 读写与打码 ───
 def test_secrets_roundtrip():
     with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:

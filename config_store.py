@@ -14,8 +14,8 @@ logger = logging.getLogger("config_store")
 TARGETS_PATH = Path(__file__).parent / "targets.json"
 SECRETS_PATH = Path(__file__).parent / "secrets.json"
 
-VALID_CATEGORIES = ("crack", "free", "paid")
-VALID_HANDLERS = ("passthrough", "copilot", "qclaw", "gemini-native", "trae-work")
+VALID_CATEGORIES = ("crack", "free", "paid", "aggregate")
+VALID_HANDLERS = ("passthrough", "copilot", "qclaw", "gemini-native", "trae-work", "aggregator")
 
 _REQUIRED_FIELDS = ("label", "listenPort", "category", "handler", "targetHost")
 
@@ -83,6 +83,8 @@ def validate_targets(cfg: dict) -> list:
         disabled = t.get("enabled") is False
         if not disabled:
             for field in _REQUIRED_FIELDS:
+                if field == "targetHost" and t.get("handler") == "aggregator":
+                    continue  # 聚合 target 无真实上游 host，仅由 virtualModels 池定义
                 if not t.get(field):
                     errors.append(f"target '{label}' 缺少必需字段: {field}")
             if t.get("category") not in VALID_CATEGORIES:
@@ -91,6 +93,8 @@ def validate_targets(cfg: dict) -> list:
                 errors.append(f"target '{label}' handler 非法: {t.get('handler')}（合法: {VALID_HANDLERS}）")
             if t.get("category") == "crack" and not t.get("crackTool"):
                 errors.append(f"crack target '{label}' 缺少 crackTool")
+            if t.get("handler") == "aggregator":
+                _validate_aggregator_target(t, label, errors)
         if label in labels:
             errors.append(f"重复 label: '{label}'")
         labels[label] = True
@@ -99,6 +103,63 @@ def validate_targets(cfg: dict) -> list:
             errors.append(f"端口 {port} 被多个 target 占用 ({ports[port]}, {label})")
         ports[port] = label
     return errors
+
+
+def _validate_aggregator_target(t: dict, label: str, errors: list) -> None:
+    """校验聚合网关 target：virtualModels / poolDefaults / quotaErrorPatterns。"""
+    vm = t.get("virtualModels")
+    if not isinstance(vm, dict) or not vm:
+        errors.append(f"aggregator target '{label}' 缺少 virtualModels")
+        return
+    for vmid, entry in vm.items():
+        if not isinstance(entry, dict):
+            errors.append(f"aggregator target '{label}' 虚拟模型 '{vmid}' 配置必须为对象")
+            continue
+        default_pool = entry.get("defaultPool")
+        if not isinstance(default_pool, list) or not default_pool:
+            errors.append(f"aggregator target '{label}' 虚拟模型 '{vmid}' 缺少非空 defaultPool")
+        else:
+            for i, m in enumerate(default_pool):
+                _validate_pool_member(label, vmid, "defaultPool", i, m, errors)
+        fallback_pool = entry.get("fallbackPool")
+        if fallback_pool is not None and not isinstance(fallback_pool, list):
+            errors.append(f"aggregator target '{label}' 虚拟模型 '{vmid}' 的 fallbackPool 必须为列表")
+        elif isinstance(fallback_pool, list):
+            for i, m in enumerate(fallback_pool):
+                _validate_pool_member(label, vmid, "fallbackPool", i, m, errors)
+        for key in ("defaultRetries", "fallbackRetries"):
+            r = entry.get(key)
+            if r is not None and (isinstance(r, bool) or not isinstance(r, int) or r < 0):
+                errors.append(f"aggregator target '{label}' 虚拟模型 '{vmid}' 的 {key} 必须为非负整数")
+    pd = t.get("poolDefaults")
+    if pd is not None:
+        if not isinstance(pd, dict):
+            errors.append(f"aggregator target '{label}' 的 poolDefaults 必须为对象")
+        else:
+            for key in ("defaultRetries", "fallbackRetries", "sessionAffinityTtlSeconds",
+                        "probeIntervalSeconds", "weight"):
+                v = pd.get(key)
+                if v is not None and (isinstance(v, bool) or not isinstance(v, (int, float)) or v < 0):
+                    errors.append(f"aggregator target '{label}' 的 poolDefaults.{key} 必须为非负数字")
+    qep = t.get("quotaErrorPatterns")
+    if qep is not None and not isinstance(qep, list):
+        errors.append(f"aggregator target '{label}' 的 quotaErrorPatterns 必须为列表")
+
+
+def _validate_pool_member(label: str, vmid: str, pool_key: str, idx: int, m: object, errors: list) -> None:
+    """校验池成员：必须为 dict 且含 port(int)/model(str)；weight 可选，若非 None 必须为非负数字。"""
+    if not isinstance(m, dict):
+        errors.append(f"aggregator target '{label}' 虚拟模型 '{vmid}' {pool_key}[{idx}] 必须为对象")
+        return
+    port = m.get("port")
+    if isinstance(port, bool) or not isinstance(port, int):
+        errors.append(f"aggregator target '{label}' 虚拟模型 '{vmid}' {pool_key}[{idx}] 的 port 必须为整数")
+    model = m.get("model")
+    if not isinstance(model, str) or not model:
+        errors.append(f"aggregator target '{label}' 虚拟模型 '{vmid}' {pool_key}[{idx}] 的 model 必须为非空字符串")
+    weight = m.get("weight")
+    if weight is not None and (isinstance(weight, bool) or not isinstance(weight, (int, float)) or weight < 0):
+        errors.append(f"aggregator target '{label}' 虚拟模型 '{vmid}' {pool_key}[{idx}] 的 weight 必须为非负数字")
 
 
 def save_targets(cfg: dict, path: Path = TARGETS_PATH) -> None:
