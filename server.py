@@ -6532,23 +6532,6 @@ DASHBOARD_STYLE = """
   .mrow-add-btn:hover { filter: brightness(1.1); }
   .mrow-add-btn:active { transform: scale(0.98); }
 
-  /* ── 模型映射编辑器（🔀 按钮 + modal 行式表格）── */
-  .mm-open-btn { border-radius: var(--radius-sm); padding: 5px 12px; cursor: pointer; font-size: 12.5px; font-weight: 600; white-space: nowrap; transition: background 0.2s, border-color 0.2s, transform 0.15s, box-shadow 0.2s; background: transparent; color: var(--brand-cyan); border: 1px solid rgba(34,211,238,0.28); }
-  .mm-open-btn:hover { background: rgba(34,211,238,0.10); border-color: rgba(34,211,238,0.5); transform: translateY(-1px); }
-  .mm-open-btn:active { transform: scale(0.98); }
-  .mm-hint { font-size: 11.5px; color: var(--text-tertiary); margin: 2px 0 10px; line-height: 1.5; }
-  .mm-row { display: flex; align-items: center; gap: 8px; padding: 7px 0; border-bottom: 1px solid #1f2233; }
-  .mm-row:last-child { border-bottom: none; }
-  .mm-key, .mm-val { flex: 1; min-width: 0; background: var(--bg-inset); border: 1px solid var(--border); border-radius: var(--radius-sm); color: var(--text-primary); padding: 7px 10px; font-size: 12.5px; font-family: var(--font-mono); transition: border-color 0.2s, box-shadow 0.2s; }
-  .mm-key:focus, .mm-val:focus { outline: none; border-color: var(--brand-cyan); box-shadow: 0 0 0 2px rgba(34,211,238,0.15); }
-  .mm-arrow { color: var(--text-tertiary); font-size: 12px; flex-shrink: 0; }
-  .mm-del { background: none; border: none; color: var(--text-tertiary); cursor: pointer; font-size: 16px; line-height: 1; padding: 4px 8px; border-radius: 6px; flex-shrink: 0; transition: color 0.2s, background 0.2s; }
-  .mm-del:hover { color: var(--danger); background: rgba(248,113,113,0.12); }
-  .mm-add-row { margin-top: 10px; }
-  .mm-add-btn { border-radius: var(--radius-sm); padding: 6px 14px; cursor: pointer; font-size: 12.5px; font-weight: 600; white-space: nowrap; transition: background 0.2s, border-color 0.2s, transform 0.15s; background: transparent; color: var(--brand-cyan); border: 1px dashed rgba(34,211,238,0.35); }
-  .mm-add-btn:hover { background: rgba(34,211,238,0.08); border-color: rgba(34,211,238,0.6); transform: translateY(-1px); }
-  .mm-add-btn:active { transform: scale(0.98); }
-
   /* ── 聚合网关 / 转发配置编辑 modal ── */
   .modal-wide { max-width: 860px; }
   .agg-section { margin-bottom: 16px; }
@@ -6997,7 +6980,7 @@ def _model_details_html(models, model_stats=None, label=None, edit_mode=False, c
 def _build_card_html(name, note, kind_badge, status_badge, status_badge_class,
                      kv_items, stats_detail=None, models=None, model_stats=None, description="",
                      accent_class="", raw_html="", label=None, port=None, meta_badges=None,
-                     can_prune=False, mapping_label=None, col_429="429"):
+                     can_prune=False, col_429="429"):
     """统一卡片渲染（手风琴折叠）：透传目标和定制服务用同一套视觉风格。
 
     stats_detail: dict with total/ok/err/translated/success_rate/uptime
@@ -7006,8 +6989,6 @@ def _build_card_html(name, note, kind_badge, status_badge, status_badge_class,
     port: 端口号，显示在卡片头
     meta_badges: 额外的分类标签列表 [("文本", "样式类"), ...]，如 [("破解", "b-crack"), ("免费", "b-free")...]
     can_prune: 上游是否支持 /models 清理（copilot 系 true；codebuddy/qclaw/trae-work false 不显示清理按钮）
-    mapping_label: 模型映射编辑按钮指向的 target label（8081 卡指向 anthropicForwardPort 对应 target）；
-                   None 时不显示"🔀 模型映射"按钮
     """
     # ── 卡片头 badges（分类 badge 带图标点 + 渐变底；状态 badge 带状态点）──
     kind_badge_class = {"破解": "b-crack", "免费": "b-free", "收费": "b-paid"}.get(str(kind_badge), "b-generic")
@@ -7088,16 +7069,6 @@ def _build_card_html(name, note, kind_badge, status_badge, status_badge_class,
         )
 
     model_html = _model_details_html(models, model_stats, label, edit_mode=False, can_prune=can_prune, col_429=col_429) if models is not None else ""
-    # 模型映射编辑按钮（模型区下方独立操作行；8081 卡等 label=None 的场景也可见）
-    mm_btn = ""
-    if mapping_label:
-        mm_btn = (
-            f'<div class="model-ops">'
-            f'  <button class="mm-open-btn" data-label="{_html_escape(mapping_label)}" '
-            f'    onclick="openMappingEditor(this)" title="编辑该 target 的 modelMapping（请求模型名 → 转发目标模型，可指向聚合模型 agg:xxx）">'
-            f'    🔀 模型映射</button>'
-            f'</div>'
-        )
     card_class = f'card {accent_class}'.strip()
 
     return f"""<div class="{card_class}" data-label="{_html_escape(label or '')}">
@@ -7107,7 +7078,6 @@ def _build_card_html(name, note, kind_badge, status_badge, status_badge_class,
   {f'<div class="card-desc">{_html_escape(description)}</div>' if description else ""}
   {stats_html}
   {f'<div class="model-section" data-label="{_html_escape(label or "")}">{model_html}</div>' if model_html else ""}
-  {mm_btn}
   {raw_html}
   </div>
 </div>"""
@@ -7771,12 +7741,11 @@ async def dashboard():
         port=8081,
         raw_html=(
             '<div class="model-ops">'
-            '  <button class="model-edit-toggle" onclick="openForwardConfigEditor(this)" '
-            '    title="编辑 8081 Anthropic 转发目标（默认端口 + 按模型映射）">✏️ 转发配置</button>'
+            '  <button class="model-edit-toggle" onclick="openModelsEditor(this)" '
+            '    title="编辑模型定义（name/别名 → 下游端口+真实模型，可指向聚合虚拟模型 agg:xxx）">✏️ 模型定义</button>'
             '</div>'
         ),
         meta_badges=[("Forward Gateway", "b-meta-agg"), ("Anthropic", "b-meta-normal")],
-        mapping_label=_forward_label,
     ))
 
     # ── 动态 target 卡片（targets.json 驱动）──
@@ -7899,8 +7868,6 @@ async def dashboard():
             port=port,
             meta_badges=meta_badges,
             can_prune=(t.get("handler") == "copilot"),
-            # 模型映射（openMappingEditor）是 8081 转发网关专属，普通 target 卡片不显示
-            mapping_label=None,
         )
         if category == "crack":
             crack_cards.append(card)
@@ -7992,18 +7959,18 @@ async def dashboard():
     </div>
   </div>
 
-  <!-- 模型映射编辑 modal（modelMapping：请求模型名 → 转发目标模型） -->
-  <div class="modal-overlay" id="mm-modal" role="dialog" aria-modal="true" aria-label="编辑模型映射">
+  <!-- 模型定义编辑 modal（全局 models[]：name/aliases/target port+model） -->
+  <div class="modal-overlay" id="models-modal" role="dialog" aria-modal="true" aria-label="编辑模型定义">
     <div class="modal">
       <div class="modal-head">
-        <h3 id="mm-modal-title">模型映射</h3>
-        <button class="modal-close" onclick="closeMappingEditor()" aria-label="关闭">×</button>
+        <h3 id="models-modal-title">模型定义</h3>
+        <button class="modal-close" onclick="closeModelsEditor()" aria-label="关闭">×</button>
       </div>
-      <div class="modal-body" id="mm-modal-body"></div>
+      <div class="modal-body" id="models-modal-body"></div>
       <div class="modal-foot">
-        <span class="modal-msg" id="mm-modal-msg"></span>
-        <button class="modal-btn" onclick="closeMappingEditor()">取消</button>
-        <button class="modal-btn modal-btn-primary" onclick="saveMappingEditor(this)">保存</button>
+        <span class="modal-msg" id="models-modal-msg"></span>
+        <button class="modal-btn" onclick="closeModelsEditor()">取消</button>
+        <button class="modal-btn modal-btn-primary" onclick="saveModelsEditor(this)">保存</button>
       </div>
     </div>
   </div>
@@ -8024,21 +7991,7 @@ async def dashboard():
     </div>
   </div>
 
-  <!-- 8081 转发配置编辑 modal -->
-  <div class="modal-overlay" id="fw-modal" role="dialog" aria-modal="true" aria-label="编辑转发配置">
-    <div class="modal">
-      <div class="modal-head">
-        <h3 id="fw-modal-title">8081 转发配置</h3>
-        <button class="modal-close" onclick="closeForwardConfigEditor()" aria-label="关闭">×</button>
-      </div>
-      <div class="modal-body" id="fw-modal-body"></div>
-      <div class="modal-foot">
-        <span class="modal-msg" id="fw-modal-msg"></span>
-        <button class="modal-btn" onclick="closeForwardConfigEditor()">取消</button>
-        <button class="modal-btn modal-btn-primary" onclick="saveForwardConfig(this)">保存</button>
-      </div>
-    </div>
-  </div>
+  
 <script>
 // ── 手风琴交互（互斥，任一时刻只展开一个）──
 (function() {{
@@ -8298,129 +8251,132 @@ function addModelRow() {{
   bindModelEvents();
 }}
 
-// ── 模型映射编辑 modal（modelMapping 行式编辑）──
-var mmLabel = '';
-
-async function openMappingEditor(btn) {{
-  mmLabel = btn.dataset.label;
-  var overlay = document.getElementById('mm-modal');
-  var body = document.getElementById('mm-modal-body');
-  var title = document.getElementById('mm-modal-title');
-  var msg = document.getElementById('mm-modal-msg');
+// ── 模型定义编辑 modal（全局 models[]：name/aliases/target port+model）──
+async function openModelsEditor(btn) {{
+  var overlay = document.getElementById('models-modal');
+  var body = document.getElementById('models-modal-body');
+  var title = document.getElementById('models-modal-title');
+  var msg = document.getElementById('models-modal-msg');
   if (!overlay || !body) return;
-  title.textContent = '模型映射 — ' + mmLabel;
+  title.textContent = '模型定义 — 8081 转发/别名配置';
   msg.textContent = '';
   body.innerHTML = '<div class="no-models">加载中...</div>';
   overlay.classList.add('open');
   try {{
-    var resp = await fetch('/api/targets/' + encodeURIComponent(mmLabel) + '/mapping');
+    var resp = await fetch('/api/models');
     var r = await resp.json();
     if (!resp.ok) {{
       body.innerHTML = '<div class="no-models">加载失败: ' + (r.detail || JSON.stringify(r)) + '</div>';
       return;
     }}
-    body.innerHTML = buildMappingEditorHtml(r);
+    body.innerHTML = buildModelsEditorHtml(r);
   }} catch (e) {{
     body.innerHTML = '<div class="no-models">加载异常: ' + e + '</div>';
   }}
 }}
 
-function buildMappingEditorHtml(r) {{
-  var html = '<div class="mm-hint">键 = 请求模型名/别名（如 opus / sonnet / haiku），值 = 转发目标模型。' +
-    '值以 agg: 开头时请求将路由到 8080 聚合网关。键或值为空的行不保存；全部删除 = 清空映射。</div>';
-  var mm = r.modelMapping || {{}};
-  var keys = Object.keys(mm);
-  if (keys.length === 0) {{
-    html += mappingRowHtml('', '');
+function buildModelsEditorHtml(r) {{
+  var models = r.models || [];
+  var html = '<div class="mm-hint">模型定义：name 为主模型名（请求可直接用它），aliases 为额外别名（逗号分隔），target 指定最终下游端口与真实模型（可填聚合虚拟模型 agg:xxx）。未匹配任何定义的模型名将走 modelDefaults.defaultPort 原样透传。</div>';
+  html += '<div class="agg-section"><div class="agg-section-title">默认转发端口</div><div class="agg-fields">' +
+    '<label class="agg-field">' +
+    '  <span class="agg-label">modelDefaults.defaultPort（未命中定义的兜底端口）</span>' +
+    '  <input type="number" class="agg-input md-default-port" value="' + escHtml(String((r.modelDefaults || {{}}).defaultPort)) + '" aria-label="默认转发端口">' +
+    '</label>' +
+    '</div></div>';
+  html += '<div class="agg-section"><div class="agg-section-title">模型定义列表</div>';
+  if (models.length === 0) {{
+    html += modelsRowHtml('', '', '', '');
   }} else {{
-    keys.forEach(function(k) {{ html += mappingRowHtml(k, mm[k]); }});
+    models.forEach(function(m) {{
+      var aliases = (m.aliases || []).join(', ');
+      var t = m.target || {{}};
+      html += modelsRowHtml(m.name, aliases, t.port, t.model);
+    }});
   }}
-  // 值列可输入下拉：本 target 模型 + 聚合虚拟模型（agg:xxx）+ 自由输入
-  var opts = (r.models || []).concat(r.aggModels || []);
-  html += '<datalist id="mm-value-list">';
-  opts.forEach(function(m) {{ html += '<option value="' + escHtml(m) + '"></option>'; }});
-  html += '</datalist>';
-  html += '<div class="mm-add-row"><button class="mm-add-btn" onclick="addMappingRow()">+ 添加映射行</button></div>';
+  html += '<div class="agg-add-row"><button class="mm-add-btn" onclick="addModelsRow()">+ 添加模型</button></div></div>';
   return html;
 }}
 
-function mappingRowHtml(k, v) {{
+function modelsRowHtml(name, aliases, port, model) {{
+  var n = (name === undefined || name === null) ? '' : escHtml(String(name));
+  var a = (aliases === undefined || aliases === null) ? '' : escHtml(String(aliases));
+  var p = (port === undefined || port === null) ? '' : escHtml(String(port));
+  var m = (model === undefined || model === null) ? '' : escHtml(String(model));
   return '<div class="mm-row">' +
-    '<input type="text" class="mm-key" value="' + escHtml(k) + '" placeholder="请求模型名（如 haiku）" aria-label="请求模型名">' +
-    '<span class="mm-arrow">→</span>' +
-    '<input type="text" class="mm-val" value="' + escHtml(v) + '" list="mm-value-list" placeholder="转发目标模型（可填 agg:xxx）" aria-label="转发目标模型">' +
-    '<button class="mm-del" onclick="removeMappingRow(this)" title="删除此行">×</button>' +
+    '<input type="text" class="agg-input md-name" value="' + n + '" placeholder="模型名（如 sonnet）" aria-label="模型名">' +
+    '<input type="text" class="agg-input md-aliases" value="' + a + '" placeholder="别名，逗号分隔" aria-label="别名">' +
+    '<input type="number" class="agg-input md-port" value="' + p + '" placeholder="下游端口" aria-label="下游端口">' +
+    '<input type="text" class="agg-input md-model" value="' + m + '" placeholder="真实模型（可 agg:xxx）" aria-label="真实模型">' +
+    '<button class="mm-del" onclick="removeModelsRow(this)" title="删除此行">×</button>' +
     '</div>';
 }}
 
-function addMappingRow() {{
-  var body = document.getElementById('mm-modal-body');
+function addModelsRow() {{
+  var body = document.getElementById('models-modal-body');
   if (!body) return;
-  var addRow = body.querySelector('.mm-add-row');
-  var html = mappingRowHtml('', '');
-  if (addRow) {{
-    addRow.insertAdjacentHTML('beforebegin', html);
-  }} else {{
-    body.insertAdjacentHTML('beforeend', html);
-  }}
-  var keys = body.querySelectorAll('.mm-key');
-  if (keys.length) keys[keys.length - 1].focus();
+  var addRow = body.querySelector('.agg-add-row');
+  var html = modelsRowHtml('', '', '', '');
+  if (addRow) {{ addRow.insertAdjacentHTML('beforebegin', html); }}
+  else {{ body.insertAdjacentHTML('beforeend', html); }}
 }}
 
-function removeMappingRow(btn) {{
+function removeModelsRow(btn) {{
   var row = btn.closest('.mm-row');
   if (row) row.remove();
 }}
 
-async function saveMappingEditor(btn) {{
-  var body = document.getElementById('mm-modal-body');
-  var msg = document.getElementById('mm-modal-msg');
-  if (!body || !msg || !mmLabel) return;
-  var mapping = {{}};
-  body.querySelectorAll('.mm-row').forEach(function(row) {{
-    var kEl = row.querySelector('.mm-key');
-    var vEl = row.querySelector('.mm-val');
-    var k = (kEl ? kEl.value : '').trim();
-    var v = (vEl ? vEl.value : '').trim();
-    if (k && v) mapping[k] = v;
-  }});
-  btn.disabled = true; btn.textContent = '保存中...';
-  try {{
-    var resp = await fetch('/api/targets/' + encodeURIComponent(mmLabel), {{
-      method: 'PUT', headers: {{'Content-Type': 'application/json'}},
-      body: JSON.stringify({{modelMapping: mapping}}),
-    }});
-    var r = await resp.json();
-    if (resp.ok) {{
-      msg.textContent = '✅ 已保存，热生效';
-      msg.className = 'modal-msg success';
-      setTimeout(function() {{ location.reload(); }}, 800);
-    }} else {{
-      msg.textContent = '❌ 保存失败: ' + JSON.stringify(r.detail || r);
-      msg.className = 'modal-msg danger';
-      btn.disabled = false; btn.textContent = '保存';
-    }}
-  }} catch (e) {{
-    msg.textContent = '❌ 保存异常: ' + e;
-    msg.className = 'modal-msg danger';
-    btn.disabled = false; btn.textContent = '保存';
-  }}
-}}
-
-function closeMappingEditor() {{
-  var overlay = document.getElementById('mm-modal');
+function closeModelsEditor() {{
+  var overlay = document.getElementById('models-modal');
   if (overlay) overlay.classList.remove('open');
 }}
 
-// 点击遮罩关闭映射弹框
-(function() {{
-  var overlay = document.getElementById('mm-modal');
-  if (overlay) {{
-    overlay.addEventListener('click', function(e) {{
-      if (e.target === overlay) overlay.classList.remove('open');
-    }});
+async function saveModelsEditor(btn) {{
+  var body = document.getElementById('models-modal-body');
+  var msg = document.getElementById('models-modal-msg');
+  if (!body || !msg) return;
+  var defaultPortEl = body.querySelector('.md-default-port');
+  var defaultPort = defaultPortEl ? defaultPortEl.value.trim() : '';
+  if (defaultPort === '' || isNaN(Number(defaultPort)) || Number(defaultPort) < 0 || Number(defaultPort) % 1 !== 0) {{
+    msg.textContent = '⚠️ defaultPort 必须为非负整数'; msg.className = 'modal-msg danger';
+    return;
   }}
-}})();
+  var models = [];
+  var bad = false;
+  body.querySelectorAll('.mm-row').forEach(function(row) {{
+    if (bad) return;
+    var nEl = row.querySelector('.md-name');
+    var aEl = row.querySelector('.md-aliases');
+    var pEl = row.querySelector('.md-port');
+    var mEl = row.querySelector('.md-model');
+    var n = (nEl ? nEl.value : '').trim();
+    var a = (aEl ? aEl.value : '').trim();
+    var p = (pEl ? pEl.value : '').trim();
+    var m = (mEl ? mEl.value : '').trim();
+    if (!n && !a && !p && !m) return;
+    if (!n) {{ msg.textContent = '⚠️ 模型名不能为空'; msg.className = 'modal-msg danger'; bad = true; return; }}
+    if (p === '' || isNaN(Number(p)) || Number(p) < 0 || Number(p) % 1 !== 0) {{
+      msg.textContent = '⚠️ 模型 ' + n + ' 的下游端口必须为非负整数'; msg.className = 'modal-msg danger'; bad = true; return;
+    }}
+    if (!m) {{ msg.textContent = '⚠️ 模型 ' + n + ' 的真实模型不能为空'; msg.className = 'modal-msg danger'; bad = true; return; }}
+    var aliases = a ? a.split(',').map(function(x) {{ return x.trim(); }}).filter(function(x) {{ return x; }}) : [];
+    models.push({{name: n, aliases: aliases, target: {{port: Number(p), model: m}}}});
+  }});
+  if (bad) return;
+  var payload = {{models: models, modelDefaults: {{defaultPort: Number(defaultPort)}}}};
+  var resp = await fetch('/api/models', {{
+    method: 'PUT',
+    headers: {{'Content-Type': 'application/json'}},
+    body: JSON.stringify(payload)
+  }});
+  var r = await resp.json();
+  if (!resp.ok) {{
+    msg.textContent = '⚠️ 保存失败: ' + (r.detail || JSON.stringify(r)); msg.className = 'modal-msg danger';
+    return;
+  }}
+  msg.textContent = '✅ 已保存'; msg.className = 'modal-msg success';
+  setTimeout(function() {{ closeModelsEditor(); }}, 800);
+}}
 
 // ── 聚合网关（8080）配置编辑 modal ──
 function aggNumField(key, labelText, val, placeholder) {{
@@ -8755,150 +8711,6 @@ function closeAggConfigEditor() {{
   }}
 }})();
 
-// ── 8081 转发配置编辑 modal ──
-async function openForwardConfigEditor(btn) {{
-  var overlay = document.getElementById('fw-modal');
-  var body = document.getElementById('fw-modal-body');
-  var title = document.getElementById('fw-modal-title');
-  var msg = document.getElementById('fw-modal-msg');
-  if (!overlay || !body) return;
-  title.textContent = '8081 转发配置';
-  msg.textContent = '';
-  body.innerHTML = '<div class="no-models">加载中...</div>';
-  overlay.classList.add('open');
-  try {{
-    var resp = await fetch('/api/anthropic-forward');
-    var r = await resp.json();
-    if (!resp.ok) {{
-      body.innerHTML = '<div class="no-models">加载失败: ' + (r.detail || JSON.stringify(r)) + '</div>';
-      return;
-    }}
-    body.innerHTML = buildForwardConfigHtml(r);
-  }} catch (e) {{
-    body.innerHTML = '<div class="no-models">加载异常: ' + e + '</div>';
-  }}
-}}
-
-function buildForwardConfigHtml(r) {{
-  var html = '<div class="agg-hint">Anthropic 模型名 → 内部转发目标（端口 + 模型名）。' +
-    'defaultPort 为未匹配映射时的默认转发端口；空行不保存。</div>';
-  html += '<div class="agg-section"><div class="agg-section-title">默认转发</div><div class="agg-fields">' +
-    '<label class="agg-field">' +
-    '  <span class="agg-label">defaultPort（默认转发端口）</span>' +
-    '  <input type="number" class="agg-input fw-default-port" value="' + escHtml(String(r.defaultPort)) + '" aria-label="默认转发端口">' +
-    '</label>' +
-    '</div></div>';
-  html += '<div class="agg-section"><div class="agg-section-title">按模型映射 modelMap</div>';
-  var mm = r.modelMap || {{}};
-  var keys = Object.keys(mm);
-  if (keys.length === 0) {{
-    html += forwardRowHtml('', '', '');
-  }} else {{
-    keys.forEach(function(k) {{ html += forwardRowHtml(k, mm[k].port, mm[k].model); }});
-  }}
-  html += '<div class="agg-add-row"><button class="mm-add-btn" onclick="addForwardRow()">+ 添加映射</button></div></div>';
-  return html;
-}}
-
-function forwardRowHtml(name, port, model) {{
-  var n = (name === undefined || name === null) ? '' : escHtml(String(name));
-  var p = (port === undefined || port === null) ? '' : escHtml(String(port));
-  var m = (model === undefined || model === null) ? '' : escHtml(String(model));
-  return '<div class="mm-row">' +
-    '<input type="text" class="agg-input fw-key" value="' + n + '" placeholder="Anthropic 模型名（如 sonnet）" aria-label="Anthropic 模型名">' +
-    '<span class="mm-arrow">→</span>' +
-    '<input type="number" class="agg-input fw-port" value="' + p + '" placeholder="转发端口" aria-label="转发端口">' +
-    '<input type="text" class="agg-input fw-model" value="' + m + '" placeholder="转发模型" aria-label="转发模型">' +
-    '<button class="mm-del" onclick="removeForwardRow(this)" title="删除此行">×</button>' +
-    '</div>';
-}}
-
-function addForwardRow() {{
-  var body = document.getElementById('fw-modal-body');
-  if (!body) return;
-  var addRow = body.querySelector('.agg-add-row');
-  var html = forwardRowHtml('', '', '');
-  if (addRow) {{ addRow.insertAdjacentHTML('beforebegin', html); }}
-  else {{ body.insertAdjacentHTML('beforeend', html); }}
-}}
-
-function removeForwardRow(btn) {{
-  var row = btn.closest('.mm-row');
-  if (row) row.remove();
-}}
-
-async function saveForwardConfig(btn) {{
-  var body = document.getElementById('fw-modal-body');
-  var msg = document.getElementById('fw-modal-msg');
-  if (!body || !msg) return;
-  var defaultPortEl = body.querySelector('.fw-default-port');
-  var defaultPort = defaultPortEl ? defaultPortEl.value.trim() : '';
-  if (defaultPort === '' || isNaN(Number(defaultPort)) || Number(defaultPort) < 0 || Number(defaultPort) % 1 !== 0) {{
-    msg.textContent = '⚠️ defaultPort 必须为非负整数'; msg.className = 'modal-msg danger';
-    return;
-  }}
-  var modelMap = {{}};
-  var bad = false;
-  body.querySelectorAll('.mm-row').forEach(function(row) {{
-    if (bad) return;
-    var kEl = row.querySelector('.fw-key');
-    var pEl = row.querySelector('.fw-port');
-    var mEl = row.querySelector('.fw-model');
-    var k = (kEl ? kEl.value : '').trim();
-    var p = (pEl ? pEl.value : '').trim();
-    var m = (mEl ? mEl.value : '').trim();
-    if (!k && !p && !m) return;  // 空行忽略
-    if (!k) {{
-      msg.textContent = '⚠️ 映射行的 Anthropic 模型名不能为空'; msg.className = 'modal-msg danger';
-      bad = true; return;
-    }}
-    if (p === '' || isNaN(Number(p)) || Number(p) < 0 || Number(p) % 1 !== 0) {{
-      msg.textContent = '⚠️ 映射行 ' + k + ' 的转发端口必须为非负整数'; msg.className = 'modal-msg danger';
-      bad = true; return;
-    }}
-    if (!m) {{
-      msg.textContent = '⚠️ 映射行 ' + k + ' 的转发模型不能为空'; msg.className = 'modal-msg danger';
-      bad = true; return;
-    }}
-    modelMap[k] = {{port: Number(p), model: m}};
-  }});
-  if (bad) return;
-  btn.disabled = true; btn.textContent = '保存中...';
-  try {{
-    var resp = await fetch('/api/anthropic-forward', {{
-      method: 'PUT', headers: {{'Content-Type': 'application/json'}},
-      body: JSON.stringify({{defaultPort: Number(defaultPort), modelMap: modelMap}}),
-    }});
-    var r = await resp.json();
-    if (resp.ok) {{
-      msg.textContent = '✅ 已保存，热生效'; msg.className = 'modal-msg success';
-      btn.textContent = '✅ 已保存'; btn.style.background = '#4ade80';
-      setTimeout(function() {{ location.reload(); }}, 2000);
-    }} else {{
-      var errs = Array.isArray(r.detail) ? r.detail.join('；') : JSON.stringify(r.detail || r);
-      msg.textContent = '❌ 保存失败: ' + errs; msg.className = 'modal-msg danger';
-      btn.disabled = false; btn.textContent = '保存'; btn.style.background = '';
-    }}
-  }} catch (e) {{
-    msg.textContent = '❌ 保存异常: ' + e; msg.className = 'modal-msg danger';
-    btn.disabled = false; btn.textContent = '保存'; btn.style.background = '';
-  }}
-}}
-
-function closeForwardConfigEditor() {{
-  var overlay = document.getElementById('fw-modal');
-  if (overlay) overlay.classList.remove('open');
-}}
-
-// 点击遮罩关闭转发配置弹框
-(function() {{
-  var overlay = document.getElementById('fw-modal');
-  if (overlay) {{
-    overlay.addEventListener('click', function(e) {{
-      if (e.target === overlay) overlay.classList.remove('open');
-    }});
-  }}
-}})();
 
 // ── 破解 token 重试 ──
 async function recrackCard(label, btn) {{
