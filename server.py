@@ -7753,7 +7753,7 @@ async def dashboard():
     _8081_ok = _ANTHROPIC_STATS.get("passthroughOk", 0)
     _8081_err = _ANTHROPIC_STATS.get("passthroughError", 0)
     _8081_rate = round(_8081_ok / _8081_total * 100, 1) if _8081_total > 0 else 100.0
-    # 8081 使用的 modelMapping 即 anthropicForwardPort 对应 target 的映射（翻译后转发到该端口）
+    # 8081 卡片关联的 target：modelDefaults.defaultPort 对应端口（dashboard 映射按钮定位用）
     _forward_target = next((t for t in _TARGETS if t.get("listenPort") == _MODELS_CFG["modelDefaults"].get("defaultPort", 8082)), None)
     _forward_label = _forward_target["label"] if _forward_target else None
     agg_cards.append(_build_card_html(
