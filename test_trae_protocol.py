@@ -117,9 +117,56 @@ dsml_text = ('<｜DSML｜><｜function｜><｜function name｜>get_weather</｜f
              '<｜parameter｜>{"city":"北京"}</｜parameter｜></｜function｜></｜DSML｜>')
 check("DSML 识别", server._looks_like_dsml(dsml_text))
 
+# DSML 变体 4（2026-08-03 实测，Doubao-Seed-Code）：<｜DSML｜invoke name=".."> +
+# <｜DSML｜parameter name="..">，标签属性形态而非独立标签体。曾完全绕过前 3 种解析器
+# （_DSML_LIKE_RE/_DSML_PAIR_RE/_TOOLCALL_XML_RE 全部不匹配），原样透传给客户端。
+dsml_invoke_text = (
+    '<｜DSML｜tool_calls>\n'
+    '<｜DSML｜invoke name="bash">\n'
+    '<｜DSML｜parameter name="command" string="true">ls -la</｜DSML｜parameter>\n'
+    '</｜DSML｜invoke>\n'
+    '</｜DSML｜tool_calls>'
+)
+check("DSML invoke 变体识别", server._looks_like_dsml(dsml_invoke_text))
+tcs_invoke = server._parse_dsml_tool_calls(dsml_invoke_text)
+check("DSML invoke 解析出 1 个", len(tcs_invoke) == 1)
+check("DSML invoke name 正确", tcs_invoke[0]["function"]["name"] == "bash")
+check("DSML invoke arguments 含 command 参数",
+      json.loads(tcs_invoke[0]["function"]["arguments"])["command"] == "ls -la")
+tcs_i, r_i, content_i = server._resolve_trae_text(dsml_invoke_text)
+check("DSML invoke resolve 解析出 tool_calls", len(tcs_i) == 1)
+check("DSML invoke resolve 正文已清洗", content_i == "")
+
+# 多参数场景：一个 invoke 内含多个 parameter（如 edit 工具 oldString/newString）
+dsml_invoke_multi = (
+    '<｜DSML｜tool_calls>\n'
+    '<｜DSML｜invoke name="edit">\n'
+    '<｜DSML｜parameter name="filePath">/a/b.py</｜DSML｜parameter>\n'
+    '<｜DSML｜parameter name="oldString">function foo() { return 1; }</｜DSML｜parameter>\n'
+    '<｜DSML｜parameter name="newString">function foo() { return 2; }</｜DSML｜parameter>\n'
+    '</｜DSML｜invoke>\n'
+    '</｜DSML｜tool_calls>'
+)
+tcs_multi = server._parse_dsml_tool_calls(dsml_invoke_multi)
+check("DSML invoke 多参数解析出 1 个", len(tcs_multi) == 1)
+multi_args = json.loads(tcs_multi[0]["function"]["arguments"])
+check("DSML invoke 多参数含 3 个 key", len(multi_args) == 3)
+check("DSML invoke 多参数嵌套花括号未截断",
+      multi_args["oldString"] == "function foo() { return 1; }")
+
 plain = "这是一个普通回复"
 check("普通文本不误识别", not server._looks_like_dsml(plain))
 check("普通文本解析为空", server._parse_dsml_tool_calls(plain) == [])
+
+# 兜底告警场景（2026-08-03 新增）：模拟未知的"第 5 种变体"——含 DSML 标记特征
+# 但不匹配任何已知解析器格式，_resolve_trae_text 应记录 WARNING 但不抛异常，
+# 且仍按普通文本处理（不吞掉，不中断），保证"未知新变体"能从日志被发现。
+unknown_variant = '<｜DSML｜unknown_wrapper>some content the parser has never seen</｜DSML｜unknown_wrapper>'
+check("未知变体仍判定为疑似 DSML", server._looks_like_dsml(unknown_variant))
+check("未知变体已知解析器解析为空", server._parse_dsml_tool_calls(unknown_variant) == [])
+tcs_u, r_u, content_u = server._resolve_trae_text(unknown_variant)
+check("未知变体 resolve 不抛异常且 tool_calls 为空", tcs_u == [])
+check("未知变体 resolve 原样保留在 content（不吞掉）", "unknown_wrapper" in content_u)
 
 # ─── 4. _trae_chunk_to_openai：新旧格式 ───
 print("[4] output 新旧格式映射")
