@@ -27,10 +27,10 @@ def load_targets(path: Path = TARGETS_PATH) -> dict:
             raw = json.load(f)
     except FileNotFoundError:
         logger.warning(f"targets.json not found: {path}, using empty config")
-        return {"anthropicForwardPort": 8082, "targets": []}
+        return {"targets": [], "modelDefaults": {"defaultPort": 8082}, "models": []}
     except json.JSONDecodeError as e:
         logger.error(f"targets.json invalid JSON: {e}")
-        return {"anthropicForwardPort": 8082, "targets": []}
+        return {"targets": [], "modelDefaults": {"defaultPort": 8082}, "models": []}
 
     if isinstance(raw, list):
         # 旧格式：数组 → 迁移
@@ -45,7 +45,7 @@ def load_targets(path: Path = TARGETS_PATH) -> dict:
                 "isFree": t.get("isFree", category == "free"),
                 "enabled": t.get("enabled", True),
             })
-        cfg = {"anthropicForwardPort": 8082, "targets": migrated}
+        cfg = {"targets": migrated, "modelDefaults": {"defaultPort": 8082}, "models": []}
         try:
             save_targets(cfg, path)  # 回写迁移结果
             logger.info(f"targets.json migrated to new format: {path}")
@@ -66,12 +66,10 @@ def load_targets(path: Path = TARGETS_PATH) -> dict:
             "enabled": t.get("enabled", True),
         })
     result = {
-        "anthropicForwardPort": raw.get("anthropicForwardPort", 8082),
         "targets": normalized,
+        "modelDefaults": raw.get("modelDefaults", {"defaultPort": 8082}),
+        "models": raw.get("models", []),
     }
-    af = raw.get("anthropicForward")
-    if af is not None:
-        result["anthropicForward"] = af
     return result
 
 
