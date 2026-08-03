@@ -45,7 +45,11 @@ Anthropic 协议：base_url = http://192.168.2.128:8081，api_key = "dummy"
 
 ```jsonc
 {
-  "anthropicForwardPort": 8082,   // 8081 内部转发目标
+  "modelDefaults": { "defaultPort": 8082 },   // 8081 未命中模型定义时的默认转发端口
+  "models": [                                  // 全局模型定义（名称/别名 → 下游端口+真实模型）
+    { "name": "sonnet", "aliases": [], "target": { "port": 8080, "model": "agg:sonnet" } },
+    { "name": "haiku", "aliases": [], "target": { "port": 8082, "model": "claude-haiku-4.5" } }
+  ],
   "targets": [
     {
       "label": "copilot",          // 唯一标识（dashboard/API 用）
@@ -60,7 +64,6 @@ Anthropic 协议：base_url = http://192.168.2.128:8081，api_key = "dummy"
       "secretRef": "copilot_token",     // secrets.json 的 key
       "apikeyEnv": "COPILOT_GHE_TOKEN", // 环境变量兜底
       "models": [...],                 // 模型白名单（字符串或 {id, enabled}）
-      "modelMapping": {"opus": "...", "sonnet": "...", "haiku": "..."},
       "extraHeaders": {"Copilot-Integration-Id": "..."},
       "isFree": false,
       "enabled": true
@@ -152,27 +155,34 @@ Anthropic 协议：base_url = http://192.168.2.128:8081，api_key = "dummy"
 ### 配置编辑（dashboard，非黑盒）
 
 - `GET/PUT /api/aggregate/config`：读写聚合 target 的 `virtualModels / poolDefaults / quotaErrorPatterns / name`。PUT 为**整体替换语义**（`virtualModels` 传完整 map；未提供的字段保留现值），校验后写 targets.json 并热重载（引擎自动 reload，保留会话/熔断状态）
-- `GET/PUT /api/anthropic-forward`：读写 8081 转发目标配置（见下节）
-- dashboard：8080 卡片「✏️ 编辑配置」modal（虚拟模型增删/池成员 port/model/weight/retries/降级池编辑）、8081 卡片「✏️ 转发配置」modal（defaultPort + 按模型映射增删改）
+- `GET/PUT /api/models`：读写全局 `modelDefaults / models` 配置
+- dashboard：8080 卡片「✏️ 编辑配置」modal（虚拟模型增删/池成员 port/model/weight/retries/降级池编辑）、8081 卡片「✏️ 模型定义」modal（modelDefaults + models[] 增删改）
 
-### 8081 转发配置（anthropicForward）
+### 模型定义（models）
 
-8081 收到 `/v1/messages` 后翻译为 OpenAI 并转发，默认发往 `anthropicForwardPort`（8082），`model` 字段原样透传。通过 targets.json 顶层 `anthropicForward` 可**按模型配置转发目标**（聚合模型或非聚合模型）：
+8081 与所有 OpenAI 协议直连端口统一用全局 `models[]` 做别名解析（`_resolve_model_alias`）：
 
-```json
-"anthropicForward": {
-  "defaultPort": 8082,
-  "modelMap": {
-    "sonnet": { "port": 8080, "model": "agg:sonnet" },
-    "haiku":  { "port": 8082, "model": "claude-haiku-4.5" }
-  }
+- **命中且 `target.port` 等于请求到达的端口** → 只改写模型名继续原上游转发
+- **命中且指向另一端口**（含聚合网关 `agg:xxx`）→ 整体改路由到该端口
+- **未命中** → 8081 走 `modelDefaults.defaultPort` 原样透传模型名（直连端口未命中 = 原样透传给自己上游）
+
+示例（targets.json 顶层）：
+
+```jsonc
+{
+  "modelDefaults": { "defaultPort": 8082 },
+  "models": [
+    { "name": "sonnet", "aliases": [], "target": { "port": 8080, "model": "agg:sonnet" } },
+    { "name": "haiku", "aliases": [], "target": { "port": 8082, "model": "claude-haiku-4.5" } }
+  ]
 }
 ```
 
-- 客户端请求 `model` 命中 `modelMap` → 按配置的 `port` + `model` 转发（如 `sonnet` → 8080 聚合网关的 `agg:sonnet`，走权重/会话粘性/熔断全链路）；未命中 → 走 `defaultPort` + 原样模型（现状行为）
-- `defaultPort` 缺省回退 `anthropicForwardPort`；`modelMap` 为空 = 全部走默认端口
+**防环约束**：任何 `models[].target.port` 或聚合网关池成员 `port` 不得等于 8081（anthropic-compatible 自身端口），否则配置校验报错。
 
-实现：`aggregator.py`（`AggregatorEngine`，纯路由/熔断/统计逻辑，无网络 I/O）+ `server.py`（`_handle_aggregate_request` 分发 / `_aggregator_prober` 探测 / reload 钩子 / `/api/aggregate/status`、`/api/aggregate/config`、`/api/anthropic-forward` / lifespan 预初始化引擎）+ `config_store.py`（aggregate/aggregator 校验 + 顶层 `anthropicForward` 校验与保留加载）。
+**管理入口**：dashboard 8081 卡片「✏️ 模型定义」→ `GET/PUT /api/models`
+
+实现：`aggregator.py`（`AggregatorEngine`，纯路由/熔断/统计逻辑，无网络 I/O）+ `server.py`（`_handle_aggregate_request` 分发 / `_aggregator_prober` 探测 / reload 钩子 / `/api/aggregate/status`、`/api/aggregate/config`、`/api/models` / lifespan 预初始化引擎）+ `config_store.py`（aggregate/aggregator 校验 + 顶层 `modelDefaults/models` 校验与保留加载）。
 
 ## 路径重写（_rewrite_upstream_path）
 

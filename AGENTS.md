@@ -116,7 +116,7 @@ tail -f /root/shared-workspace/claude-code-proxy/proxy.log
 
 ### 5.5 模型清理
 
-- `POST /api/targets/{label}/prune-models` → 对照上游最新模型列表删过期模型（配置+内存）；**保护 modelMapping 目标**（映射目标上游不存在时修正为同族可用模型，避免映射断裂）
+- `POST /api/targets/{label}/prune-models` → 对照上游最新模型列表删过期模型（配置+内存）；**保护 models[] 目标**（映射目标上游不存在时修正为同族可用模型，避免映射断裂）
 - 仅 copilot 系（handler=copilot）支持（上游有 /models）；codebuddy/qclaw/trae-work 不显示清理按钮
 
 ---
