@@ -106,6 +106,13 @@
       "extraHeaders": {
         "Copilot-Integration-Id": "copilot-developer-cli"
       },
+      "responsesModels": [
+        "gpt-5.3-codex",
+        "gpt-5.4-mini",
+        "gpt-5.6-luna",
+        "gpt-5.6-terra",
+        "mai-code-1-flash-picker"
+      ],
       "modelMapping": {
         "opus": "claude-sonnet-5",
         "sonnet": "claude-sonnet-5",
@@ -412,11 +419,11 @@
         },
         {
           "id": "qwen-3.5",
-          "enabled": false
+          "enabled": true
         },
         {
           "id": "qwen3-coder",
-          "enabled": false
+          "enabled": true
         }
       ],
       "enabled": true,

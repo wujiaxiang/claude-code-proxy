@@ -26,19 +26,26 @@
 | `.env` / `secrets.json` | 项目根 | 全局配置 / 私密 token（**gitignored**，dashboard 可热编辑） |
 | `proxy.log` | 项目根 | 运行日志 |
 
-### 手动启动
+### 启动 / 重启（Linux 用 systemd）
+
+> Linux LXC 上代理由 systemd 托管（`claude-code-proxy.service`），**改代码/配置后一律用 systemctl 重启**，不要手动 kill + nohup。
 
 ```bash
-# Linux：启动 8081 FastAPI + 所有 targets.json 端口
+# 重启（推荐，加载 server.py 改动 + targets.json）：
+sudo systemctl restart claude-code-proxy
+
+# 查看状态 / 实时日志：
+systemctl status claude-code-proxy
+tail -f /root/shared-workspace/claude-code-proxy/proxy.log
+
+# 手动启动（仅调试，前台运行 8081 FastAPI + 所有 targets.json 端口）：
 .venv/bin/python server.py
 # Windows PowerShell：
 # Set-Location "c:\Users\Administrator\claude-code-proxy-main"
 # & ".\.venv\Scripts\python.exe" server.py
-
-# 重启（Linux）：
-PID=$(ss -tlnp | grep ':8081 ' | grep -oP 'pid=\K[0-9]+'); [ -n "$PID" ] && kill -9 $PID
-nohup .venv/bin/python server.py > /tmp/proxy.log 2>&1 & disown
 ```
+
+> systemd 细节：`ExecStart=.venv/bin/python3 server.py`，`Restart=always`（kill -9 也会被自动拉起）、`RestartSec=10`，日志追加到 `proxy.log`；`/etc/systemd/system/claude-code-proxy.service.d/debug.conf` 注入 `DEBUG=true`（调试日志常开）。
 
 > **注意**：代理进程跑在独立 mount namespace，`/tmp` 与 shell 隔离——跨进程共享状态（如 crack_daily 时间戳）放仓库内 `.cache/`，勿用 `/tmp`。
 

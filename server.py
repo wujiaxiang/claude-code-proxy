@@ -908,6 +908,12 @@ async def _aggregate_codebuddy_stream(target, upstream_url, fwd_headers, body_js
 
 # ─── HTTP 代理共享工具函数（所有端口统一用，不要各写各的） ───
 
+# 响应头透传时剔除的字段：
+# - transfer-encoding/connection/content-length：由代理按实际 body 重算
+# - content-encoding：httpx 已自动解压 body（gzip/br/deflate），再透传该头会让
+#   客户端对"已解压的明文"再解压一次 → 报 "incorrect header check"（openrouter 实测）
+_PROXY_STRIP_RESP_HEADERS = frozenset(("transfer-encoding", "connection", "content-length", "content-encoding"))
+
 async def _parse_http_request(reader):
     """统一 HTTP 请求解析。
     返回 (method, path, raw_path, headers, body)，请求无效时全返回 None。
@@ -1011,7 +1017,7 @@ async def _write_response(writer, resp, *, stats=None):
         if is_stream:
             writer.write(f"HTTP/1.1 {status} {reason}\r\n".encode())
             for k, v in resp.headers.items():
-                if k.lower() not in ("transfer-encoding", "connection", "content-length"):
+                if k.lower() not in _PROXY_STRIP_RESP_HEADERS:
                     writer.write(f"{k}: {v}\r\n".encode())
             writer.write(b"\r\n")
             async for chunk in resp.aiter_bytes():
@@ -1029,7 +1035,7 @@ async def _write_response(writer, resp, *, stats=None):
 
         resp_headers = "".join(
             f"{k}: {v}\r\n" for k, v in resp.headers.items()
-            if k.lower() not in ("transfer-encoding", "connection", "content-length")
+            if k.lower() not in _PROXY_STRIP_RESP_HEADERS
         )
         writer.write(f"HTTP/1.1 {status} {reason}\r\n{resp_headers}Content-Length: {len(body_bytes)}\r\n\r\n".encode())
         writer.write(body_bytes)
@@ -1237,6 +1243,302 @@ def _gemini_chunk_to_openai(gemini_chunk: dict, model: str) -> dict:
             "finish_reason": _FINISH_REASON_MAP.get(fr) if fr else None,
         }],
     }
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Copilot Responses API 桥接（/chat/completions ↔ /responses 双向转换）
+# 上游部分模型（gpt-5.6-terra/gpt-5.6-luna/gpt-5.3-codex/gpt-5.4-mini/
+# mai-code-1-flash-picker）只支持 /responses 协议，不支持 /chat/completions。
+# 网关按 targets.json 的 responsesModels 列表判定，把客户端的标准 OpenAI
+# chat.completions 请求转换为 Responses API 格式转发，再把响应转回 chat 格式。
+# ══════════════════════════════════════════════════════════════════════════════
+
+_RESPONSES_FINISH_REASON_MAP = {
+    "completed": "stop",
+    "incomplete": "length",
+    "failed": "content_filter",
+    "cancelled": "stop",
+}
+
+
+def _copilot_chat_to_responses_body(body: dict) -> dict:
+    """OpenAI chat.completions 请求体 → OpenAI Responses API 请求体。
+
+    关键差异：
+      messages → input（tool 消息转 function_call_output，assistant tool_calls 扁平化）
+      max_tokens/max_completion_tokens → max_output_tokens
+      tools 从 {function:{...}} 嵌套 → 扁平 {name, description, parameters}
+      response_format → text.format
+    """
+    out: dict = {}
+    if body.get("model"):
+        out["model"] = body["model"]
+
+    # ── messages → input ──
+    input_msgs = []
+    for m in body.get("messages", []) or []:
+        role = m.get("role", "")
+        if role == "tool":
+            input_msgs.append({
+                "type": "function_call_output",
+                "call_id": m.get("tool_call_id", ""),
+                "output": m.get("content", "") if isinstance(m.get("content"), str) else json.dumps(m.get("content", ""), ensure_ascii=False),
+            })
+        elif role == "assistant" and m.get("tool_calls"):
+            flat_tc = []
+            for c in m["tool_calls"]:
+                fn = c.get("function", {}) or {}
+                flat_tc.append({
+                    "id": c.get("id", ""),
+                    "type": "function",
+                    "name": fn.get("name", ""),
+                    "arguments": fn.get("arguments", "{}"),
+                })
+            am: dict = {"role": "assistant", "content": m.get("content") or ""}
+            if flat_tc:
+                am["tool_calls"] = flat_tc
+            input_msgs.append(am)
+        else:
+            am: dict = {"role": role, "content": m.get("content", "")}
+            if m.get("name"):
+                am["name"] = m["name"]
+            input_msgs.append(am)
+    if input_msgs:
+        out["input"] = input_msgs
+
+    # ── 输出上限 ──
+    mt = body.get("max_tokens") or body.get("max_completion_tokens")
+    if mt is not None:
+        out["max_output_tokens"] = mt
+
+    if "stream" in body:
+        out["stream"] = bool(body["stream"])
+
+    # ── 采样参数（字段名两边一致，直接透传）──
+    for k in ("temperature", "top_p", "stop", "user", "metadata",
+              "frequency_penalty", "presence_penalty", "top_logprobs",
+              "logprobs", "seed"):
+        if body.get(k) is not None:
+            out[k] = body[k]
+
+    # ── tools 扁平化：{type,function:{name,...}} → {type,name,description,parameters} ──
+    if body.get("tools"):
+        flat_tools = []
+        for t in body["tools"]:
+            fn = t.get("function", {}) or {}
+            flat_tools.append({
+                "type": "function",
+                "name": fn.get("name", ""),
+                "description": fn.get("description", ""),
+                "parameters": fn.get("parameters", {}),
+            })
+        out["tools"] = flat_tools
+
+    # ── tool_choice ──
+    if body.get("tool_choice") is not None:
+        tc = body["tool_choice"]
+        if isinstance(tc, dict) and tc.get("function"):
+            out["tool_choice"] = {"type": "function", "name": tc["function"].get("name", "")}
+        else:
+            out["tool_choice"] = tc
+
+    # ── response_format → text.format ──
+    if body.get("response_format"):
+        rf = body["response_format"]
+        ftype = rf.get("type", "text")
+        if ftype == "json_object":
+            out["text"] = {"format": {"type": "json_object"}}
+        elif ftype == "json_schema":
+            js = rf.get("json_schema", {}) or {}
+            out["text"] = {"format": {
+                "type": "json_schema",
+                "name": js.get("name", "schema"),
+                "schema": js.get("schema", {}),
+            }}
+    return out
+
+
+def _copilot_responses_to_chat_body(resp: dict, model: str) -> dict:
+    """OpenAI Responses API 响应体 → OpenAI chat.completions 响应体。"""
+    content_parts: List[str] = []
+    tool_calls: List[dict] = []
+    for item in resp.get("output", []) or []:
+        t = item.get("type")
+        if t == "message":
+            for part in item.get("content", []) or []:
+                if part.get("type") == "output_text":
+                    content_parts.append(part.get("text", ""))
+                elif part.get("type") == "refusal":
+                    content_parts.append(part.get("refusal", ""))
+        elif t == "function_call":
+            tool_calls.append({
+                "id": item.get("call_id") or item.get("id") or f"call_{uuid.uuid4().hex[:12]}",
+                "type": "function",
+                "function": {
+                    "name": item.get("name", ""),
+                    "arguments": item.get("arguments") or "{}",
+                },
+            })
+
+    content = "".join(content_parts) or None
+    message: dict = {"role": "assistant", "content": content}
+    if tool_calls:
+        message["tool_calls"] = tool_calls
+
+    status = resp.get("status", "completed")
+    u = resp.get("usage") or {}
+    return {
+        "id": f"chatcmpl-{uuid.uuid4().hex[:24]}",
+        "object": "chat.completion",
+        "created": int(time.time()),
+        "model": model,
+        "choices": [{
+            "index": 0,
+            "message": message,
+            "finish_reason": _RESPONSES_FINISH_REASON_MAP.get(status, "stop"),
+        }],
+        "usage": {
+            "prompt_tokens": u.get("input_tokens", 0),
+            "completion_tokens": u.get("output_tokens", 0),
+            "total_tokens": u.get("total_tokens", 0),
+        },
+    }
+
+
+def _copilot_responses_usage_to_chat(usage: dict) -> dict:
+    """Responses usage → chat usage（流式 completed 事件用）。"""
+    return {
+        "prompt_tokens": (usage or {}).get("input_tokens", 0),
+        "completion_tokens": (usage or {}).get("output_tokens", 0),
+        "total_tokens": (usage or {}).get("total_tokens", 0),
+    }
+
+
+def _copilot_stream_chunk(model: str, delta: dict, finish_reason=None, usage: Optional[dict] = None) -> dict:
+    """构造 OpenAI chat.completion.chunk。"""
+    chunk: dict = {
+        "id": f"chatcmpl-{uuid.uuid4().hex[:24]}",
+        "object": "chat.completion.chunk",
+        "created": int(time.time()),
+        "model": model,
+        "choices": [{"index": 0, "delta": delta, "finish_reason": finish_reason}],
+    }
+    if usage is not None:
+        chunk["usage"] = usage
+    return chunk
+
+
+async def _write_copilot_responses_stream(writer, resp, model: str, label: str) -> None:
+    """上游 /responses SSE 事件流 → OpenAI chat.completions SSE，写回客户端。
+
+    事件映射：
+      response.created                          → 首 chunk（role: assistant）
+      response.output_item.added (function_call)→ tool_call 首 chunk（id/name/index）
+      response.output_text.delta                → content chunk
+      response.refusal.delta                    → content chunk（拒绝内容）
+      response.function_call_arguments.delta    → tool_calls arguments chunk
+      response.completed                        → usage chunk + [DONE]
+      response.failed                           → error chunk + [DONE]
+    """
+    started = False
+    tool_indices: Dict[str, int] = {}   # item_id(fc_xxx) → tool_call index
+    next_tool_index = 0
+
+    async def _send(chunk: dict):
+        writer.write(f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n".encode())
+        await writer.drain()
+
+    try:
+        async for raw in resp.aiter_lines():
+            line = raw.strip()
+            if not line.startswith("data:"):
+                continue
+            data_str = line[5:].strip()
+            if not data_str:
+                continue
+            try:
+                ev = json.loads(data_str)
+            except Exception:
+                continue
+            etype = ev.get("type", "")
+
+            if etype == "response.created":
+                if not started:
+                    started = True
+                    await _send(_copilot_stream_chunk(model, {"role": "assistant", "content": ""}))
+
+            elif etype == "response.output_item.added":
+                item = ev.get("item", {}) or {}
+                if item.get("type") == "function_call":
+                    item_id = item.get("id") or item.get("call_id") or ""
+                    if item_id and item_id not in tool_indices:
+                        tool_indices[item_id] = next_tool_index
+                        idx = next_tool_index
+                        next_tool_index += 1
+                        await _send(_copilot_stream_chunk(model, {
+                            "tool_calls": [{
+                                "index": idx,
+                                "id": item.get("call_id") or item.get("id") or "",
+                                "type": "function",
+                                "function": {"name": item.get("name", ""), "arguments": ""},
+                            }],
+                        }))
+
+            elif etype == "response.output_text.delta":
+                d = ev.get("delta")
+                if d:
+                    await _send(_copilot_stream_chunk(model, {"content": d}))
+
+            elif etype == "response.refusal.delta":
+                d = ev.get("delta")
+                if d:
+                    await _send(_copilot_stream_chunk(model, {"content": d}))
+
+            elif etype == "response.function_call_arguments.delta":
+                d = ev.get("delta")
+                if d:
+                    item_id = ev.get("item_id") or ev.get("call_id") or ""
+                    idx = tool_indices.get(item_id, next_tool_index)
+                    if item_id and item_id not in tool_indices:
+                        tool_indices[item_id] = next_tool_index
+                        next_tool_index += 1
+                    await _send(_copilot_stream_chunk(model, {
+                        "tool_calls": [{"index": idx, "function": {"arguments": d}}],
+                    }))
+
+            elif etype == "response.completed":
+                r = ev.get("response", {}) or {}
+                status = r.get("status", "completed")
+                finish = _RESPONSES_FINISH_REASON_MAP.get(status, "stop")
+                usage = _copilot_responses_usage_to_chat(r.get("usage"))
+                await _send(_copilot_stream_chunk(model, {}, finish_reason=finish, usage=usage))
+                writer.write(b"data: [DONE]\n\n")
+                await writer.drain()
+                return
+
+            elif etype == "response.failed":
+                r = ev.get("response", {}) or {}
+                err = (r.get("error") or ev.get("error")) or {"message": "upstream response failed"}
+                await _send(_copilot_stream_chunk(model, {}, finish_reason="stop"))
+                await _send({"error": err})
+                writer.write(b"data: [DONE]\n\n")
+                await writer.drain()
+                return
+
+        # 流未正常结束（无 completed/failed）→ 补 finish + [DONE]
+        if not started:
+            await _send(_copilot_stream_chunk(model, {"role": "assistant", "content": ""}))
+        await _send(_copilot_stream_chunk(model, {}, finish_reason="stop"))
+        writer.write(b"data: [DONE]\n\n")
+        await writer.drain()
+    except Exception:
+        logger.warning(f"[{label}] responses stream conversion failed")
+        try:
+            writer.write(b"data: [DONE]\n\n")
+            await writer.drain()
+        except Exception:
+            pass
+        raise
 
 
 async def _handle_gemini_native(writer, target, method, path, headers, body, stats, label):
@@ -1697,6 +1999,30 @@ _TOOLCALL_XML_RE = re.compile(r"<tool_call\b[^>]*>([\s\S]*?)</tool_call\s*>", re
 # DSML 外层完整包裹（含 <｜DSML｜>...</｜DSML｜>），一次性移除时用
 _DSML_BLOCK_RE = re.compile(r"<[｜|]DSML[｜|]>[\s\S]*?</[｜|]DSML[｜|]>", re.S)
 
+# ── DSML 第 4 种变体：<｜DSML｜invoke name="..."> / <｜DSML｜parameter name="...">
+# （2026-08-03 实测，Doubao-Seed-Code）：
+#   <｜DSML｜tool_calls>
+#   <｜DSML｜invoke name="bash">
+#   <｜DSML｜parameter name="command" string="true">...</｜DSML｜parameter>
+#   </｜DSML｜invoke>
+#   </｜DSML｜tool_calls>
+# 与前 3 种（<｜function｜>/<｜function name｜>/<｜parameter｜> 独立标签、
+# [Tool Call: name] 纯文本、<tool_call>JSON</tool_call>）完全不同的第 4 种
+# 标签语法：tool 名和 param 名作为**标签属性**（name="xxx"）而非独立标签体。
+# 教训：与其继续为每个新样本量身定制一条正则（治标），这里改写一个通用
+# "<｜DSML｜TAGNAME attr="val" ...>...</｜DSML｜TAGNAME>" 家族扫描器，只认
+# 标签语法结构本身（TAGNAME 任意、属性任意），不绑定具体 tool/param 名，
+# 这样才能覆盖同一标签家族里模型可能继续变换出的其他排列，而不是每次追新样本。
+_DSML_INVOKE_RE = re.compile(
+    r'<[｜|]DSML[｜|]invoke\s+name="([^"]*)"[^>]*>([\s\S]*?)</[｜|]DSML[｜|]invoke\s*>', re.S)
+_DSML_PARAM_RE = re.compile(
+    r'<[｜|]DSML[｜|]parameter\s+name="([^"]*)"[^>]*>([\s\S]*?)</[｜|]DSML[｜|]parameter\s*>', re.S)
+# 整个 <｜DSML｜tool_calls>...</｜DSML｜tool_calls> 外层包裹，清洗正文时一次性移除
+_DSML_TOOLCALLS_BLOCK_RE = re.compile(
+    r"<[｜|]DSML[｜|]tool_calls[｜|]?>[\s\S]*?</[｜|]DSML[｜|]tool_calls\s*>", re.S)
+# 检测用：任意 "<｜DSML｜任意标签" 前缀（含 invoke/parameter/tool_calls 等家族全部成员）
+_DSML_ANY_TAG_RE = re.compile(r"<[｜|]DSML[｜|][A-Za-z_]+")
+
 
 def _build_trae_tool_prompt(tools: list) -> str:
     """OpenAI tools 定义 → Trae 提示词文本（trae-local-api buildToolPrompt 方式）。
@@ -1748,6 +2074,7 @@ def _looks_like_dsml(text: str) -> bool:
     t = text or ""
     return bool(_DSML_LIKE_RE.search(t) or _TOOLCALL_TEXT_RE.search(t)
                 or _DSML_REASONING_RE.search(t) or _TOOLCALL_XML_RE.search(t)
+                or _DSML_ANY_TAG_RE.search(t)
                 or "[Tool Call" in t or "Arguments:" in t
                 or '{"reasoning_content"' in t or "reasoning_content" in t
                 or "tool_call" in t or t.startswith('{"'))
@@ -1782,9 +2109,18 @@ def _resolve_trae_text(full_text: str) -> tuple[list, str, str]:
     if reasoning_text:
         text = _DSML_REASONING_RE.sub("", text)  # 摘除全部（可能有多段），不只第一段
     tool_calls = _parse_dsml_tool_calls(text)
+    if not tool_calls and _looks_like_dsml(text):
+        # 兜底告警（2026-08-03 新增）：文本命中"疑似工具调用标记"特征，但所有已知
+        # 解析器（DSML 独立标签/invoke 属性变体/[Tool Call:] 文本/<tool_call> XML）
+        # 均未能解析出 tool_calls——大概率是模型又输出了一种尚未支持的第 5 种变体。
+        # 直接记录 WARNING + 原始文本，以便第一时间从日志发现新变体，而不是被动
+        # 等用户反馈"工具没执行"。不中断流程：仍按普通文本处理，避免整段吞掉。
+        logger.warning(f"[trae-work] _looks_like_dsml=True 但未解析出 tool_calls，"
+                        f"疑似新的工具调用标记变体，原始文本: {text[:2000]!r}")
     if tool_calls:
         # 工具调用文本本身不作为正文回显（DSML/[Tool Call:]/<tool_call> 全部清洗掉）
         content_text = _DSML_BLOCK_RE.sub("", text)
+        content_text = _DSML_TOOLCALLS_BLOCK_RE.sub("", content_text)
         content_text = _TOOLCALL_TEXT_RE.sub("", content_text)
         for m in re.finditer(_TOOLCALL_TEXT_RE, text):
             args = _extract_balanced_json(text, m.start(2))
@@ -1800,9 +2136,29 @@ def _resolve_trae_text(full_text: str) -> tuple[list, str, str]:
 def _parse_dsml_tool_calls(text: str) -> list:
     """把工具调用标记文本解析为 OpenAI tool_calls 列表；无匹配返回 []。
 
-    先试 DSML 标记（<｜function｜> 块），再试 [Tool Call: name]\nArguments: {...} 文本。
+    依次尝试：<｜DSML｜invoke name=".."><｜DSML｜parameter name="..">..</｜DSML｜parameter></｜DSML｜invoke>
+    标签属性变体 → DSML 标记（<｜function｜> 块）→ [Tool Call: name]\nArguments: {...} 文本
+    → <tool_call>JSON</tool_call>。
     """
     tcs = []
+    # 变体 4（2026-08-03）：<｜DSML｜invoke name="bash"> + 内部多个
+    # <｜DSML｜parameter name="command" ...>value</｜DSML｜parameter>。
+    # 一个 invoke 可能含多个 parameter，需要收集成 {param_name: value} 再序列化 arguments。
+    for tool_name, invoke_body in _DSML_INVOKE_RE.findall(text):
+        tool_name = tool_name.strip()
+        if not tool_name:
+            continue
+        params = {}
+        for param_name, param_val in _DSML_PARAM_RE.findall(invoke_body):
+            param_name = param_name.strip()
+            if param_name:
+                params[param_name] = param_val
+        item = {"type": "function", "function": {"name": tool_name}}
+        if params:
+            item["function"]["arguments"] = json.dumps(params, ensure_ascii=False)
+        tcs.append(item)
+    if tcs:
+        return tcs
     for name_raw, args_raw in _DSML_PAIR_RE.findall(text):
         name = name_raw.strip()
         if not name:
@@ -2198,8 +2554,12 @@ def _handler_prepare_headers(target: dict, fwd_headers: dict, body_json: dict) -
     # 补充 header（如 copilot 的 Copilot-Integration-Id）
     for k, v in (target.get("extraHeaders") or {}).items():
         fwd_headers[k] = v
-    # qclaw 上游要求 UA
+    # qclaw 上游要求 UA 精确等于 OpenAI/JS 6.39.1
+    # 客户端透传的 user-agent（python-httpx 等）必须清除——否则 httpx 会把两个 UA
+    # 合并成逗号分隔值（"python-httpx/0.28.1, OpenAI/JS 6.39.1"），上游 400 invalid request。
     if handler == "qclaw":
+        for _hk in [k for k in fwd_headers if k.lower() == "user-agent"]:
+            del fwd_headers[_hk]
         fwd_headers["User-Agent"] = "OpenAI/JS 6.39.1"
     return fwd_headers
 
@@ -2213,6 +2573,7 @@ _HANDLER_PATH_MAP = {
     "copilot": {
         "/v1/chat/completions": "/chat/completions",
         "/v1/models": "/models",
+        "/v1/responses": "/responses",
     },
 }
 
@@ -2709,7 +3070,7 @@ async def _handle_anthropic_proxy_request(reader, writer):
             if is_stream:
                 writer.write(f"HTTP/1.1 {resp.status_code} {resp.reason_phrase or 'OK'}\r\n".encode())
                 for k, v in resp.headers.items():
-                    if k.lower() not in ("transfer-encoding", "connection"):
+                    if k.lower() not in _PROXY_STRIP_RESP_HEADERS:
                         writer.write(f"{k}: {v}\r\n".encode())
                 writer.write(b"\r\n")
                 async for chunk in resp.aiter_bytes():
@@ -2720,7 +3081,7 @@ async def _handle_anthropic_proxy_request(reader, writer):
 
             body_bytes = await resp.aread()
             _ANTHROPIC_STATS["passthroughOk"] += 1
-            resp_headers = "".join(f"{k}: {v}\r\n" for k, v in resp.headers.items() if k.lower() not in ("transfer-encoding", "connection"))
+            resp_headers = "".join(f"{k}: {v}\r\n" for k, v in resp.headers.items() if k.lower() not in _PROXY_STRIP_RESP_HEADERS)
             writer.write(f"HTTP/1.1 {resp.status_code} {resp.reason_phrase or 'OK'}\r\n{resp_headers}Content-Length: {len(body_bytes)}\r\n\r\n".encode())
             writer.write(body_bytes)
             await writer.drain()
@@ -2824,7 +3185,7 @@ async def _handle_aggregate_request(reader, writer, target, method, path, raw_pa
             engine.trip(member.port, "quota_error")
         resp_headers = "".join(
             f"{k}: {v}\r\n" for k, v in resp.headers.items()
-            if k.lower() not in ("transfer-encoding", "connection", "content-length")
+            if k.lower() not in _PROXY_STRIP_RESP_HEADERS
         )
         writer.write(f"HTTP/1.1 {resp.status_code} {resp.reason_phrase or 'OK'}\r\n{resp_headers}Content-Length: {len(body_text.encode())}\r\n\r\n".encode())
         writer.write(body_text.encode("utf-8"))
@@ -2916,7 +3277,12 @@ async def _handle_target_request(reader, writer, target):
         # ── /api/*：代理到 8081 FastAPI（dashboard 管理接口）──
         # 用户可能通过任意 target 端口访问 /dashboard，页面内 JS 的 fetch('/api/...')
         # 是相对路径，会发到当前端口——必须透传回 8081，否则 404。
-        if path.startswith("/api/") or path == "/api":
+        # 注意：routePrefix 以 /api/ 开头的 target（如 openrouter 的 /api/v1），其上游
+        # 路径 /api/v1/chat/completions 不能被误判为 dashboard API 劫持，需排除透传前缀。
+        _route_prefix = target.get("routePrefix", "")
+        if (path == "/api" or path.startswith("/api/")) and not (
+            _route_prefix and path.startswith(_route_prefix)
+        ):
             async with httpx.AsyncClient(timeout=httpx.Timeout(30.0), trust_env=False) as c:
                 fwd = {k: v for k, v in headers.items() if k.lower() not in ("host", "connection", "content-length")}
                 fwd["host"] = "127.0.0.1:8081"
@@ -2925,7 +3291,7 @@ async def _handle_target_request(reader, writer, target):
                 if "text/event-stream" in resp.headers.get("content-type", ""):
                     writer.write(f"HTTP/1.1 {resp.status_code} {resp.reason_phrase or 'OK'}\r\n".encode())
                     for k, v in resp.headers.items():
-                        if k.lower() not in ("transfer-encoding", "connection"):
+                        if k.lower() not in _PROXY_STRIP_RESP_HEADERS:
                             writer.write(f"{k}: {v}\r\n".encode())
                     writer.write(b"\r\n")
                     async for chunk in resp.aiter_bytes():
@@ -2935,7 +3301,7 @@ async def _handle_target_request(reader, writer, target):
                     resp_body = await resp.aread()
                     resp_headers = "".join(
                         f"{k}: {v}\r\n" for k, v in resp.headers.items()
-                        if k.lower() not in ("transfer-encoding", "connection", "content-length")
+                        if k.lower() not in _PROXY_STRIP_RESP_HEADERS
                     )
                     writer.write(f"HTTP/1.1 {resp.status_code} {resp.reason_phrase or 'OK'}\r\n{resp_headers}Content-Length: {len(resp_body)}\r\n\r\n".encode())
                     writer.write(resp_body)
@@ -2982,6 +3348,25 @@ async def _handle_target_request(reader, writer, target):
             except Exception:
                 pass
 
+        # ── Copilot /responses 桥接：responsesModels 名单内的模型走 /responses 协议 ──
+        # 上游部分模型（gpt-5.6-terra 等）只支持 /responses 端点，不支持 /chat/completions。
+        # 客户端统一用 OpenAI chat.completions 格式请求，网关负责双向格式转换：
+        #   chat.completions body → Responses API body（发送前）
+        #   Responses API 响应   → chat.completions 响应（接收后，流式/非流式）
+        _use_responses = False
+        if (
+            target.get("handler") == "copilot"
+            and raw_path in ("/v1/chat/completions", "/chat/completions")
+            and _req_model
+            and str(_req_model) in (target.get("responsesModels") or [])
+            and body_json and isinstance(body_json, dict)
+        ):
+            _use_responses = True
+            body_bytes = json.dumps(
+                _copilot_chat_to_responses_body(body_json), ensure_ascii=False
+            ).encode("utf-8")
+            logger.info(f"[{label}] responses bridge: {_req_model} → /responses (chat→responses)")
+
         # ── agg:xxx 目标：modelMapping 映射到聚合模型 → 改路由到本地聚合网关 ──
         # 聚合网关不透传 secretRef/apikeyEnv，只透传客户端 Authorization（凭据归池内
         # 成员端口自己处理）；且成员端口会各自重写 path/鉴权，因此这里保留原始 path、
@@ -3001,6 +3386,8 @@ async def _handle_target_request(reader, writer, target):
                 raw_path,
                 target.get("routePrefix", ""),
             )
+            if _use_responses:
+                upstream_path = "/responses"
             upstream_url = f"{transport}://{target['targetHost']}:{target.get('targetPort', 443)}{upstream_path}"
             fwd_headers = _resolve_auth(headers, target=target)
             fwd_headers["host"] = target["targetHost"]
@@ -3014,6 +3401,15 @@ async def _handle_target_request(reader, writer, target):
             is_stream = "text/event-stream" in content_type
 
             if is_stream:
+                if _use_responses:
+                    # 上游 /responses SSE → chat.completions SSE
+                    writer.write(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\n\r\n")
+                    await writer.drain()
+                    await _write_copilot_responses_stream(writer, resp, str(_req_model), label)
+                    if _req_model:
+                        _bump_model_stats(label, _req_model, "ok")
+                    writer.close()
+                    return
                 status, _ = await _write_response(writer, resp, stats=stats)
                 if _req_model:
                     _bump_model_stats(label, _req_model, "ok" if (status or 0) < 400 else "err")
@@ -3028,6 +3424,24 @@ async def _handle_target_request(reader, writer, target):
 
             if status >= 400:
                 logger.warning(f"[{label}] HTTP {status}: {body_text[:300]}")
+
+            # ── Copilot /responses 非流式响应转换回 chat.completions 格式 ──
+            # 成功(2xx)时上游返回 Responses API 结构（output[]），需转回 chat 结构；
+            # 错误(4xx/5xx)时上游错误本身就是 OpenAI error 格式，直接透传。
+            if _use_responses and status < 400:
+                try:
+                    upstream_json = json.loads(body_text)
+                    chat_body = _copilot_responses_to_chat_body(upstream_json, str(_req_model))
+                    payload = json.dumps(chat_body, ensure_ascii=False).encode("utf-8")
+                    writer.write(f"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {len(payload)}\r\n\r\n".encode())
+                    writer.write(payload)
+                    await writer.drain()
+                    writer.close()
+                    if _req_model:
+                        _bump_model_stats(label, _req_model, "ok")
+                    return
+                except Exception as e:
+                    logger.warning(f"[{label}] responses→chat convert failed: {e}，透传上游原始响应")
 
             # ── codebuddy 上游只支持流式：非流式请求自动转流式聚合 ──
             # 上游（copilot.tencent.com）对非流式 chat 返回 11101 "Non-stream chat request
@@ -6104,8 +6518,8 @@ DASHBOARD_STYLE = """
   .agg-pool { margin: 8px 0 2px 0; }
   .agg-pool-title { font-size: 11.5px; color: var(--text-tertiary); font-weight: 600; margin-bottom: 6px; }
   .agg-pool-row { display: flex; align-items: center; gap: 8px; padding: 5px 0; }
-  .agg-mem-port { width: 96px; flex-shrink: 0; }
-  .agg-mem-model { flex: 1; min-width: 0; }
+  .agg-mem-port { width: 180px; flex-shrink: 0; }
+  .agg-mem-model { flex: 1; min-width: 200px; }
   .agg-mem-weight { width: 84px; flex-shrink: 0; }
   .agg-add-row { margin: 6px 0 10px 0; }
   .agg-vm-retries { display: flex; gap: 12px; flex-wrap: wrap; margin-top: 8px; padding-top: 8px; border-top: 1px dashed var(--border); }
@@ -7976,8 +8390,6 @@ function aggNumField(key, labelText, val, placeholder) {{
 
 // 聚合可用端口缓存（由 buildAggConfigHtml 在打开编辑器时注入）
 var _aggAvailablePorts = {{}};
-// 聚合虚拟模型 id 映射（用于模型下拉补全 agg:xxx 选项）
-var _aggVirtualModelIds = [];
 
 function aggPortSelectHtml(selectedPort) {{
   var html = '<select class="agg-input agg-mem-port" aria-label="端口" onchange="onAggPortChange(this)">';
@@ -8003,9 +8415,8 @@ function aggModelSelectHtml(selectedPort, selectedModel) {{
   if (selectedPort !== undefined && selectedPort !== null && selectedPort !== '' && _aggAvailablePorts[String(selectedPort)]) {{
     models = _aggAvailablePorts[String(selectedPort)].models || [];
   }}
-  // 聚合虚拟模型（agg:xxx）总是可选
+  // 仅显示所选端口的真实上游模型，不追加虚拟模型（agg:xxx）
   var all = models.slice();
-  _aggVirtualModelIds.forEach(function(v) {{ if (all.indexOf(v) === -1) all.push(v); }});
   all.sort();
   all.forEach(function(m) {{
     var sel = (m === selectedModel) ? ' selected' : '';
@@ -8024,7 +8435,7 @@ function onAggPortChange(selEl) {{
   var modelSel = row.querySelector('.agg-mem-model');
   if (!modelSel) return;
   var port = selEl.value;
-  // 重建模型下拉
+  // 重建模型下拉（不传 poolKey，统一只显示所选端口的真实模型）
   var newHtml = aggModelSelectHtml(port, '');
   var tmp = document.createElement('div');
   tmp.innerHTML = newHtml;
@@ -8039,7 +8450,7 @@ function onAggModelChange(selEl) {{
   // 保留钩子：未来可扩展 agg:xxx 模型的特殊处理
 }}
 
-function aggPoolMemberRow(port, model, weight) {{
+function aggPoolMemberRow(port, model, weight, poolKey) {{
   var w = (weight === undefined || weight === null) ? '' : escHtml(String(weight));
   return '<div class="agg-pool-row">' +
     aggPortSelectHtml(port) +
@@ -8062,12 +8473,12 @@ function aggVmBlock(id, vm) {{
     '</div>';
   html += '<div class="agg-pool" data-pool="default">' +
     '<div class="agg-pool-title">默认池 defaultPool</div>';
-  if (d.length) {{ d.forEach(function(mem) {{ html += aggPoolMemberRow(mem.port, mem.model, mem.weight); }}); }}
-  else {{ html += aggPoolMemberRow('', '', ''); }}
+  if (d.length) {{ d.forEach(function(mem) {{ html += aggPoolMemberRow(mem.port, mem.model, mem.weight, 'default'); }}); }}
+  else {{ html += aggPoolMemberRow('', '', '', 'default'); }}
   html += '<div class="agg-add-row"><button class="mm-add-btn" onclick="addAggPoolMember(this, &quot;default&quot;)">+ 添加成员</button></div></div>';
   html += '<div class="agg-pool" data-pool="fallback">' +
     '<div class="agg-pool-title">降级池 fallbackPool</div>';
-  if (f.length) {{ f.forEach(function(mem) {{ html += aggPoolMemberRow(mem.port, mem.model, mem.weight); }}); }}
+  if (f.length) {{ f.forEach(function(mem) {{ html += aggPoolMemberRow(mem.port, mem.model, mem.weight, 'fallback'); }}); }}
   html += '<div class="agg-add-row"><button class="mm-add-btn" onclick="addAggPoolMember(this, &quot;fallback&quot;)">+ 添加降级成员</button></div></div>';
   html += '<div class="agg-vm-retries">' +
     '<label class="agg-field">' +
@@ -8113,9 +8524,6 @@ async function openAggConfigEditor(btn) {{
 function buildAggConfigHtml(r) {{
   // 注入全局缓存，供 aggPortSelectHtml / aggModelSelectHtml 使用
   _aggAvailablePorts = r.availablePorts || {{}};
-  var _vmMap = r.virtualModels || {{}};
-  _aggVirtualModelIds = [];
-  Object.keys(_vmMap).forEach(function(k) {{ if (k.indexOf('agg:') === 0) _aggVirtualModelIds.push(k); }});
   var pd = r.poolDefaults || {{}};
   var html = '<div class="agg-hint">虚拟模型池配置：成员端口指向本地真实网关端口，模型为上游模型名（可填 agg:xxx 链式聚合）。' +
     '权重与重试留空 = 继承池默认值；保存后热生效。</div>';
@@ -8158,7 +8566,7 @@ function removeAggVm(btn) {{
 function addAggPoolMember(btn, poolKey) {{
   var pool = btn.closest('.agg-pool');
   if (!pool) return;
-  var html = aggPoolMemberRow('', '', '');
+  var html = aggPoolMemberRow('', '', '', poolKey || (pool.dataset ? pool.dataset.pool : ''));
   var addRow = pool.querySelector('.agg-add-row');
   if (addRow) {{ addRow.insertAdjacentHTML('beforebegin', html); }}
   else {{ pool.insertAdjacentHTML('beforeend', html); }}
