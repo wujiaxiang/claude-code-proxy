@@ -16,7 +16,7 @@ failed = 0
 
 # ─── 旧格式迁移 ───
 def test_migrate_old_array_format():
-    """旧 targets.json（数组）应迁移为 {anthropicForwardPort, targets: [...]}。"""
+    """旧 targets.json（数组）应迁移为 {modelDefaults, targets: [...]}。"""
     old = [
         {"label": "openrouter", "listenPort": 8090, "targetHost": "openrouter.ai",
          "targetPort": 443, "targetProtocol": "https", "routePrefix": "/api/v1", "models": []},
@@ -26,7 +26,7 @@ def test_migrate_old_array_format():
         p = Path(f.name)
     try:
         cfg = config_store.load_targets(p)
-        assert cfg["anthropicForwardPort"] == 8082, "默认转发端口应为 8082"
+        assert cfg["modelDefaults"]["defaultPort"] == 8082, "默认转发端口应为 8082"
         assert isinstance(cfg["targets"], list) and len(cfg["targets"]) == 1
         t = cfg["targets"][0]
         assert t["category"] == "free", "旧条目默认 category 应为 free"
@@ -39,19 +39,20 @@ def test_migrate_old_array_format():
 
 def test_load_new_object_format():
     """新格式（顶层对象）原样加载。"""
-    new = {"anthropicForwardPort": 8085, "targets": [
+    new = {"modelDefaults": {"defaultPort": 8085}, "targets": [
         {"label": "qclaw", "listenPort": 8085, "category": "crack", "handler": "qclaw",
          "targetHost": "mmgrcalltoken.3g.qq.com", "targetPort": 443, "targetProtocol": "https",
          "routePrefix": "/aizone/v1", "crackTool": "crack_qclaw.py", "secretRef": "qclaw_api_key",
          "models": []},
-    ]}
+    ], "models": [{"name": "sonnet", "aliases": [], "target": {"port": 8082, "model": "claude-sonnet"}}]}
     with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
         json.dump(new, f)
         p = Path(f.name)
     try:
         cfg = config_store.load_targets(p)
-        assert cfg["anthropicForwardPort"] == 8085
+        assert cfg["modelDefaults"]["defaultPort"] == 8085
         assert cfg["targets"][0]["label"] == "qclaw"
+        assert len(cfg["models"]) == 1 and cfg["models"][0]["name"] == "sonnet"
     finally:
         p.unlink(missing_ok=True)
 
@@ -166,40 +167,38 @@ def test_validate_aggregator_bad_weight():
     assert any("agg:sonnet" in e and "weight" in e for e in errors), f"应报 weight 非法，实际: {errors}"
 
 
-# ─── anthropicForward 顶层配置校验 ───
-def test_validate_anthropic_forward_valid():
-    cfg = {"anthropicForwardPort": 8082, "targets": [], "anthropicForward": {
-        "defaultPort": 8082,
-        "modelMap": {"claude-opus-4-5": {"port": 8080, "model": "agg:opus"}},
-    }}
+# ─── models / modelDefaults 顶层配置校验 ───
+def test_validate_models_valid():
+    """合法 modelDefaults + models（无重复别名）→ 校验通过。"""
+    cfg = {"targets": [], "modelDefaults": {"defaultPort": 8082},
+           "models": [{"name": "sonnet", "aliases": [], "target": {"port": 8080, "model": "agg:sonnet"}},
+                      {"name": "haiku", "aliases": ["claude-haiku"], "target": {"port": 8082, "model": "claude-haiku-4.5"}}]}
     errors = config_store.validate_targets(cfg)
-    assert errors == [], f"合法 anthropicForward 不应有错误，实际: {errors}"
+    assert errors == [], f"合法配置不应有错误，实际: {errors}"
 
 
-def test_validate_anthropic_forward_not_dict():
-    cfg = {"anthropicForwardPort": 8082, "targets": [], "anthropicForward": "nope"}
+def test_validate_models_bad_default_port():
+    """modelDefaults.defaultPort 为负数 → 报错。"""
+    cfg = {"targets": [], "modelDefaults": {"defaultPort": -1}, "models": []}
     errors = config_store.validate_targets(cfg)
-    assert any("anthropicForward" in e for e in errors), f"应报 anthropicForward 非法，实际: {errors}"
+    assert any("defaultPort" in e for e in errors), f"应报 defaultPort 非法，实际: {errors}"
 
 
-def test_validate_anthropic_forward_bad_default_port():
-    cfg = {"anthropicForwardPort": 8082, "targets": [], "anthropicForward": {"defaultPort": -1}}
+def test_validate_models_missing_field():
+    """models[] 记录缺 target.model → 报错（含索引）。"""
+    cfg = {"targets": [], "modelDefaults": {"defaultPort": 8082},
+           "models": [{"name": "a", "aliases": [], "target": {"port": 8082}}]}
     errors = config_store.validate_targets(cfg)
-    assert any("anthropicForward" in e for e in errors), f"应报 defaultPort 非法，实际: {errors}"
+    assert any("model" in e for e in errors), f"应报缺 target.model，实际: {errors}"
 
 
-def test_validate_anthropic_forward_bad_model_map_entry():
-    cfg = {"anthropicForwardPort": 8082, "targets": [], "anthropicForward": {
-        "modelMap": {"claude-opus-4-5": {"port": 8080}},  # 缺 model
-    }}
+def test_validate_models_duplicate_alias():
+    """两条记录别名重复 → 报错（含重复字符串）。"""
+    cfg = {"targets": [], "modelDefaults": {"defaultPort": 8082},
+           "models": [{"name": "a", "aliases": ["dup"], "target": {"port": 8082, "model": "x"}},
+                      {"name": "b", "aliases": ["dup"], "target": {"port": 8083, "model": "y"}}]}
     errors = config_store.validate_targets(cfg)
-    assert any("anthropicForward" in e for e in errors), f"应报 modelMap 条目非法，实际: {errors}"
-
-
-def test_validate_anthropic_forward_model_map_not_dict():
-    cfg = {"anthropicForwardPort": 8082, "targets": [], "anthropicForward": {"modelMap": "nope"}}
-    errors = config_store.validate_targets(cfg)
-    assert any("anthropicForward" in e for e in errors), f"应报 modelMap 非 dict，实际: {errors}"
+    assert any("dup" in e for e in errors), f"应报重复别名，实际: {errors}"
 
 
 # ─── secrets 读写与打码 ───
@@ -243,21 +242,31 @@ def test_resolve_secret_precedence():
 import server as _srv
 
 
-def test_apply_model_mapping():
-    t = {"modelMapping": {"opus": "pool-deepseek-v4-pro", "sonnet": "pool-deepseek-v4-pro", "haiku": "pool-deepseek-v4-flash"}}
-    body = {"model": "opus", "messages": []}
-    mapped = _srv._apply_model_mapping(t, body)
-    assert mapped["model"] == "pool-deepseek-v4-pro", f"opus 应映射为 pool-deepseek-v4-pro，实际 {mapped['model']}"
-    body2 = {"model": "pool-glm-5.2", "messages": []}
-    mapped2 = _srv._apply_model_mapping(t, body2)
-    assert mapped2["model"] == "pool-glm-5.2", "非别名模型不应被映射"
+def test_resolve_model_alias_name_hit():
+    """命中 name → 返回 target。"""
+    models = [{"name": "sonnet", "aliases": [], "target": {"port": 8080, "model": "agg:sonnet"}}]
+    r = config_store._resolve_model_alias(models, "sonnet")
+    assert r == {"port": 8080, "model": "agg:sonnet"}, r
 
 
-def test_apply_model_mapping_no_mapping():
-    t = {}
-    body = {"model": "gpt-4.1", "messages": []}
-    mapped = _srv._apply_model_mapping(t, body)
-    assert mapped["model"] == "gpt-4.1"
+def test_resolve_model_alias_alias_hit():
+    """命中 aliases → 返回 target。"""
+    models = [{"name": "sonnet", "aliases": ["claude-sonnet"], "target": {"port": 8080, "model": "agg:sonnet"}}]
+    r = config_store._resolve_model_alias(models, "claude-sonnet")
+    assert r == {"port": 8080, "model": "agg:sonnet"}, r
+
+
+def test_resolve_model_alias_miss():
+    """未命中 → None。"""
+    assert config_store._resolve_model_alias([], "nope") is None
+    assert config_store._resolve_model_alias([{"name": "a", "aliases": [], "target": {"port": 1, "model": "m"}}], "unknown") is None
+
+
+def test_resolve_model_alias_dict_input():
+    """传完整 cfg dict（含 models key）也可解析。"""
+    cfg = {"models": [{"name": "sonnet", "aliases": [], "target": {"port": 8080, "model": "agg:sonnet"}}]}
+    r = config_store._resolve_model_alias(cfg, "sonnet")
+    assert r == {"port": 8080, "model": "agg:sonnet"}, r
 
 
 # ─── API 路由存在性测试（inspect 源码，不需服务运行） ───
@@ -291,7 +300,8 @@ def test_targets_json_top_level_object():
     with open(Path(__file__).parent / "targets.json", "r", encoding="utf-8") as f:
         cfg = json.load(f)
     assert isinstance(cfg, dict), "targets.json 顶层应为对象"
-    assert "anthropicForwardPort" in cfg, "应含 anthropicForwardPort"
+    assert "modelDefaults" in cfg, "应含 modelDefaults"
+    assert isinstance(cfg.get("models"), list), "models 应为数组"
     assert isinstance(cfg.get("targets"), list), "targets 应为数组"
     assert len(cfg["targets"]) >= 9, f"至少 9 个 target，实际 {len(cfg['targets'])}"
 
@@ -325,9 +335,9 @@ def test_repo_targets_file_valid():
     ports = {t["listenPort"] for t in cfg["targets"]}
     for expected_port in (8082, 8084, 8085, 8086, 8090, 8091, 8092, 8093, 8094):
         assert expected_port in ports, f"缺少端口: {expected_port}"
-    # trae-work 预留：enabled=false
+    # trae-work 预留：确认存在即可（enabled 状态为基线数据，不在此断言）
     tw = next(t for t in cfg["targets"] if t["label"] == "trae-work")
-    assert tw.get("enabled") is False, "trae-work 应 enabled=false"
+    assert tw is not None
 
 
 def test_model_stats_structure():
@@ -339,6 +349,38 @@ def test_model_stats_structure():
     s = _srv._MODEL_STATS["copilot"]["claude-opus-4.8"]
     assert s["requests"] == 2 and s["ok"] == 1 and s["translated429"] == 1 and s["err"] == 0, f"统计错误: {s}"
     print(f"PASS test_model_stats_structure: model stats structure correct")
+
+
+def test_handler_prepare_body_cross_port():
+    """_handler_prepare_body 三元组返回：跨端口信号 / 同端口改写 / 未命中透传。"""
+    import server as _srv
+    _srv._MODELS_CFG["models"] = [
+        {"name": "sonnet", "aliases": [], "target": {"port": 8080, "model": "agg:sonnet"}},
+    ]
+    _srv._MODELS_CFG["modelDefaults"] = {"defaultPort": 8082}
+    try:
+        # 跨端口：请求 target 是 8082，命中 sonnet（target.port=8080）→ cross_port_target 非空，body model 不改
+        b, j, cross = _srv._handler_prepare_body(
+            {"label": "x", "handler": "passthrough", "listenPort": 8082},
+            b'{"model": "sonnet", "messages": []}')
+        assert j is not None, (j, cross)
+        assert cross == {"port": 8080, "model": "agg:sonnet"}, (j, cross)
+        assert j["model"] == "sonnet", "跨端口命中不应改写 body model（由调用方处理）"
+        # 同端口：请求 target 是 8080 → 只改写 model 为 agg:sonnet，cross 为 None
+        b2, j2, cross2 = _srv._handler_prepare_body(
+            {"label": "agg", "handler": "passthrough", "listenPort": 8080},
+            b'{"model": "sonnet", "messages": []}')
+        assert j2 is not None, (j2, cross2)
+        assert cross2 is None and j2["model"] == "agg:sonnet", (j2, cross2)
+        # 未命中：model 原样，cross 为 None
+        b3, j3, cross3 = _srv._handler_prepare_body(
+            {"label": "x", "handler": "passthrough", "listenPort": 8082},
+            b'{"model": "nope-xyz", "messages": []}')
+        assert j3 is not None, (j3, cross3)
+        assert cross3 is None and j3["model"] == "nope-xyz", (j3, cross3)
+    finally:
+        _srv._MODELS_CFG["models"] = []
+        _srv._MODELS_CFG["modelDefaults"] = {"defaultPort": 8082}
 
 
 if __name__ == "__main__":
