@@ -5616,6 +5616,47 @@ async def create_message(request: MessagesRequest, raw_request: Request):
         # ── Copilot /v1/messages 透传：直接转发 Anthropic 格式到下游 /v1/messages ──
         # 绕过 convert_anthropic_to_litellm() → LiteLLM → /chat/completions 的双层翻译，
         # Anthropic 原生格式零转换，thinking/tool_use/stream 等复杂结构不会丢失。
+        # ── 统一模型定义解析：命中 models[] → Anthropic→OpenAI 翻译后转发到本地端口 ──
+        # 未命中则继续走下方原有 copilot 透传 / LiteLLM 路径。
+        mapped = _cfg._resolve_model_alias(_MODELS_CFG, original_model)
+        if mapped:
+            from anthropic_convert import convert_anthropic_request_to_openai, convert_openai_response_to_anthropic
+            _fwd_port = int(mapped["port"])
+            openai_body = convert_anthropic_request_to_openai(body_json)
+            openai_body["model"] = mapped["model"]
+            openai_payload = json.dumps(openai_body).encode("utf-8")
+            _fwd_headers = {
+                "content-type": "application/json",
+                "host": f"127.0.0.1:{_fwd_port}",
+                "content-length": str(len(openai_payload)),
+            }
+            if raw_request.headers.get("authorization"):
+                _fwd_headers["authorization"] = raw_request.headers["authorization"]
+            if raw_request.headers.get("x-api-key"):
+                _fwd_headers["x-api-key"] = raw_request.headers["x-api-key"]
+            _is_stream = bool(body_json.get("stream", False))
+            async with httpx.AsyncClient(timeout=httpx.Timeout(300.0, connect=10.0), trust_env=False) as client:
+                _req = client.build_request("POST", f"http://127.0.0.1:{_fwd_port}/v1/chat/completions", headers=_fwd_headers, content=openai_payload)
+                _resp = await client.send(_req, stream=_is_stream)
+                if _is_stream:
+                    async def _models_stream():
+                        try:
+                            async for chunk in _resp.aiter_bytes():
+                                yield chunk
+                        finally:
+                            await _resp.aclose()
+                        yield b"data: [DONE]\n\n"
+                    return StreamingResponse(_models_stream(), media_type="text/event-stream")
+                _body_bytes = await _resp.aread()
+                try:
+                    _openai_resp = json.loads(_body_bytes.decode("utf-8"))
+                except Exception:
+                    return JSONResponse(content={"error": {"type": "proxy_error", "message": "upstream invalid response"}}, status_code=502)
+                if _resp.status_code >= 400:
+                    return JSONResponse(content=_openai_resp, status_code=_resp.status_code)
+                _anthropic_resp = convert_openai_response_to_anthropic(_openai_resp, original_model)
+                return JSONResponse(content=_anthropic_resp, status_code=_resp.status_code)
+
         if PREFERRED_PROVIDER == "copilot":
             target_model = _copilot_model_name(original_model)
             copilot_msgs_body = dict(body_json)
