@@ -76,7 +76,6 @@ def load_targets(path: Path = TARGETS_PATH) -> dict:
 def validate_targets(cfg: dict) -> list:
     """校验配置，返回错误消息列表（空 = 通过）。"""
     errors = []
-    _validate_anthropic_forward(cfg.get("anthropicForward"), errors)
     targets = cfg.get("targets", [])
     labels = {}
     ports = {}
@@ -105,34 +104,68 @@ def validate_targets(cfg: dict) -> list:
         if port in ports:
             errors.append(f"端口 {port} 被多个 target 占用 ({ports[port]}, {label})")
         ports[port] = label
+
+    # modelDefaults.defaultPort 校验
+    model_defaults = cfg.get("modelDefaults", {})
+    default_port = model_defaults.get("defaultPort")
+    if default_port is not None:
+        if not isinstance(default_port, int) or default_port < 0:
+            errors.append("modelDefaults.defaultPort must be a non-negative integer")
+
+    # models 结构校验与全局唯一性
+    _validate_models(cfg.get("models", []), errors)
+
     return errors
 
 
-def _validate_anthropic_forward(af: object, errors: list) -> None:
-    """校验顶层 anthropicForward 配置（8081 转发目标：可指定默认端口 + 按模型映射端口/模型）。"""
-    if af is None:
+def _validate_models(models: list, errors: list) -> None:
+    """校验 models 结构和全局 name/alias 唯一性。"""
+    if not isinstance(models, list):
+        errors.append("models must be a list")
         return
-    if not isinstance(af, dict):
-        errors.append(f"anthropicForward 配置非法: 必须为对象")
-        return
-    default_port = af.get("defaultPort")
-    if default_port is not None and (isinstance(default_port, bool) or not isinstance(default_port, int) or default_port < 0):
-        errors.append(f"anthropicForward 配置非法: defaultPort 必须为非负整数")
-    model_map = af.get("modelMap")
-    if model_map is not None:
-        if not isinstance(model_map, dict):
-            errors.append(f"anthropicForward 配置非法: modelMap 必须为对象")
+
+    seen = set()
+    for i, m in enumerate(models):
+        if not isinstance(m, dict):
+            errors.append(f"models[{i}] must be a dict")
+            continue
+
+        # name
+        name = m.get("name")
+        if not isinstance(name, str) or not name:
+            errors.append(f"models[{i}] missing or invalid 'name' (non-empty string)")
         else:
-            for model_name, entry in model_map.items():
-                if not isinstance(entry, dict):
-                    errors.append(f"anthropicForward 配置非法: modelMap['{model_name}'] 必须为对象")
-                    continue
-                port = entry.get("port")
-                if isinstance(port, bool) or not isinstance(port, int) or port < 0:
-                    errors.append(f"anthropicForward 配置非法: modelMap['{model_name}'].port 必须为非负整数")
-                model = entry.get("model")
-                if not isinstance(model, str) or not model:
-                    errors.append(f"anthropicForward 配置非法: modelMap['{model_name}'].model 必须为非空字符串")
+            if name in seen:
+                errors.append(f"duplicate model name: '{name}'")
+            seen.add(name)
+
+        # aliases
+        aliases = m.get("aliases", [])
+        if not isinstance(aliases, list):
+            errors.append(f"models[{i}] 'aliases' must be a list")
+        else:
+            for j, a in enumerate(aliases):
+                if not isinstance(a, str):
+                    errors.append(f"models[{i}].aliases[{j}] must be a string")
+                else:
+                    if a in seen:
+                        errors.append(f"duplicate alias '{a}' (used by name '{name}' or another alias)")
+                    seen.add(a)
+
+        # target
+        target = m.get("target")
+        if not isinstance(target, dict):
+            errors.append(f"models[{i}] missing or invalid 'target' (must be dict)")
+        else:
+            port = target.get("port")
+            if not isinstance(port, int):
+                errors.append(f"models[{i}].target.port must be an integer")
+            model_name = target.get("model")
+            if not isinstance(model_name, str) or not model_name:
+                errors.append(f"models[{i}].target.model must be a non-empty string")
+
+
+
 
 
 def _validate_aggregator_target(t: dict, label: str, errors: list) -> None:
