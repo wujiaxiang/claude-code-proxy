@@ -160,6 +160,8 @@ def _validate_models(models: list, errors: list) -> None:
             port = target.get("port")
             if not isinstance(port, int):
                 errors.append(f"models[{i}].target.port must be an integer")
+            elif port == ANTHROPIC_PORT:
+                errors.append(f"models[{i}].target.port must not be {ANTHROPIC_PORT} (anthropic-compatible self-port, would create routing loop)")
             model_name = target.get("model")
             if not isinstance(model_name, str) or not model_name:
                 errors.append(f"models[{i}].target.model must be a non-empty string")
@@ -167,6 +169,8 @@ def _validate_models(models: list, errors: list) -> None:
 
 
 
+
+ANTHROPIC_PORT = 8081  # 从 server.py:2891 的 _ANTHROPIC_PORT = int(os.environ.get("ANTHROPIC_PORT", "8081")) 同源默认值
 
 def _validate_aggregator_target(t: dict, label: str, errors: list) -> None:
     """校验聚合网关 target：virtualModels / poolDefaults / quotaErrorPatterns。"""
@@ -217,6 +221,8 @@ def _validate_pool_member(label: str, vmid: str, pool_key: str, idx: int, m: obj
     port = m.get("port")
     if isinstance(port, bool) or not isinstance(port, int):
         errors.append(f"aggregator target '{label}' 虚拟模型 '{vmid}' {pool_key}[{idx}] 的 port 必须为整数")
+    elif port == ANTHROPIC_PORT:
+        errors.append(f"aggregator target '{label}' 虚拟模型 '{vmid}' {pool_key}[{idx}] 的 port 不得为 {ANTHROPIC_PORT}（anthropic-compatible 自身端口，会形成路由死循环）")
     model = m.get("model")
     if not isinstance(model, str) or not model:
         errors.append(f"aggregator target '{label}' 虚拟模型 '{vmid}' {pool_key}[{idx}] 的 model 必须为非空字符串")
