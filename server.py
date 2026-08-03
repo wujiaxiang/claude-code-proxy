@@ -784,10 +784,8 @@ _SECRETS: dict = {}
 _TARGET_STATS: Dict[str, dict] = {}
 # 模型级统计：{ label: { model_name: {"requests": N, "ok": N, "err": N, "translated429": N} } }
 _MODEL_STATS: Dict[str, Dict[str, Dict[str, int]]] = {}
-_ANTHROPIC_FORWARD_PORT = 8082
-# 8081 转发目标配置：defaultPort 兜底端口，modelMap 按 Anthropic 请求 model 精确映射到 {port, model}
-# （支持指向聚合网关 8080 + 虚拟模型 id，如 "agg:sonnet"）
-_ANTHROPIC_FORWARD_CFG: dict = {"defaultPort": 8082, "modelMap": {}}
+# 模型别名/转发目标配置（targets.json 顶层 models[] + modelDefaults）
+_MODELS_CFG: dict = {"models": [], "modelDefaults": {"defaultPort": 8082}}
 
 # ─── 聚合网关（8080）单例引擎 + 重载去重签名 ───
 _AGGREGATOR_ENGINE = None  # type: ignore
@@ -2653,17 +2651,15 @@ def _rewrite_upstream_path(handler: str, raw_path: str, route_prefix: str) -> st
 
 def _load_vendor_targets():
     """加载 targets.json + secrets.json，规范化并初始化统计。"""
-    global _TARGETS, _SECRETS, _ANTHROPIC_FORWARD_PORT, _ANTHROPIC_FORWARD_CFG
+    global _TARGETS, _SECRETS, _MODELS_CFG
     cfg = _cfg.load_targets()
     errors = _cfg.validate_targets(cfg)
     if errors:
         for e in errors:
             logger.warning(f"targets.json 配置错误: {e}")
     _TARGETS = cfg.get("targets", [])
-    _ANTHROPIC_FORWARD_PORT = cfg.get("anthropicForwardPort", 8082)
-    _ANTHROPIC_FORWARD_CFG = cfg.get("anthropicForward") or {}
-    _ANTHROPIC_FORWARD_CFG.setdefault("defaultPort", _ANTHROPIC_FORWARD_PORT)
-    _ANTHROPIC_FORWARD_CFG.setdefault("modelMap", {})
+    _MODELS_CFG["models"] = cfg.get("models", [])
+    _MODELS_CFG["modelDefaults"] = cfg.get("modelDefaults", {"defaultPort": 8082})
     _SECRETS = _cfg.load_secrets()
     for t in _TARGETS:
         label = t["label"]
@@ -2673,7 +2669,7 @@ def _load_vendor_targets():
                 "passthroughOk": 0, "passthroughError": 0,
                 "startedAt": datetime.now().isoformat(),
             }
-    print(f"🔀 Targets loaded: {len(_TARGETS)} targets, anthropicForwardPort={_ANTHROPIC_FORWARD_PORT}")
+    print(f"🔀 Targets loaded: {len(_TARGETS)} targets, models={len(_MODELS_CFG.get('models', []))}")
 
 _load_vendor_targets()
 
@@ -2692,7 +2688,7 @@ _config_mtimes: Dict[str, float] = {}
 
 async def _reload_targets() -> list:
     """重载 targets.json / secrets.json，diff 端口并动态增删 server。"""
-    global _TARGETS, _SECRETS, _ANTHROPIC_FORWARD_PORT, _ANTHROPIC_FORWARD_CFG
+    global _TARGETS, _SECRETS, _MODELS_CFG
     changes = []
     cfg = _cfg.load_targets()
     errors = _cfg.validate_targets(cfg)
@@ -2700,10 +2696,8 @@ async def _reload_targets() -> list:
         logger.error(f"配置校验失败，拒绝重载: {errors}")
         return [f"❌ 校验失败: {errors}"]
     _TARGETS = cfg.get("targets", [])
-    _ANTHROPIC_FORWARD_PORT = cfg.get("anthropicForwardPort", 8082)
-    _ANTHROPIC_FORWARD_CFG = cfg.get("anthropicForward") or {}
-    _ANTHROPIC_FORWARD_CFG.setdefault("defaultPort", _ANTHROPIC_FORWARD_PORT)
-    _ANTHROPIC_FORWARD_CFG.setdefault("modelMap", {})
+    _MODELS_CFG["models"] = cfg.get("models", [])
+    _MODELS_CFG["modelDefaults"] = cfg.get("modelDefaults", {"defaultPort": 8082})
     _SECRETS = _cfg.load_secrets()
 
     # ── 聚合网关单例：找到聚合 target 则按需初始化/reload，找不到则清空单例 ──
@@ -3055,13 +3049,13 @@ async def _handle_anthropic_proxy_request(reader, writer):
             is_stream = anthropic_body.get("stream", False)
             openai_body = convert_anthropic_request_to_openai(anthropic_body)
 
-            # 8081 转发目标映射：modelMap 命中则用配置的端口+模型（支持聚合 agg:xxx → 8080）
-            fwd_cfg = _ANTHROPIC_FORWARD_CFG
-            fwd_port = int(fwd_cfg.get("defaultPort", _ANTHROPIC_FORWARD_PORT) or _ANTHROPIC_FORWARD_PORT)
-            mapped = (fwd_cfg.get("modelMap") or {}).get(original_model)
+            # 8081 转发目标映射：models[] 命中则用配置的端口+模型（支持聚合 agg:xxx → 8080），未命中回退 modelDefaults.defaultPort
+            mapped = _cfg._resolve_model_alias(_MODELS_CFG, original_model)
             if mapped:
-                fwd_port = int(mapped.get("port", fwd_port))
-                openai_body["model"] = mapped.get("model", openai_body.get("model"))
+                fwd_port = int(mapped["port"])
+                openai_body["model"] = mapped["model"]
+            else:
+                fwd_port = int(_MODELS_CFG["modelDefaults"].get("defaultPort", 8082))
 
             openai_payload = json.dumps(openai_body).encode("utf-8")
 
@@ -3116,10 +3110,11 @@ async def _handle_anthropic_proxy_request(reader, writer):
                 writer.close(); return
             return
 
-        # ── 其余请求：透传到 _ANTHROPIC_FORWARD_PORT ──
-        upstream_url = f"http://127.0.0.1:{_ANTHROPIC_FORWARD_PORT}{raw_path}"
+        # ── 其余请求：透传到默认转发端口 ──
+        fwd_port = int(_MODELS_CFG["modelDefaults"].get("defaultPort", 8082))
+        upstream_url = f"http://127.0.0.1:{fwd_port}{raw_path}"
         fwd_headers = {k: v for k, v in headers.items() if k not in ("host", "connection")}
-        fwd_headers["host"] = f"127.0.0.1:{_ANTHROPIC_FORWARD_PORT}"
+        fwd_headers["host"] = f"127.0.0.1:{fwd_port}"
 
         async with httpx.AsyncClient(timeout=httpx.Timeout(300.0, connect=10.0), trust_env=False) as client:
             req = client.build_request(method, upstream_url, headers=fwd_headers, content=body if body else None)
@@ -3153,7 +3148,7 @@ async def _handle_anthropic_proxy_request(reader, writer):
 
 async def _anthropic_server(host="0.0.0.0", port=8081):
     srv = await asyncio.start_server(_handle_anthropic_proxy_request, host=host, port=port)
-    print(f"🔀 [claude-code-anthropic] 0.0.0.0:{port} -> http://127.0.0.1:{_ANTHROPIC_FORWARD_PORT} (Anthropic protocol, /v1/models isolated)")
+    print(f"🔀 [claude-code-anthropic] 0.0.0.0:{port} -> http://127.0.0.1:{int(_MODELS_CFG['modelDefaults'].get('defaultPort', 8082))} (Anthropic protocol, /v1/models isolated)")
     return srv
 
 
@@ -7138,7 +7133,7 @@ async def api_targets():
             item["crackEnv"] = _crack_env_check(t)
         result.append(item)
     return {
-        "anthropicForwardPort": _ANTHROPIC_FORWARD_PORT,
+        "anthropicForwardPort": _MODELS_CFG["modelDefaults"].get("defaultPort", 8082),
         "targets": result,
     }
 
@@ -7147,8 +7142,8 @@ async def api_targets():
 async def api_get_anthropic_forward():
     """返回 8081 转发目标配置（默认端口 + 按模型映射）。"""
     return {
-        "defaultPort": _ANTHROPIC_FORWARD_CFG.get("defaultPort", _ANTHROPIC_FORWARD_PORT),
-        "modelMap": _ANTHROPIC_FORWARD_CFG.get("modelMap", {}),
+        "defaultPort": _MODELS_CFG["modelDefaults"].get("defaultPort", 8082),
+        "modelMap": {},
     }
 
 
@@ -7760,7 +7755,7 @@ async def dashboard():
     _8081_err = _ANTHROPIC_STATS.get("passthroughError", 0)
     _8081_rate = round(_8081_ok / _8081_total * 100, 1) if _8081_total > 0 else 100.0
     # 8081 使用的 modelMapping 即 anthropicForwardPort 对应 target 的映射（翻译后转发到该端口）
-    _forward_target = next((t for t in _TARGETS if t.get("listenPort") == _ANTHROPIC_FORWARD_PORT), None)
+    _forward_target = next((t for t in _TARGETS if t.get("listenPort") == _MODELS_CFG["modelDefaults"].get("defaultPort", 8082)), None)
     _forward_label = _forward_target["label"] if _forward_target else None
     agg_cards.append(_build_card_html(
         name="anthropic-compatible",
