@@ -1,5 +1,4 @@
 {
-  "anthropicForwardPort": 8082,
   "targets": [
     {
       "label": "copilot-enterprise",
@@ -113,11 +112,6 @@
         "gpt-5.6-terra",
         "mai-code-1-flash-picker"
       ],
-      "modelMapping": {
-        "opus": "claude-sonnet-5",
-        "sonnet": "claude-sonnet-5",
-        "haiku": "claude-haiku-4.5"
-      },
       "isFree": false,
       "enabled": true,
       "name": "copilot-enterprise"
@@ -148,11 +142,6 @@
       ],
       "extraHeaders": {
         "Copilot-Integration-Id": "copilot-developer-cli"
-      },
-      "modelMapping": {
-        "opus": "claude-opus-4.8",
-        "sonnet": "claude-sonnet-5",
-        "haiku": "claude-haiku-4.5"
       },
       "isFree": true,
       "enabled": true
@@ -324,11 +313,6 @@
           "enabled": false
         }
       ],
-      "modelMapping": {
-        "opus": "pool-deepseek-v4-pro",
-        "sonnet": "pool-deepseek-v4-pro",
-        "haiku": "pool-deepseek-v4-flash"
-      },
       "reasoning": {
         "big": "high",
         "medium": "low",
@@ -427,12 +411,7 @@
         }
       ],
       "enabled": true,
-      "isFree": true,
-      "modelMapping": {
-        "opus": "glm-5.2",
-        "sonnet": "glm-5.1",
-        "haiku": "DeepSeek-V4-Flash"
-      }
+      "isFree": true
     },
     {
       "label": "openrouter",
@@ -2725,17 +2704,12 @@
       "isFree": false
     }
   ],
-  "anthropicForward": {
-    "defaultPort": 8082,
-    "modelMap": {
-      "sonnet": {
-        "port": 8080,
-        "model": "agg:sonnet"
-      },
-      "haiku": {
-        "port": 8082,
-        "model": "claude-haiku-4.5"
-      }
-    }
-  }
+  "modelDefaults": {
+    "defaultPort": 8082
+  },
+  "models": [
+    {"name": "sonnet", "aliases": [], "target": {"port": 8080, "model": "agg:sonnet"}},
+    {"name": "haiku", "aliases": [], "target": {"port": 8082, "model": "claude-haiku-4.5"}},
+    {"name": "opus", "aliases": [], "target": {"port": 8082, "model": "claude-sonnet-5"}}
+  ]
 }
