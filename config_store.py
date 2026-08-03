@@ -8,6 +8,7 @@ import logging
 import os
 import tempfile
 from pathlib import Path
+from typing import Optional
 
 logger = logging.getLogger("config_store")
 
@@ -165,6 +166,32 @@ def _validate_models(models: list, errors: list) -> None:
             model_name = target.get("model")
             if not isinstance(model_name, str) or not model_name:
                 errors.append(f"models[{i}].target.model must be a non-empty string")
+
+
+def _resolve_model_alias(models, requested_model: str) -> Optional[dict]:
+    """
+    统一别名解析纯函数：遍历 models 列表，若 requested_model == m["name"]
+    或 requested_model in m["aliases"]，返回 m["target"]（{"port": int, "model": str}）。
+    均未命中返回 None。models 参数允许传 list 或 dict（dict 时取 models["models"]，缺 key 视为空列表）。
+    函数内对缺失字段容错（缺 name/aliases 时跳过该条，不抛异常）。
+    """
+    if isinstance(models, dict):
+        models = models.get("models", [])
+    elif not isinstance(models, list):
+        models = []
+
+    for m in models:
+        if not isinstance(m, dict):
+            continue
+        # 检查 name 匹配
+        if m.get("name") == requested_model:
+            return m.get("target")
+        # 检查 aliases 匹配
+        aliases = m.get("aliases")
+        if isinstance(aliases, list) and requested_model in aliases:
+            return m.get("target")
+
+    return None
 
 
 
