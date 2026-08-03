@@ -7297,31 +7297,37 @@ async def api_prune_models(label: str):
     cfg_target = next((t for t in cfg["targets"] if t["label"] == label), None)
     if cfg_target is None:
         raise HTTPException(status_code=404, detail=f"target '{label}' 不存在")
-    # modelMapping 保护：映射目标在上游存在则保留对应模型；上游不存在的映射目标
-    # 不能保留（会映射到死模型导致请求失败），把映射修正为上游存在的同族模型。
-    # 注意：agg: 开头的映射目标是聚合虚拟模型（非上游模型），跳过不修正。
-    mm = cfg_target.get("modelMapping") or {}
-    # 映射目标 → 上游存在性
-    for role, target_model in list(mm.items()):
-        if target_model and str(target_model).startswith("agg:"):
+    # 模型定义保护：遍历全局 models[] 中 target.port 落在本 target 的记录，
+    # 其 target.model 若在上游不存在则修正为同族可用模型（agg: 开头的聚合虚拟
+    # 模型跳过，非上游模型）。保护后的 target.model 集合用于 kept/removed 判定，
+    # 避免把仍被模型定义引用的模型误删。不落盘 cfg 内的修正，仅用于本次判定。
+    cfg_models = cfg.get("models", [])
+    protected_set = set()
+    for rec in cfg_models:
+        if not (isinstance(rec, dict) and isinstance(rec.get("target"), dict)):
             continue
-        if target_model and target_model not in live_set:
-            # 尝试同族回退：把 role 映射到上游存在的模型（优先 sonnet/haiku 等稳定模型）
+        if int(rec["target"].get("port", -1)) != cfg_target["listenPort"]:
+            continue
+        tm = rec["target"].get("model")
+        if not tm or str(tm).startswith("agg:"):
+            continue
+        if tm in live_set:
+            protected_set.add(tm)
+        else:
             fallback = None
-            if "haiku" in role and any("haiku" in m for m in live_set):
-                fallback = next((m for m in live_set if "haiku" in m), None)
-            elif any("sonnet" in m for m in live_set):
-                fallback = next((m for m in live_set if "sonnet" in m), None)
+            if any("haiku" in mm for mm in live_set):
+                fallback = next((mm for mm in live_set if "haiku" in mm), None)
+            elif any("sonnet" in mm for mm in live_set):
+                fallback = next((mm for mm in live_set if "sonnet" in mm), None)
             if fallback:
-                mm[role] = fallback
+                protected_set.add(fallback)
     removed = []
     kept = []
     for m in cfg_target.get("models", []):
         mid = m.get("id") if isinstance(m, dict) else str(m)
         if mid and mid in live_set:
             kept.append(m)
-        elif mid and mid in set(mm.values()):
-            # 修正后的映射目标：保留（上游存在）
+        elif mid and mid in protected_set:
             kept.append(m)
         else:
             removed.append(mid)
