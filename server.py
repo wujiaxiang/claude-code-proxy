@@ -7138,30 +7138,28 @@ async def api_targets():
     }
 
 
-@app.get("/api/anthropic-forward")
-async def api_get_anthropic_forward():
-    """返回 8081 转发目标配置（默认端口 + 按模型映射）。"""
+@app.get("/api/models")
+async def api_get_models():
+    """返回全局模型定义（models[] + modelDefaults）。"""
     return {
-        "defaultPort": _MODELS_CFG["modelDefaults"].get("defaultPort", 8082),
-        "modelMap": {},
+        "models": _MODELS_CFG.get("models", []),
+        "modelDefaults": _MODELS_CFG.get("modelDefaults", {"defaultPort": 8082}),
     }
 
 
-class AnthropicForwardUpdate(BaseModel):
-    defaultPort: Optional[int] = None
-    modelMap: Optional[Dict[str, Dict[str, object]]] = None
+class ModelsUpdate(BaseModel):
+    models: Optional[List] = None
+    modelDefaults: Optional[Dict] = None
 
 
-@app.put("/api/anthropic-forward")
-async def api_update_anthropic_forward(update: AnthropicForwardUpdate):
-    """更新 8081 转发目标配置，写 targets.json 顶层 anthropicForward 并热重载。"""
+@app.put("/api/models")
+async def api_update_models(update: ModelsUpdate):
+    """更新全局模型定义，写 targets.json 顶层 models[]/modelDefaults 并热重载。"""
     cfg = _cfg.load_targets()
-    current = cfg.get("anthropicForward") or {}
-    if update.defaultPort is not None:
-        current["defaultPort"] = update.defaultPort
-    if update.modelMap is not None:
-        current["modelMap"] = update.modelMap
-    cfg["anthropicForward"] = current
+    if update.models is not None:
+        cfg["models"] = update.models
+    if update.modelDefaults is not None:
+        cfg["modelDefaults"] = update.modelDefaults
     errors = _cfg.validate_targets(cfg)
     if errors:
         raise HTTPException(status_code=422, detail=errors)
