@@ -7246,7 +7246,6 @@ class TargetUpdate(BaseModel):
     targetProtocol: Optional[str] = None
     routePrefix: Optional[str] = None
     models: Optional[List] = None
-    modelMapping: Optional[Dict[str, str]] = None
     crackTool: Optional[str] = None
     secretRef: Optional[str] = None
     apikeyEnv: Optional[str] = None
@@ -7267,16 +7266,6 @@ async def api_update_target(label: str, update: TargetUpdate):
                     if not (isinstance(m, dict) and m.get("id") == "全部模型")
                     and not (isinstance(m, str) and m == "全部模型")
                 ]
-            # ── modelMapping 防御：空 dict 表示清空映射；过滤非字符串 key/value ──
-            if "modelMapping" in payload:
-                mm = payload["modelMapping"]
-                if not isinstance(mm, dict):
-                    payload.pop("modelMapping")
-                else:
-                    payload["modelMapping"] = {
-                        str(k): str(v) for k, v in mm.items()
-                        if k is not None and v is not None
-                    }
             t.update(payload)
             break
     else:
@@ -7348,11 +7337,7 @@ async def api_prune_models(label: str):
 
 @app.get("/api/targets/{label}/mapping")
 async def api_target_mapping(label: str):
-    """返回 target 的 modelMapping 编辑数据：现有映射 + 本 target 模型列表 + 聚合虚拟模型列表。
-
-    前端据此渲染"模型映射"弹框：键=请求模型名/别名，值=转发目标模型
-    （值可为本 target 模型、聚合模型 agg:xxx，或自由输入的其他真实模型）。
-    """
+    """返回下拉数据源候选：本 target 模型列表 + 聚合虚拟模型列表。"""
     target = next((t for t in _TARGETS if t["label"] == label), None)
     if target is None:
         raise HTTPException(status_code=404, detail=f"target '{label}' 不存在")
@@ -7367,7 +7352,6 @@ async def api_target_mapping(label: str):
             agg_models.extend(sorted((t.get("virtualModels") or {}).keys()))
     return {
         "label": label,
-        "modelMapping": target.get("modelMapping") or {},
         "models": model_ids,
         "aggModels": agg_models,
     }
