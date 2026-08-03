@@ -1082,28 +1082,27 @@ def _resolve_auth(headers: dict, target: dict = None, provider: str = None) -> d
     return fwd
 
 
-def _apply_model_mapping(target: dict, body_json: dict) -> dict:
-    """按 target.modelMapping 将 Anthropic 别名（opus/sonnet/haiku）替换为真实模型。"""
-    mapping = target.get("modelMapping") or {}
-    model = body_json.get("model")
-    if model and model in mapping:
-        body_json["model"] = mapping[model]
-    return body_json
-
-
 def _handler_prepare_body(target: dict, body_bytes: bytes):
-    """按 handler 类型处理请求体：模型映射 + qclaw body 清理。
-    返回 (new_body_bytes, body_json_or_None)。
+    """按 handler 处理请求体：统一模型别名解析 + qclaw body 清理。
+    返回 (new_body_bytes, body_json_or_None, cross_port_target_or_None)。
+    cross_port_target 非 None 时表示该请求应整体路由到另一端口（调用方处理）。
     """
     handler = target.get("handler", "passthrough")
-    if handler == "passthrough":
-        return body_bytes, None
     try:
         body_json = json.loads(body_bytes.decode("utf-8")) if body_bytes else {}
     except Exception:
-        return body_bytes, None
-    if target.get("modelMapping"):
-        body_json = _apply_model_mapping(target, body_json)
+        return body_bytes, None, None
+    # ── 统一模型别名解析（所有 handler，含 passthrough）──
+    req_model = body_json.get("model")
+    mapped = None
+    if req_model and isinstance(req_model, str):
+        mapped = _cfg._resolve_model_alias(_MODELS_CFG, req_model)
+    cross_port_target = None
+    if mapped:
+        if int(mapped["port"]) == int(target.get("listenPort", 0)):
+            body_json["model"] = mapped["model"]
+        else:
+            cross_port_target = dict(mapped)
     if handler == "qclaw":
         # QClaw 网关要求必须有 system message（与 FastAPI 透传路径一致）
         msgs = body_json.get("messages", [])
@@ -1111,7 +1110,7 @@ def _handler_prepare_body(target: dict, body_bytes: bytes):
             msgs.insert(0, {"role": "system", "content": "You are Claude, a helpful AI assistant."})
             body_json["messages"] = msgs
         body_json = _clean_qclaw_body(body_json)
-    return json.dumps(body_json, ensure_ascii=False).encode("utf-8"), body_json
+    return json.dumps(body_json, ensure_ascii=False).encode("utf-8"), body_json, cross_port_target
 
 
 # ── Gemini 原生协议转换（handler=gemini-native）──
@@ -3392,7 +3391,7 @@ async def _handle_target_request(reader, writer, target):
             return
 
         # ── 上游转发（含路径重写 + handler body/header 处理）──
-        body_bytes, body_json = _handler_prepare_body(target, body)
+        body_bytes, body_json, cross_port_target = _handler_prepare_body(target, body)
         # 模型级统计：解析请求模型名（映射后真实模型）
         _req_model = None
         if body_json and isinstance(body_json, dict):
@@ -3422,18 +3421,19 @@ async def _handle_target_request(reader, writer, target):
             ).encode("utf-8")
             logger.info(f"[{label}] responses bridge: {_req_model} → /responses (chat→responses)")
 
-        # ── agg:xxx 目标：modelMapping 映射到聚合模型 → 改路由到本地聚合网关 ──
-        # 聚合网关不透传 secretRef/apikeyEnv，只透传客户端 Authorization（凭据归池内
-        # 成员端口自己处理）；且成员端口会各自重写 path/鉴权，因此这里保留原始 path、
-        # 透传原始客户端 headers，不注入本 target 凭据/extraHeaders。
-        _agg_target = next((t for t in _TARGETS if t.get("handler") == "aggregator" and t.get("enabled", True)), None)
-        _to_agg = bool(_agg_target and _req_model and str(_req_model).startswith("agg:"))
-        if _to_agg:
-            _agg_port = _agg_target["listenPort"]
-            upstream_url = f"http://127.0.0.1:{_agg_port}{raw_path}"
+        # ── 跨端口路由：请求模型命中 models[] 别名且 target.port 指向另一端口 → 整体改路由 ──
+        # Todo 7 已在 _handler_prepare_body 里产出 cross_port_target（命中跨端口时只回信号，不改 body model）；
+        # 这里统一消费信号：改写 body.model 为目标模型、重序列化 body_bytes，并把 upstream 切到目标端口。
+        # 跨端口场景下透传原始客户端 headers（目标端口自己处理鉴权/重写），不注入本 target 凭据。
+        if cross_port_target:
+            _cross_port = int(cross_port_target["port"])
+            if body_json and isinstance(body_json, dict):
+                body_json["model"] = cross_port_target["model"]
+                body_bytes = json.dumps(body_json, ensure_ascii=False).encode("utf-8")
+            upstream_url = f"http://127.0.0.1:{_cross_port}{raw_path}"
             fwd_headers = {k: v for k, v in headers.items() if k.lower() not in ("host", "connection", "content-length", "transfer-encoding")}
-            fwd_headers["host"] = f"127.0.0.1:{_agg_port}"
-            logger.info(f"[{label}] modelMapping → 聚合路由: {_req_model} → 127.0.0.1:{_agg_port}{raw_path}")
+            fwd_headers["host"] = f"127.0.0.1:{_cross_port}"
+            logger.info(f"[{label}] cross-port route: {_req_model} → 127.0.0.1:{_cross_port}{raw_path} model={cross_port_target['model']}")
         else:
             transport = "https" if target.get("targetProtocol", "https") == "https" else "http"
             upstream_path = _rewrite_upstream_path(
