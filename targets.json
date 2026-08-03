@@ -2708,8 +2708,29 @@
     "defaultPort": 8082
   },
   "models": [
-    {"name": "sonnet", "aliases": [], "target": {"port": 8080, "model": "agg:sonnet"}},
-    {"name": "haiku", "aliases": [], "target": {"port": 8082, "model": "claude-haiku-4.5"}},
-    {"name": "opus", "aliases": [], "target": {"port": 8082, "model": "claude-sonnet-5"}}
+    {
+      "name": "sonnet",
+      "aliases": [],
+      "target": {
+        "port": 8080,
+        "model": "agg:sonnet"
+      }
+    },
+    {
+      "name": "haiku",
+      "aliases": [],
+      "target": {
+        "port": 8082,
+        "model": "claude-haiku-4.5"
+      }
+    },
+    {
+      "name": "opus",
+      "aliases": [],
+      "target": {
+        "port": 8082,
+        "model": "claude-sonnet-5"
+      }
+    }
   ]
 }
