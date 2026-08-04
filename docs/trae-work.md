@@ -271,6 +271,46 @@ event: queue_*         # 排队事件（request_wait_in_queue 含 position，不
 
 **教训（已做代码级审查确认根治）**：任何"提取 JSON 对象子串"的场景一律禁止用正则模拟花括号配对——这是同一类错误第三次出现（DSML 配对正则、reasoning 多段提取、这次的 XML JSON 提取）。统一改用平衡括号扫描 `_extract_balanced_json`（原仅用于 `[Tool Call:]` 文本格式，现 DSML/XML 两条路径同步收编），全代码库 grep 确认无残留同类脆弱正则。
 
+### Wave 2 新发现并已修复的文本变体（2026-08-03 抓包）
+
+下列文本来自 `proxy.log` 实际抓取后脱敏；其中大段文本日志曾被 `text[:2000]`
+截断，示例不声称保留完整原文。2026-08-04 的实现和回归用例覆盖了以下三个具体形态：
+
+1. **`<seed_call>` + `invoke`，闭合标签不对称**（Todo 5）：脱敏示例：
+   ```xml
+   <seed_call><invoke name="bash"><parameter name="command">…</parameter></invoke></tool_call>
+   ```
+   根因：已有解析器只覆盖 DSML、`[Tool Call:]` 与标准 `<tool_call>` 形态，未识别
+   `<seed_call>` 外层；实际样本用 `</tool_call>` 而非 `</seed_call>` 闭合。修复：新增
+   `_SEED_CALL_RE`，以 `re.search` 语义匹配不受前置正文影响，并容忍 `</seed_call>`、
+   `</tool_call>`、`</seed:tool_call>` 三种外层闭合；内部 `<invoke name="X">` 参数按
+   标签位置切片，JSON 参数仍交给 `_extract_balanced_json`，不用非贪婪正则截取参数值。
+
+2. **`<seed_call>` + `function`，带 `string="true"` 属性**（Todo 5）：脱敏示例：
+   ```xml
+   <seed_call><function name="bash"><parameter name="command" string="true">…</parameter></function></seed:tool_call>
+   ```
+   根因：同属未覆盖的 `<seed_call>` 外层变体，且 `<parameter>` 额外的 `string="true"`
+   属性不能影响参数名和值的提取。修复：同一 `_SEED_CALL_RE` 接入第 5 种解析尝试，
+   加入 `<function name="X">` 子变体；参数开标签只读取 `name`，忽略其余属性。解析出
+   工具调用后，`_resolve_trae_text` 的正文清洗链先执行 `_SEED_CALL_RE.sub()`，再执行
+   `_DSML_BLOCK_RE.sub()`，保证原始调用块不会残留到 content。
+
+3. **自由文本前缀混杂标准 `<tool_call>` JSON 的多行 command**（Todo 6）：脱敏示例：
+   ```xml
+   说明正文…<tool_call>{"name":"bash","arguments":{"command":"python3 -c '\n多行脚本，含 {…} 与 \"…\"'"}}</tool_call>后续正文…
+   ```
+   根因经合成完整 fixture 调试确认：`_TOOLCALL_XML_RE.search()` 已能在自由文本后找到
+   `<tool_call>`，`_extract_balanced_json` 也能提取完整对象；失败点是默认
+   `json.loads()` 拒绝 command 字符串中的原始多行控制字符。修复：该 XML 路径改为
+   `json.loads(..., strict=False)`，保留原始多行 command；未知标记警告的文本上限由
+   `text[:2000]` 提升为 `text[:16384]`，使后续抓包保留足够的诊断上下文。
+
+**当前已知局限性**：本轮仅覆盖上述两个 `<seed_call>` 子变体和完整闭合、但 command
+含原始多行控制字符的标准 `<tool_call>` JSON。未闭合标记仍按原文保留以便排查；模型仍
+可能产生未覆盖的第 6+ 种文本变体。命中疑似标记但未解析时会记录 warning，后续须以日志
+和 fixture 验证为准，不能宣称已穷尽所有变体。
+
 ### 判定逻辑
 
 不按模型名硬编码：响应含 `tool_calls` 字段 → A 路径立即转发；否则 `response`/`content` 一律走纯累积 + 流结束统一解析（B 路径，见上）。新模型自动归队。
