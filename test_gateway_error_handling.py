@@ -115,7 +115,7 @@ async def start_mock_upstream(handler_coro, port=None):
     """启动 mock 上游 HTTP 服务器，返回 (server, port)"""
     if port is None:
         port = find_free_port()
-    
+
     async def handle(reader, writer):
         try:
             await handler_coro(reader, writer)
@@ -126,7 +126,7 @@ async def start_mock_upstream(handler_coro, port=None):
                 writer.close()
             except Exception:
                 pass
-    
+
     srv = await asyncio.start_server(handle, "127.0.0.1", port)
     return srv, port
 
@@ -258,12 +258,12 @@ async def test_1_connect_error_502():
         srv.bind(("127.0.0.1", port))
         srv.listen(1)
         srv.close()
-        
+
         target = make_target(port, label="test-connect-error")
         req = make_request(stream=False)
-        
+
         resp, captured = await run_target(target, req, timeout=5.0)
-        
+
         assert b"HTTP/1.1 502" in resp, f"Expected 502, got: {resp[:200]}"
         print(f"PASS test_1_connect_error_502")
         passed += 1
@@ -281,14 +281,14 @@ async def test_2_connect_timeout_502():
     original_timeout = server._TARGET_HTTPX_TIMEOUT
     try:
         server._TARGET_HTTPX_TIMEOUT = httpx.Timeout(connect=0.5, read=300.0, write=300.0, pool=300.0)
-        
+
         target = make_target(80, label="test-connect-timeout")
         target["targetHost"] = "192.0.2.1"
         target["targetPort"] = 80
         req = make_request(stream=False)
-        
+
         resp, captured = await run_target(target, req, timeout=10.0)
-        
+
         assert b"HTTP/1.1 502" in resp, f"Expected 502, got: {resp[:200]}"
         print(f"PASS test_2_connect_timeout_502")
         passed += 1
@@ -308,14 +308,14 @@ async def test_3_read_timeout_504():
     original_timeout = server._TARGET_HTTPX_TIMEOUT
     try:
         server._TARGET_HTTPX_TIMEOUT = httpx.Timeout(read=1.0, connect=1.0, write=300.0, pool=300.0)
-        
+
         upstream_srv, upstream_port = await start_mock_upstream(mock_upstream_send_headers_only)
         try:
             target = make_target(upstream_port, label="test-read-timeout")
             req = make_request(stream=False)
-            
+
             resp, captured = await run_target(target, req, timeout=5.0)
-            
+
             assert b"HTTP/1.1 504" in resp, f"Expected 504, got: {resp[:200]}"
             print(f"PASS test_3_read_timeout_504")
             passed += 1
@@ -338,19 +338,19 @@ async def test_4_remote_protocol_error_no_nameerror():
     original_timeout = server._TARGET_HTTPX_TIMEOUT
     try:
         server._TARGET_HTTPX_TIMEOUT = httpx.Timeout(read=2.0, connect=1.0, write=300.0, pool=300.0)
-        
+
         upstream_srv, upstream_port = await start_mock_upstream(mock_upstream_partial_chunked_then_close)
         try:
             target = make_target(upstream_port, label="test-remote-protocol")
             req = make_request(stream=False)
-            
+
             resp, captured = await run_target(target, req, timeout=5.0)
-            
+
             handler_exc = captured.get("handler_exc")
             if handler_exc:
                 assert "NameError" not in type(handler_exc).__name__, f"Got NameError: {handler_exc}"
                 assert "httpcore" not in str(handler_exc), f"httpcore in exception: {handler_exc}"
-            
+
             assert b"HTTP/1.1 502" in resp or len(resp) == 0, f"Expected 502 or empty, got: {resp[:200]}"
             print(f"PASS test_4_remote_protocol_error_no_nameerror")
             passed += 1
@@ -375,9 +375,9 @@ async def test_5_body_embedded_error_rewrite():
         try:
             target = make_target(upstream_port, label="test-body-error")
             req = make_request(stream=False)
-            
+
             resp, captured = await run_target(target, req, timeout=5.0)
-            
+
             assert b"HTTP/1.1 504" in resp, f"Expected 504 status, got: {resp[:200]}"
             assert b"Gateway Timeout" in resp, f"Expected 'Gateway Timeout' reason, got: {resp[:200]}"
             expected_body = json.dumps({
@@ -407,9 +407,9 @@ async def test_6_false_positive_choices():
         try:
             target = make_target(upstream_port, label="test-false-positive")
             req = make_request(stream=False)
-            
+
             resp, captured = await run_target(target, req, timeout=5.0)
-            
+
             assert b"HTTP/1.1 200" in resp, f"Expected 200, got: {resp[:200]}"
             assert b"choices" in resp and b"chat.completion" in resp, f"Body modified: {resp}"
             print(f"PASS test_6_false_positive_choices")
@@ -433,9 +433,9 @@ async def test_7_false_positive_upstream_not_200():
         try:
             target = make_target(upstream_port, label="test-upstream-500")
             req = make_request(stream=False)
-            
+
             resp, captured = await run_target(target, req, timeout=5.0)
-            
+
             assert b"HTTP/1.1 500" in resp, f"Expected 500, got: {resp[:200]}"
             print(f"PASS test_7_false_positive_upstream_not_200")
             passed += 1
@@ -456,22 +456,22 @@ async def test_8_stream_abort_after_headers_sent():
     original_timeout = server._TARGET_HTTPX_TIMEOUT
     try:
         server._TARGET_HTTPX_TIMEOUT = httpx.Timeout(read=2.0, connect=1.0, write=300.0, pool=300.0)
-        
+
         upstream_srv, upstream_port = await start_mock_upstream(mock_upstream_stream_then_close)
         try:
             target = make_target(upstream_port, label="test-stream-abort")
             req = make_request(stream=True)
-            
+
             resp, captured = await run_target(target, req, timeout=5.0)
-            
+
             http_count = resp.count(b"HTTP/1.1")
             assert http_count == 1, f"Expected exactly 1 status line, got {http_count}: {resp[:500]}"
-            
+
             assert b"HTTP/1.1 200" in resp, f"Expected 200 status line, got: {resp[:200]}"
-            
+
             assert b"data: {\"a\":1}" in resp
             assert b"data: {\"b\":2}" in resp
-            
+
             print(f"PASS test_8_stream_abort_after_headers_sent")
             passed += 1
         finally:
@@ -495,18 +495,18 @@ async def test_9_normal_stream_unaffected():
         try:
             target = make_target(upstream_port, label="test-normal-stream")
             req = make_request(stream=True)
-            
+
             resp, captured = await run_target(target, req, timeout=5.0)
-            
+
             http_count = resp.count(b"HTTP/1.1")
             assert http_count == 1, f"Expected exactly 1 status line, got {http_count}"
-            
+
             assert b"HTTP/1.1 200" in resp
-            
+
             assert b"Hello" in resp
             assert b"world" in resp
             assert b"[DONE]" in resp
-            
+
             print(f"PASS test_9_normal_stream_unaffected")
             passed += 1
         finally:
@@ -530,7 +530,7 @@ async def test_10_api_stream_proxy_path():
         )
         lines = result.stdout.strip().split('\n')
         assert len(lines) >= 3, f"Expected at least 3 headers_sent assignments, found {len(lines)}: {lines}"
-        
+
         print(f"PASS test_10_api_stream_proxy_path (grep verified {len(lines)} headers_sent assignments)")
         passed += 1
     except AssertionError as e:
@@ -545,20 +545,20 @@ async def test_mutation_body_error_detection():
     """Mutation testing: 临时禁用 body 嵌错误码检测，验证测试能捕获回归"""
     global passed, failed
     original_func = server._write_response_with_status_override
-    
+
     async def noop_override(writer, resp, effective_status, *, stats=None):
         await server._write_response(writer, resp, stats=stats)
-    
+
     server._write_response_with_status_override = noop_override
-    
+
     try:
         upstream_srv, upstream_port = await start_mock_upstream(mock_upstream_200_with_error_envelope)
         try:
             target = make_target(upstream_port, label="test-mutation")
             req = make_request(stream=False)
-            
+
             resp, captured = await run_target(target, req, timeout=5.0)
-            
+
             assert b"HTTP/1.1 200" in resp, f"Mutation test: expected 200 when detection disabled, got: {resp[:200]}"
             print(f"PASS test_mutation_body_error_detection (mutation detected)")
             passed += 1
@@ -567,14 +567,14 @@ async def test_mutation_body_error_detection():
             await upstream_srv.wait_closed()
     finally:
         server._write_response_with_status_override = original_func
-        
+
         upstream_srv, upstream_port = await start_mock_upstream(mock_upstream_200_with_error_envelope)
         try:
             target = make_target(upstream_port, label="test-mutation-restore")
             req = make_request(stream=False)
-            
+
             resp, captured = await run_target(target, req, timeout=5.0)
-            
+
             assert b"HTTP/1.1 504" in resp, f"Restore test: expected 504 after restore, got: {resp[:200]}"
             print(f"PASS test_mutation_body_error_detection (restore verified)")
             passed += 1
@@ -587,7 +587,7 @@ async def test_mutation_body_error_detection():
 
 async def run_all_tests():
     global passed, failed
-    
+
     tests = [
         test_1_connect_error_502,
         test_2_connect_timeout_502,
@@ -601,14 +601,14 @@ async def run_all_tests():
         test_10_api_stream_proxy_path,
         test_mutation_body_error_detection,
     ]
-    
+
     for t in tests:
         try:
             await t()
         except Exception as e:
             print(f"ERROR {t.__name__}: {e}")
             failed += 1
-    
+
     print(f"\n{passed}/{passed + failed} passed")
     return 1 if failed else 0
 

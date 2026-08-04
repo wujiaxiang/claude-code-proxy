@@ -1124,7 +1124,7 @@ async def _write_response_with_status_override(writer, resp, effective_status: i
         # 读取原始 body 字节（resp 已在调用方 aread() 过，这里直接用 resp.content 或重新 aread）
         # 注意：调用方已执行 await resp.aread()，所以 resp.content 可用
         body_bytes = resp.content if hasattr(resp, "content") and resp.content is not None else await resp.aread()
-        
+
         reason = _get_status_reason(effective_status)
         # 写状态行 + 头部 + Content-Length + body（body 字节级保持原样）
         writer.write(f"HTTP/1.1 {effective_status} {reason}\r\n{resp_headers}Content-Length: {len(body_bytes)}\r\n\r\n".encode())
@@ -3750,7 +3750,7 @@ async def _handle_target_request(reader, writer, target):
     except (ConnectionResetError, RuntimeError):
         # 客户端提前断开（写阶段异常，如 RuntimeError: unable to perform operation on <TCPTransport closed=True>）
         # 此异常发生在写入阶段，headers 已提交或正在提交，二次写无意义 → 仅记录 + 关闭连接
-        logger.warning(f"[{label}] client disconnected mid-transfer, closing connection")
+        logger.warning(f"[{label}] client disconnected mid-transfer, closing connection", exc_info=True)
         try:
             writer.close()
         except Exception:
@@ -5428,7 +5428,7 @@ async def handle_streaming(
                             else:
                                 # 没开启 thinking，用 index 0 的 text block（已在外面初始化）
                                 text_block_index = 0
-                            
+
                             text_sent = True
                             yield f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta', 'index': text_block_index, 'delta': {'type': 'text_delta', 'text': delta_content}})}\n\n"
 
@@ -8244,7 +8244,7 @@ async def dashboard():
     </div>
   </div>
 
-  
+
 <script>
 // ── 手风琴交互（互斥，任一时刻只展开一个）──
 (function() {{
