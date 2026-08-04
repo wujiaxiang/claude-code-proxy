@@ -2243,9 +2243,34 @@ _SEED_CALL_PARAM_OPEN_RE = re.compile(r'<parameter\s+name="([^"]*)"[^>]*>', re.I
 _TOOLCALL_NAME_RE = re.compile(r"<tool_name\b[^>]*>([\s\S]*?)</tool_name\s*>", re.I)
 _TOOLCALL_PARAM_RE = re.compile(
     r'<parameter\s+name="([^"]*)"[^>]*>([\s\S]*?)</parameter\s*>', re.I)
+# ── 官方 seed-oss / Qwen3 XML 语法（vLLM 官方 parser，2026-08-04 补全）──
+# Qwen3/seed-oss 模型原生工具调用格式（vllm/parser/qwen3.py + seed_oss.py）：
+#   <think>...</think>（seed-oss 用 <seed:think>）推理
+#   <seed:tool_call><function=bash><parameter=command>ls -la</parameter></function></seed:tool_call>
+# 关键差异：function/parameter 用"无空格无引号"的 <tag=name> 属性形式，且
+# seed-oss 外层是 <seed:tool_call>（带冒号），与已支持的 <seed_call>（无冒号）
+# 和 <function name="..">（带空格引号）是两套不同语法——官方 parser 三者都认。
+# 此外官方 parser 还容忍：无 <tool_call> 前缀直接 <function=>（fallback）、
+# </function> 后直接下一个 <tool_call>（连续调用未闭合外层）。
+_SEED_TOOL_CALL_RE = re.compile(
+    r"<seed:tool_call\b[^>]*>([\s\S]*?)(?:</seed:tool_call\s*>|</seed_call\s*>|</tool_call\s*>)", re.I)
+_QWEN_FUNC_RE = re.compile(r"<function\s*=\s*([^>\s/]+)\s*>([\s\S]*?)(?:</function\s*>|(?=<tool_call\b|<seed:tool_call\b|<seed_call\b))", re.I)
+_QWEN_PARAM_RE = re.compile(
+    r"<parameter\s*=\s*([^>\s/]+)\s*>([\s\S]*?)(?:</parameter\s*>|(?=<parameter\s*=|<function\s*=</tool_call\b|<seed:tool_call\b))", re.I)
 # 变体 7（2026-08-04 实测）：模型把历史工具结果用 <seed:tool_result> 包裹复述
 # （无闭合标签，直接透传给客户端显示重复的历史 grep 结果）。识别用于剥离。
 _SEED_TOOL_RESULT_OPEN_RE = re.compile(r"<seed:tool_result\b[^>]*>", re.I)
+# 通用工具调用意图正则（2026-08-04 根治层）：匹配任意 XML 标签中出现的工具
+# 语义关键词。模型自由生成时无论发明什么标签排列（<any_tool_xxx>、<tool:xxx>、
+# <func>、<param> 等），只要标签名含这些关键词就命中——这是"不再打地鼠"的
+# 关键：识别层从"已知标签白名单"升级为"语义关键词通用匹配"，新变体自动落入
+# 剥离路径，不会静默透传。仅匹配 XML 标签形态（<...>），正文里出现 function/
+# tool 等单词不误伤。
+_TOOL_INTENT_TAG_RE = re.compile(
+    r"<(?:[a-zA-Z_:][\w:.-]*)?\s*[a-zA-Z_:]*"
+    r"(?:tool(?:[_:\-](?:call|name|result|usage))?|func(?:tion)?|parameter|param(?:s)?|"
+    r"invoke|argument|args|arg|tool_call|seed_call|execute|cmd|command|call)\b[^>]*>",
+    re.I)
 
 
 def _build_trae_tool_prompt(tools: list) -> str:
@@ -2295,17 +2320,27 @@ def _looks_like_dsml(text: str) -> bool:
     {"reasoning_content":"..."} JSON 字面量（思考封装）、<tool_call> XML、
     <seed_call>/<seed:tool_result> 等 seed 系标签，以及各形态的分片半截
     （尽早进入缓冲累积，避免原始标记/JSON 字面量透传给客户端）。
+
+    2026-08-04 根治：在"具体特征白名单"之上叠加**通用意图正则**
+    （_TOOL_INTENT_TAG_RE）——模型发明新标签时，只要标签名含工具语义关键词
+    （tool_call/function/parameter/invoke/tool_name/tool_result/arguments 等），
+    一律判定为疑似工具调用进入剥离路径，不再逐个打地鼠。关键词限定在 XML
+    标签形态内（<...>），避免误伤普通正文里出现"function"等单词。
     """
     t = text or ""
     return bool(_DSML_LIKE_RE.search(t) or _TOOLCALL_TEXT_RE.search(t)
                 or _DSML_REASONING_RE.search(t) or _TOOLCALL_XML_RE.search(t)
                 or _DSML_ANY_TAG_RE.search(t)
                 or _SEED_CALL_RE.search(t) or _SEED_TOOL_RESULT_OPEN_RE.search(t)
+                or _SEED_TOOL_CALL_RE.search(t) or _QWEN_FUNC_RE.search(t)
                 or _TOOLCALL_NAME_RE.search(t) or _TOOLCALL_PARAM_RE.search(t)
+                or "<seed:think" in t or "<think" in t
+                or "<function=" in t
                 or "<seed:" in t or "<tool_" in t
                 or "[Tool Call" in t or "Arguments:" in t
                 or '{"reasoning_content"' in t or "reasoning_content" in t
-                or "tool_call" in t or t.startswith('{"'))
+                or "tool_call" in t or t.startswith('{"')
+                or bool(_TOOL_INTENT_TAG_RE.search(t)))
 
 
 # ── 架构说明（2026-08-02 重构）──────────────────────────────────────────
@@ -2385,6 +2420,12 @@ def _resolve_trae_text(full_text: str) -> tuple[list, str, str]:
         # 强标记界定块边界），再删 <tool_call> 等调用块——反序会因调用块已删
         # 找不到边界而吞掉复述块之后的正文（2026-08-04 实测）。
         content_text = _SEED_CALL_RE.sub("", text)
+        content_text = _SEED_TOOL_CALL_RE.sub("", content_text)
+        # 官方 seed-oss 推理标签 <seed:think>...</seed:think>（Qwen3 用 <think>）：
+        # 推理内容已由上游 reasoning_content 结构化字段单独转发，文本形态的
+        # think 标签不透明传给客户端（与 reasoning JSON 字面量同一处理原则）
+        content_text = re.sub(r"<seed:think\b[^>]*>[\s\S]*?</seed:think\s*>", "", content_text, flags=re.I)
+        content_text = re.sub(r"<think\b[^>]*>[\s\S]*?</think\s*>", "", content_text, flags=re.I)
         content_text = _strip_seed_tool_result_blocks(content_text)
         content_text = _DSML_BLOCK_RE.sub("", content_text)
         content_text = _DSML_TOOLCALLS_BLOCK_RE.sub("", content_text)
@@ -2394,10 +2435,71 @@ def _resolve_trae_text(full_text: str) -> tuple[list, str, str]:
             if args is not None:
                 content_text = content_text.replace(args, "", 1)
         content_text = _TOOLCALL_XML_RE.sub("", content_text)
+        # 官方 seed-oss 语法（<seed:tool_call><function=..>）已由 _SEED_TOOL_CALL_RE
+        # 剥离；裸 <function=..>（无外层）由 _QWEN_FUNC_RE 兜底剥离
+        content_text = _QWEN_FUNC_RE.sub("", content_text)
         content_text = content_text.strip()
     else:
         content_text = text.strip()
     return tool_calls, reasoning_text, content_text
+
+
+def _strip_generic_tool_blocks(text: str) -> str:
+    """通用剥离：移除任意"工具语义" XML 标签块（2026-08-04 根治层）。
+
+    配合 _looks_like_dsml 的通用意图正则 _TOOL_INTENT_TAG_RE——检测层已从
+    "已知标签白名单"升级为"语义关键词通用匹配"，剥离层必须同样通用，否则
+    检测到新变体却剥不掉（白名单剥离 = 检测白搭，依旧泄漏）。
+
+    做法：扫描文本中所有含工具语义关键词的标签（<tool_xxx>/<function>/
+    <parameter>/<invoke>/<args> 等任意排列），对每个开标签用**平衡标签扫描**
+    找到对应闭标签（支持嵌套，如 <tool_call><function>..</function></tool_call>），
+    整块删除；未闭合的开标签从开标签剥离到文本末尾（调用输出被截断时，
+    其后都是调用内容，原样透传只会泄漏半截 XML）。
+    """
+    out = text
+    while True:
+        m = _TOOL_INTENT_TAG_RE.search(out)
+        if not m:
+            break
+        start = m.start()
+        open_tag = m.group(0)
+        # 自闭合标签 <call name=".." /> → 直接删
+        if open_tag.rstrip().endswith("/>"):
+            out = out[:start] + out[m.end():]
+            continue
+        # 提取开标签名（含命名空间前缀，如 <seed:tool_call> → seed:tool_call）
+        name_m = re.match(r"<([a-zA-Z_:][\w:.-]*)", open_tag)
+        if not name_m:
+            out = out[:start] + out[m.end():]
+            continue
+        open_name = name_m.group(1)
+        # 平衡扫描：找到与该开标签配对的闭标签（容忍嵌套同名标签）
+        depth = 1
+        pos = m.end()
+        close_re = re.compile(rf"</{re.escape(open_name)}\s*>", re.I)
+        open_re = re.compile(rf"<{re.escape(open_name)}\b[^>]*>", re.I)
+        end = None
+        while pos < len(out):
+            nxt_open = open_re.search(out, pos)
+            nxt_close = close_re.search(out, pos)
+            if nxt_close and (not nxt_open or nxt_close.start() < nxt_open.start()):
+                depth -= 1
+                if depth == 0:
+                    end = nxt_close.end()
+                    break
+                pos = nxt_close.end()
+            elif nxt_open:
+                depth += 1
+                pos = nxt_open.end()
+            else:
+                break
+        if end is not None:
+            out = out[:start] + out[end:]
+        else:
+            # 未闭合：开标签之后全部视为调用内容，剥离到末尾
+            out = out[:start]
+    return out
 
 
 def _strip_strong_tool_markers(text: str) -> str:
@@ -2413,6 +2515,10 @@ def _strip_strong_tool_markers(text: str) -> str:
     """
     out = text
     out = _SEED_CALL_RE.sub("", out)
+    out = _SEED_TOOL_CALL_RE.sub("", out)
+    # 官方 seed-oss/Qwen3 推理标签（<seed:think>/<think>）不透明给客户端
+    out = re.sub(r"<seed:think\b[^>]*>[\s\S]*?</seed:think\s*>", "", out, flags=re.I)
+    out = re.sub(r"<think\b[^>]*>[\s\S]*?</think\s*>", "", out, flags=re.I)
     # 先剥 <seed:tool_result>（依赖 <tool_call>/<invoke> 等强标记界定边界），再删调用块
     out = _strip_seed_tool_result_blocks(out)
     out = _TOOLCALL_XML_RE.sub("", out)
@@ -2427,6 +2533,21 @@ def _strip_strong_tool_markers(text: str) -> str:
     unclosed = re.search(r"<tool_call\b[^>]*>", out, re.I)
     if unclosed:
         out = out[:unclosed.start()]
+    # 未闭合 <seed:tool_call> 开标签（官方 seed-oss 外层，截断）→ 剥到末尾
+    unclosed_seed = re.search(r"<seed:tool_call\b[^>]*>", out, re.I)
+    if unclosed_seed:
+        out = out[:unclosed_seed.start()]
+    # 未闭合 <function=..> 开标签（官方语法，无闭合 </function>）→ 剥到末尾
+    unclosed_func = re.search(r"<function\s*=\s*[^>]*>", out, re.I)
+    if unclosed_func:
+        out = out[:unclosed_func.start()]
+    # 未闭合 <seed:think>/<think> 开标签（截断）→ 剥到末尾
+    unclosed_think = re.search(r"<seed:think\b[^>]*>|<think\b[^>]*>", out, re.I)
+    if unclosed_think:
+        out = out[:unclosed_think.start()]
+    # 根治兜底：通用剥离任意"工具语义" XML 标签块（覆盖所有未识别新变体）
+    # 已知格式已被上方逐条剥离，此处处理剩余的任何工具语义标签排列。
+    out = _strip_generic_tool_blocks(out)
     return out
 
 
@@ -2582,6 +2703,69 @@ def _parse_dsml_tool_calls(text: str) -> list:
                     if params:
                         item["function"]["arguments"] = json.dumps(params, ensure_ascii=False)
                     tcs.append(item)
+    if not tcs:
+        # 变体 8（2026-08-04，官方 seed-oss/Qwen3 XML 语法，vllm qwen3.py）：
+        #   <seed:tool_call><function=bash><parameter=command>ls</parameter></function></seed:tool_call>
+        # 官方语法用"无空格无引号"的 <tag=name> 属性形式（与 <function name="..">
+        # 带空格引号形式是两套不同语法），seed-oss 外层为 <seed:tool_call>（带冒号）。
+        # 官方 parser 还容忍：无外层直接 <function=>（fallback）、</function> 后
+        # 连续下一个 <tool_call>。先匹配 <seed:tool_call> 外层，再匹配裸 <function=>。
+        for block in _SEED_TOOL_CALL_RE.findall(text):
+            tcs.extend(_parse_qwen_func_params(block))
+        if not tcs:
+            # 无 <seed:tool_call> 外层：官方 parser 的 fallback——裸 <function=> 直接解析
+            for tool_name, func_body in _QWEN_FUNC_RE.findall(text):
+                tool_name = tool_name.strip()
+                if not tool_name:
+                    continue
+                params = {}
+                for param_name, param_val in _QWEN_PARAM_RE.findall(func_body):
+                    param_name = param_name.strip()
+                    param_val = param_val.strip()
+                    if param_name:
+                        json_start = param_val.find("{")
+                        if json_start >= 0:
+                            balanced_value = _extract_balanced_json(param_val, json_start)
+                            if balanced_value is not None and not param_val[:json_start].strip():
+                                param_val = balanced_value
+                        params[param_name] = param_val
+                item = {"type": "function", "function": {"name": tool_name}}
+                if params:
+                    item["function"]["arguments"] = json.dumps(params, ensure_ascii=False)
+                tcs.append(item)
+    return tcs
+
+
+def _parse_qwen_func_params(func_body: str) -> list:
+    """解析官方 Qwen3/seed-oss <function=..> 块内的 <parameter=..> 参数为 tool_calls。
+
+    与 _QWEN_PARAM_RE 配合：一个 function 块内可能有多个 <parameter=key>value</parameter>，
+    全部收集成 {param_name: value} 再序列化 arguments。JSON 值走平衡括号提取，
+    防止嵌套花括号截断（与 _parse_toolcall_subtags 同一教训）。
+    """
+    tcs = []
+    func_re = re.compile(r"<function\s*=\s*([^>\s/]+)\s*>([\s\S]*?)(?:</function\s*>|$)", re.I)
+    for fm in func_re.finditer(func_body):
+        tool_name = fm.group(1).strip()
+        if not tool_name:
+            continue
+        inner = fm.group(2)
+        params = {}
+        for pm in _QWEN_PARAM_RE.finditer(inner):
+            param_name = pm.group(1).strip()
+            param_val = pm.group(2).strip()
+            if not param_name:
+                continue
+            json_start = param_val.find("{")
+            if json_start >= 0:
+                balanced_value = _extract_balanced_json(param_val, json_start)
+                if balanced_value is not None and not param_val[:json_start].strip():
+                    param_val = balanced_value
+            params[param_name] = param_val
+        item = {"type": "function", "function": {"name": tool_name}}
+        if params:
+            item["function"]["arguments"] = json.dumps(params, ensure_ascii=False)
+        tcs.append(item)
     return tcs
 
 

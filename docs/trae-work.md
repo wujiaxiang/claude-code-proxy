@@ -343,6 +343,73 @@ event: queue_*         # 排队事件（request_wait_in_queue 含 position，不
 可能产生未覆盖的第 6+ 种文本变体。命中疑似标记但未解析时会记录 warning，后续须以日志
 和 fixture 验证为准，不能宣称已穷尽所有变体。
 
+### Wave 3/4：打地鼠根因修复 + 官方格式补全（2026-08-04）
+
+**为什么此前堵了又漏（根因）**：
+1. `_looks_like_dsml` 是**白名单特征判定**——只认已知标签（DSML/`[Tool Call`/`<tool_call>`），
+   模型发明新标签（`<seed:tool_result>`、`<tool_name>`）就不在特征里 → 静默透传。
+2. 兜底逻辑**只 WARNING 不拦截**——命中疑似标记但解析失败时 `content_text = text.strip()`
+   原样透传，泄漏是必然的，WARNING 只负责事后记录。
+
+**Wave 3（实测抓包，ses_032871f10ffeUFPADwt7q2qizX 会话泄漏）**：
+1. **`<tool_call>` XML 子标签变体**（模型从 opencode 历史学到）：
+   ```xml
+   <tool_call><tool_name>bash</tool_name><parameters>
+   <parameter name="command" string="true">cd /x && git status</parameter></parameters></tool_call>
+   ```
+   `_TOOLCALL_XML_RE` 分支要求块内 `find("{")`（JSON），XML 子标签无 `{` → 解析失败泄漏。
+   修复：`_parse_toolcall_subtags()` 解析 `<tool_name>`/`<parameter name=..>` 子标签。
+2. **`<seed:tool_result>` 复述块**（模型复述历史工具结果，无闭合标签）：
+   ```xml
+   <seed:tool_result>
+   /root/...targets.json:417: "label": "openrouter",...
+   ```
+   不在任何检测特征里，静默透传。修复：`_strip_seed_tool_result_blocks()` 剥离——
+   纯复述（无后续强标记）整块丢弃；混合结构（复述+正文+新调用）剥开标签保留正文。
+
+**Wave 4（官方格式，vllm 权威来源）**：查 vLLM 官方 parser（`vllm/parser/qwen3.py` +
+`vllm/parser/seed_oss.py` + `vllm/tool_parsers/seed_oss_tool_parser.py`）确认
+Doubao-Seed-Code 家族（seed-oss）的**原生 XML 语法**是 Qwen3 语法 + seed 包装：
+```
+<seed:think>...</seed:think>  ← 推理（Qwen3 用 <think>）
+<seed:tool_call><function=bash><parameter=command>ls -la</parameter></function></seed:tool_call>
+```
+关键差异：`<function=name>`/`<parameter=key>` 是**无空格无引号**属性形式，与已支持的
+`<function name="..">`（带空格引号）是两套不同语法；外层 `<seed:tool_call>`（带冒号）
+与已支持的 `<seed_call>`（无冒号）不同。官方 parser 还容忍：无外层直接 `<function=>`
+（fallback）、`</function>` 后连续下一个 `<tool_call>`（未闭合外层）。本轮全部补上
+（`_SEED_TOOL_CALL_RE`/`_QWEN_FUNC_RE`/`_QWEN_PARAM_RE` + `_parse_qwen_func_params`）。
+
+**根治设计（不再打地鼠）**：
+- `_looks_like_dsml` 补全特征：`<seed:`/`<tool_`/`<parameters>`/`<parameter name=`/
+  `<function=`/`<seed:think`/`<think` 等前缀，命中标记不再静默透传
+- 兜底改为 **`_strip_strong_tool_markers()`**：命中强工具标签但解析失败时剥离标记块，
+  不原样透传；未闭合开标签（`<tool_call>`/`<seed:tool_call>`/`<function=`/think）也截断剥离
+- `_strip_seed_tool_result_blocks()` 处理 `<seed:tool_result>` 复述
+- 已知局限：混合结构（复述+正文+新调用）无闭合标签无法精确分界，保守只剥开标签
+  保留正文（工具调用已正确解析执行，残留的是模型自吐的复述文本非标记泄漏）
+
+**通用意图根治（Wave 5，2026-08-04）——为什么官方格式救不了我们**：
+vLLM 官方 parser（`vllm/parser/qwen3.py` + `seed_oss.py`）是**服务端 grammar 约束
+解码**——官方推理时强制模型输出 `<seed:tool_call><function=..>`，所以官方"全量 case"
+是约束下的唯一格式。而 Trae 的 `llm_utils_chat` 服务端**没有 grammar 引导**，模型
+自由生成，从上下文历史学格式（代理文本化的 `[Tool Call:]`、opencode 的 seed 上下文
+等），输出空间无限——**枚举官方格式 + 补丁式修变体永远堵不完**。
+
+根治 = 三层防线，把"能不能解析"与"会不会泄漏"解耦：
+1. **检测层**：`_TOOL_INTENT_TAG_RE` 通用意图正则——任何 XML 标签只要含工具语义
+   关键词（`tool/function/param/invoke/args/call/cmd` 等任意排列、任意前缀/命名空间）
+   即判定"疑似工具调用"，不再依赖已知标签白名单。关键词限定在 XML 标签形态内
+   （`<...>`），正文里出现 function/tool 等单词不误伤。
+2. **解析层**：已知格式（DSML/`[Tool Call:]`/JSON/seed_call/官方 Qwen3/XML 子标签）
+   正常解析为 tool_calls 执行。
+3. **拦截层**：`_strip_generic_tool_blocks()` 通用剥离——用平衡标签扫描删除任意
+   含工具语义关键词的 XML 块（支持嵌套、自闭合、未闭合截断），解析失败的新变体
+   标记被剥掉、正文保留，**绝不原样透传**。
+
+保证：模型发明从未见过的新标签也不泄漏（只是解析不出 tool_calls，标记被剥离），
+彻底消除"新变体 → 泄漏必现"的因果链。回归测试 Wave 5 覆盖未知变体 + 误伤防护。
+
 ### 判定逻辑
 
 不按模型名硬编码：响应含 `tool_calls` 字段 → A 路径立即转发；否则 `response`/`content` 一律走纯累积 + 流结束统一解析（B 路径，见上）。新模型自动归队。

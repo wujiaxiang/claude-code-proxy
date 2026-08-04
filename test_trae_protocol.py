@@ -471,6 +471,109 @@ check("未闭合 tool_call 不崩溃且剥离标记",
       "<tool_call>" not in w3u_c and "开始执行" in w3u_c,
       f"content={w3u_c!r}")
 
+# ─── 9. Wave 4：官方 seed-oss / Qwen3 XML 语法（vllm qwen3.py + seed_oss.py）───
+# 官方原生格式：<seed:tool_call><function=bash><parameter=command>ls</parameter></function></seed:tool_call>
+# 关键差异：function/parameter 用"无空格无引号"的 <tag=name> 属性形式；
+# seed-oss 外层 <seed:tool_call>（带冒号）；推理 <seed:think>（Qwen3 用 <think>）。
+# 此前解析器只覆盖 <function name="..">（带空格引号）与 <seed_call>（无冒号），
+# 官方语法整体漏解析 → 原样泄漏。vLLM 官方 parser 是"全量 case"权威来源。
+print("[9] Wave 4: 官方 seed-oss/Qwen3 XML 语法")
+
+# 9.1 seed:think + seed:tool_call + function= + parameter=
+w4_1 = ('<seed:think>I need to check the file.</seed:think>'
+        '<seed:tool_call><function=bash><parameter=command>ls -la</parameter></function></seed:tool_call>')
+w41_t, w41_r, w41_c = server._resolve_trae_text(w4_1)
+check("官方 seed:tool_call 解析出 1 个", len(w41_t) == 1)
+check("官方 seed:tool_call name 正确",
+      w41_t and w41_t[0]["function"]["name"] == "bash")
+check("官方 seed:tool_call arguments 完整",
+      w41_t and json.loads(w41_t[0]["function"]["arguments"])["command"] == "ls -la")
+check("官方 seed:tool_call think 标签剥离", "seed:think" not in w41_c, f"content={w41_c!r}")
+check("官方 seed:tool_call 调用块剥离", "seed:tool_call" not in w41_c, f"content={w41_c!r}")
+
+# 9.2 tool_call + function= 多参数（嵌套花括号不截断）
+w4_2 = ('<tool_call><function=edit><parameter=filePath>/a/b.py</parameter>'
+        '<parameter=oldString>function foo() { return 1; }</parameter>'
+        '<parameter=newString>function foo() { return 2; }</parameter></function></tool_call>')
+w42_t, w42_r, w42_c = server._resolve_trae_text(w4_2)
+check("官方多参数解析出 1 个", len(w42_t) == 1)
+w42_args = json.loads(w42_t[0]["function"]["arguments"]) if w42_t else {}
+check("官方多参数含 3 个 key", len(w42_args) == 3)
+check("官方多参数嵌套花括号未截断",
+      w42_args.get("oldString") == "function foo() { return 1; }")
+
+# 9.3 裸 function= 无 tool_call 包裹（官方 parser 的 fallback）
+w4_3 = '<function=bash><parameter=command>ls</parameter></function>'
+w43_t, w43_r, w43_c = server._resolve_trae_text(w4_3)
+check("官方裸 function= fallback 解析出 1 个", len(w43_t) == 1)
+check("官方裸 function= name 正确",
+      w43_t and w43_t[0]["function"]["name"] == "bash")
+check("官方裸 function= 标记剥离", "function" not in w43_c, f"content={w43_c!r}")
+
+# 9.4 连续两个 seed:tool_call（官方 parser 容忍连续调用）
+w4_4 = ('<seed:tool_call><function=bash><parameter=command>git add</parameter></function></seed:tool_call>'
+        '<seed:tool_call><function=bash><parameter=command>git status</parameter></function></seed:tool_call>')
+w44_t, w44_r, w44_c = server._resolve_trae_text(w4_4)
+check("官方连续调用解析出 2 个", len(w44_t) == 2)
+
+# 9.5 Qwen3 原生 <think>/<tool_call>（无 seed 前缀）
+w4_5 = '<think>Let me check</think><tool_call><function=bash><parameter=command>ls</parameter></function></tool_call>'
+w45_t, w45_r, w45_c = server._resolve_trae_text(w4_5)
+check("Qwen3 原生格式解析出 1 个", len(w45_t) == 1)
+check("Qwen3 think 标签剥离", "think" not in w45_c, f"content={w45_c!r}")
+
+# 9.6 未闭合 <seed:think>（截断）剥离
+w4_6 = '<seed:think>thinking...'
+w46_t, w46_r, w46_c = server._resolve_trae_text(w4_6)
+check("未闭合 seed:think 剥离", "seed:think" not in w46_c, f"content={w46_c!r}")
+
+# 9.7 正文 + 官方调用混合
+w4_7 = '我来执行。\n<seed:tool_call><function=bash><parameter=command>ls</parameter></function></seed:tool_call>'
+w47_t, w47_r, w47_c = server._resolve_trae_text(w4_7)
+check("官方调用混合正文保留", len(w47_t) == 1 and "我来执行" in w47_c)
+check("官方调用混合无标记泄漏", "seed:tool_call" not in w47_c, f"content={w47_c!r}")
+
+# ─── 10. Wave 5：通用意图根治（2026-08-04，不再打地鼠）───
+# 根治设计：检测层(_looks_like_dsml)与剥离层(_strip_generic_tool_blocks)都用
+# 通用意图正则 _TOOL_INTENT_TAG_RE——任何 XML 标签只要含工具语义关键词
+# （tool/function/param/invoke/args/call 等任意排列）即进剥离路径。模型发明
+# 从未见过的新标签也不泄漏（解析不出 tool_calls 但标记被剥离，正文保留）。
+print("[10] Wave 5: 通用意图根治（未知变体不泄漏）")
+
+# 10.1 任意自定义工具标签（模型可能发明的任何排列）
+w5_cases = [
+    ("自定义工具标签", '<my_custom_tool><cmd>ls</cmd><args>{"a":1}</args></my_custom_tool>', ""),
+    ("命名空间标签", '<tool:call><function>bash</function><params><p name="cmd">ls</p></params></tool:call>', ""),
+    ("简写 func/param", '<func><param>ls</param></func>', ""),
+    ("execute 容器", '<execute><tool>bash</tool><cmd>ls</cmd></execute>', ""),
+    ("自闭合 call", "<call name='bash' args='{\"command\":\"ls\"}'/>", ""),
+    ("command 标签", '<command>ls</command>', ""),
+    ("深层嵌套", '<tool_call><func><param>x</param></func><cmd>y</cmd></tool_call>', ""),
+    ("正文+未知调用", '好的我来做。\n<any_tool><args>{"cmd":"ls"}</args></any_tool>', "好的我来做。"),
+    ("未闭合未知标签", '<any_tool><args>{"cmd":', ""),
+]
+for w5_name, w5_text, w5_exp in w5_cases:
+    w5_t, w5_r, w5_c = server._resolve_trae_text(w5_text)
+    check(f"Wave5 [{w5_name}] 无 XML 标记泄漏",
+          "<" not in w5_c, f"content={w5_c!r}")
+    if w5_exp is not None:
+        check(f"Wave5 [{w5_name}] 正文保留", w5_c == w5_exp, f"content={w5_c!r}")
+
+# 10.2 普通文本/正文含工具单词不误伤（关键词限定在 XML 标签形态内）
+w5_normals = [
+    "这是一个普通回复，没有任何工具调用。",
+    "The function foo() returns 1. The tool was useful.",
+    "parameter 这个单词出现在正文里，不是标签。",
+    "please call me tomorrow",
+    "调用 function 这个词的普通句子。",
+]
+for w5_n in w5_normals:
+    w5_d = server._looks_like_dsml(w5_n)
+    w5_t, w5_r, w5_c = server._resolve_trae_text(w5_n)
+    check(f"Wave5 普通文本不误伤: {w5_n[:20]}...",
+          not w5_d and w5_t == [] and w5_c == w5_n,
+          f"detected={w5_d} content={w5_c!r}")
+
 # 7.7 空文本 → 全部返回空
 tcs, rtext, content = server._resolve_trae_text("")
 check("空文本 tool_calls 为空", tcs == [])
