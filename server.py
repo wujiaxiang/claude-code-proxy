@@ -2271,7 +2271,7 @@ def _resolve_trae_text(full_text: str) -> tuple[list, str, str]:
         # 直接记录 WARNING + 原始文本，以便第一时间从日志发现新变体，而不是被动
         # 等用户反馈"工具没执行"。不中断流程：仍按普通文本处理，避免整段吞掉。
         logger.warning(f"[trae-work] _looks_like_dsml=True 但未解析出 tool_calls，"
-                        f"疑似新的工具调用标记变体，原始文本: {text[:2000]!r}")
+                        f"疑似新的工具调用标记变体，原始文本: {text[:16384]!r}")
     if tool_calls:
         # 工具调用文本本身不作为正文回显（DSML/[Tool Call:]/<tool_call> 全部清洗掉）
         content_text = _SEED_CALL_RE.sub("", text)
@@ -2356,7 +2356,9 @@ def _parse_dsml_tool_calls(text: str) -> list:
             if obj_str is None:
                 continue  # 未闭合（半截标记），交由上层判定是否继续等待
             try:
-                obj = json.loads(obj_str)
+                # 模型常在 command JSON 字符串中直接输出多行脚本；这违反严格 JSON
+                # 的控制字符约束，但仍是可恢复的工具调用文本。strict=False 保留原值。
+                obj = json.loads(obj_str, strict=False)
             except Exception:
                 continue
             name = (obj.get("name") or obj.get("tool_name") or "").strip()
