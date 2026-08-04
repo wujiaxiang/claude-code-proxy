@@ -370,6 +370,28 @@ def _clean_qclaw_body(body: dict) -> dict:
     return cleaned
 
 
+_CODEBUDDY_DROP_KEYS = {
+    "reasoning_effort", "reasoning", "reasoning_summary",
+    "thinking", "thinking_tokens", "thinking_budget",
+    "top_logprobs", "logprobs",
+}
+
+
+def _clean_codebuddy_body(body: dict) -> dict:
+    """剥离 codebuddy 上游(copilot.tencent.com)不兼容的推理类参数。
+    tools/tool_choice 必须保留——子代理工具调用依赖请求体 tools 字段，
+    强行剥离会导致子代理无法调用工具(2026-08-04 回退)。仅剥离上游
+    不支持的思考链/推理参数，避免触发内容过滤。"""
+    removed = []
+    for k in list(body.keys()):
+        if k in _CODEBUDDY_DROP_KEYS:
+            removed.append(k)
+            del body[k]
+    if removed:
+        logger.info(f"🧹 Codebuddy body cleaned: removed keys={removed}")
+    return body
+
+
 async def _passthrough_to_qclaw(
     litellm_req: dict,
     request,  # type: ignore - MessagesRequest defined later
@@ -1256,6 +1278,10 @@ def _handler_prepare_body(target: dict, body_bytes: bytes):
             msgs.insert(0, {"role": "system", "content": "You are Claude, a helpful AI assistant."})
             body_json["messages"] = msgs
         body_json = _clean_qclaw_body(body_json)
+    elif target.get("cleanCodebuddyBody"):
+        # codebuddy 上游(copilot.tencent.com)不兼容 opencode 注入的思考链参数，
+        # 透传会触发内容过滤拦截(#2071)；剥离而非全白名单，保留腾讯支持的正常字段。
+        body_json = _clean_codebuddy_body(body_json)
     return json.dumps(body_json, ensure_ascii=False).encode("utf-8"), body_json, cross_port_target
 
 
