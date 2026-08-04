@@ -1056,6 +1056,89 @@ async def _write_response(writer, resp, *, stats=None):
             pass
 
 
+# HTTP 标准状态码 → 原因短语映射（用于状态行改写，覆盖 400-599 常见码）
+_HTTP_STATUS_REASON = {
+    400: "Bad Request",
+    401: "Unauthorized",
+    402: "Payment Required",
+    403: "Forbidden",
+    404: "Not Found",
+    405: "Method Not Allowed",
+    406: "Not Acceptable",
+    407: "Proxy Authentication Required",
+    408: "Request Timeout",
+    409: "Conflict",
+    410: "Gone",
+    411: "Length Required",
+    412: "Precondition Failed",
+    413: "Payload Too Large",
+    414: "URI Too Long",
+    415: "Unsupported Media Type",
+    416: "Range Not Satisfiable",
+    417: "Expectation Failed",
+    418: "I'm a teapot",
+    421: "Misdirected Request",
+    422: "Unprocessable Entity",
+    423: "Locked",
+    424: "Failed Dependency",
+    425: "Too Early",
+    426: "Upgrade Required",
+    428: "Precondition Required",
+    429: "Too Many Requests",
+    431: "Request Header Fields Too Large",
+    451: "Unavailable For Legal Reasons",
+    500: "Internal Server Error",
+    501: "Not Implemented",
+    502: "Bad Gateway",
+    503: "Service Unavailable",
+    504: "Gateway Timeout",
+    505: "HTTP Version Not Supported",
+    506: "Variant Also Negotiates",
+    507: "Insufficient Storage",
+    508: "Loop Detected",
+    510: "Not Extended",
+    511: "Network Authentication Required",
+}
+
+
+def _get_status_reason(status: int) -> str:
+    """获取 HTTP 状态码对应的标准原因短语，未知码返回 'Unknown Status'。"""
+    return _HTTP_STATUS_REASON.get(status, "Unknown Status")
+
+
+async def _write_response_with_status_override(writer, resp, effective_status: int, *, stats=None):
+    """
+    非流式响应状态码改写：保持上游原始 body 字节完全一致，仅改写状态行。
+    用于检测到"上游 200 但 body 嵌错误码"的场景。
+    """
+    try:
+        # 复用 _write_response 的头部剥离逻辑
+        resp_headers = "".join(
+            f"{k}: {v}\r\n" for k, v in resp.headers.items()
+            if k.lower() not in _PROXY_STRIP_RESP_HEADERS
+        )
+        # 读取原始 body 字节（resp 已在调用方 aread() 过，这里直接用 resp.content 或重新 aread）
+        # 注意：调用方已执行 await resp.aread()，所以 resp.content 可用
+        body_bytes = resp.content if hasattr(resp, "content") and resp.content is not None else await resp.aread()
+        
+        reason = _get_status_reason(effective_status)
+        # 写状态行 + 头部 + Content-Length + body（body 字节级保持原样）
+        writer.write(f"HTTP/1.1 {effective_status} {reason}\r\n{resp_headers}Content-Length: {len(body_bytes)}\r\n\r\n".encode())
+        writer.write(body_bytes)
+        await writer.drain()
+        if stats:
+            stats["passthroughError"] += 1
+        return effective_status, body_bytes
+    except Exception:
+        logger.exception(f"Error writing status-overridden response ({effective_status}) to client")
+        raise
+    finally:
+        try:
+            writer.close()
+        except Exception:
+            pass
+
+
 def _resolve_auth(headers: dict, target: dict = None, provider: str = None) -> dict:
     """统一鉴权 headers 解析。
     - target 有 apikey → 注入（覆盖客户端传入的 key，vendor 场景）
@@ -3480,6 +3563,27 @@ async def _handle_target_request(reader, writer, target):
             resp_body = await resp.aread()
             body_text = resp_body.decode("utf-8", errors="replace")
             status = resp.status_code
+
+            # ── 检测"上游 200 但 body 嵌错误码"的伪装成功响应 ──
+            # 仅当上游原始状态码为 200 时才判定；非 200 时 body 里的 code 不覆盖真实状态码
+            if status == 200:
+                try:
+                    parsed = json.loads(body_text)
+                    if (
+                        isinstance(parsed, dict)
+                        and isinstance(parsed.get("code"), int)
+                        and 400 <= parsed["code"] <= 599
+                        and isinstance(parsed.get("message"), str)
+                        and "choices" not in parsed
+                        and "object" not in parsed
+                    ):
+                        effective_status = parsed["code"]
+                        logger.warning(f"[{label}] upstream 200 with embedded error code {effective_status}: {parsed.get('message')[:200]}")
+                        await _write_response_with_status_override(writer, resp, effective_status, stats=stats)
+                        return
+                except Exception:
+                    # JSON 解析失败或不符合错误信封结构 → 走正常透传逻辑
+                    pass
 
             if status >= 400:
                 logger.warning(f"[{label}] HTTP {status}: {body_text[:300]}")
