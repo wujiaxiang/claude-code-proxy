@@ -51,7 +51,11 @@ _log_fmt = "%(asctime)s - %(levelname)s - %(message)s"
 logging.basicConfig(level=_log_level, format=_log_fmt)
 logger = logging.getLogger(__name__)
 
-# ══════════════════════════════════════════════════════════════════════════════
+# Module-level timeout constant for target forwarding engine (used in _handle_target_request)
+# Can be monkeypatched in tests for fast timeout simulation
+_TARGET_HTTPX_TIMEOUT = httpx.Timeout(300.0, connect=10.0)
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # 本地 token 估算（tiktoken）— 上游 QClaw 网关不返回 usage，需自行估算
 # ══════════════════════════════════════════════════════════════════════════════
 import tiktoken as _tiktoken
@@ -3448,7 +3452,7 @@ async def _handle_target_request(reader, writer, target):
             fwd_headers["host"] = target["targetHost"]
             fwd_headers = _handler_prepare_headers(target, fwd_headers, body_json)
 
-        async with httpx.AsyncClient(timeout=httpx.Timeout(300.0, connect=10.0), trust_env=False) as client:
+        async with httpx.AsyncClient(timeout=_TARGET_HTTPX_TIMEOUT, trust_env=False) as client:
             req = client.build_request(method, upstream_url, headers=fwd_headers, content=body_bytes if body_bytes else None)
             resp = await client.send(req, stream=True)
 
@@ -3550,6 +3554,36 @@ async def _handle_target_request(reader, writer, target):
                 if _req_model:
                     _bump_model_stats(label, _req_model, "ok" if resp.status_code < 400 else "err")
                 await _write_response(writer, resp, stats=stats)
+    except (httpx.ConnectError, httpx.ConnectTimeout) as exc:
+        stats["passthroughError"] += 1
+        logger.exception(f"[{label}] upstream connect failed")
+        try:
+            await _write_error_response(writer, 502, f"Upstream connection failed for {label}")
+        except Exception:
+            pass
+    except httpx.ReadTimeout as exc:
+        stats["passthroughError"] += 1
+        logger.exception(f"[{label}] upstream read timeout")
+        try:
+            await _write_error_response(writer, 504, f"Upstream read timeout for {label}")
+        except Exception:
+            pass
+    except httpx.RemoteProtocolError as exc:
+        # TODO(Todo 3): 完整逻辑 - headers 已提交(write_state["headers_sent"])时只 warning+close；未提交时 502
+        stats["passthroughError"] += 1
+        logger.exception(f"[{label}] upstream protocol error")
+        try:
+            await _write_error_response(writer, 502, f"Upstream protocol error for {label}")
+        except Exception:
+            pass
+    except (ConnectionResetError, RuntimeError):
+        # 客户端提前断开（写阶段异常，如 RuntimeError: unable to perform operation on <TCPTransport closed=True>）
+        # 此异常发生在写入阶段，headers 已提交或正在提交，二次写无意义 → 仅记录 + 关闭连接
+        logger.warning(f"[{label}] client disconnected mid-transfer, closing connection")
+        try:
+            writer.close()
+        except Exception:
+            pass
     except Exception:
         stats["passthroughError"] += 1
         logger.exception(f"[{label}] target proxy exception")
