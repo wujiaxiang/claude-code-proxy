@@ -3668,7 +3668,7 @@ async def _handle_target_request(reader, writer, target):
                 if _req_model:
                     _bump_model_stats(label, _req_model, "ok" if resp.status_code < 400 else "err")
                 await _write_response(writer, resp, stats=stats, write_state=write_state)
-    except (httpx.ConnectError, httpx.ConnectTimeout) as exc:
+    except (httpx.ConnectError, httpx.ConnectTimeout, httpx.ReadError) as exc:
         stats["passthroughError"] += 1
         logger.exception(f"[{label}] upstream connect failed")
         if write_state.get("headers_sent"):
