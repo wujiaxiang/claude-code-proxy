@@ -20,7 +20,7 @@
 | 客户端接入 | `base_url = http://<host>:8084/v1`，`api_key = "dummy"`（crack 类代理不校验） |
 | secrets 字段 | `codebuddy_token`（JWT，必填）/ `codebuddy_refresh_token`（可空）/ `codebuddy_uid`（数字）/ `codebuddy_nickname`（只读展示） |
 | 模型 | targets.json 白名单：`deepseek-v4-pro` / `deepseek-v4-flash` / `glm-5.2` / `kimi-k3-1` / `hy3` 等 |
-| 内容过滤排查 | 详见交接文档 [`codebuddy-content-filter-probe-handoff.md`](codebuddy-content-filter-probe-handoff.md) |
+| 内容过滤排查 | 见 §6「错误排查」下的「内容过滤现象分类与归因」 |
 
 认证方式：`Authorization: Bearer <codebuddy_token>`（JWT）。
 
@@ -143,8 +143,45 @@ CodeBuddy 无独立"每日签到"接口，积分由两部分构成：
 | 401/403 | token 过期 / 该 base 不认此 token（如 `www.codebuddy.ai` 对 IOA token 直接 401） | 重新提取 token；`_call` 会自动换 base |
 | 额度显示 error | token 无权限 / 接口异常 | 检查 `codebuddy_token` 有效性（`GET /v2/accounts` 可验证） |
 | 登录态丢失 | 刷新后未持久化轮换的 refreshToken | 回写新 refreshToken 到 secrets.json（陷阱 #11） |
-| 内容过滤/阻断 | 上游触发内容安全策略或格式校验阻断 | 参考 [`codebuddy-content-filter-probe-handoff.md`](codebuddy-content-filter-probe-handoff.md) 进行现象分类与对照排查 |
-| **返回"您当前输入的信息存在敏感内容"** | 代理强制注入 `reasoning_effort:"medium"` + `reasoning_summary:"auto"`，即使客户端未请求推理也会触发 CodeBuddy 内容过滤 (#2071) | **已修复**（2026-08-04）：代理现在仅在客户端显式传了 `reasoning_effort` 时才添加 `reasoning_summary`；未请求推理时移除所有 reasoning 字段。无需客户端改动。 |
+| 内容过滤/阻断 | 上游触发内容安全策略或格式校验阻断 | 见下方「内容过滤现象分类与归因」 |
+| **返回"您当前输入的信息存在敏感内容"** | 见下方归因规则 R1–R4；注意：当前 codebuddy 走纯 `passthrough`，代理**不注入** `reasoning_effort` / `reasoning_summary` 字段，因此「代理注入触发过滤」在当前代码下不会发生。若未来在 `_handler_prepare_body` 增加 codebuddy 特判，必须遵循 **opt-in 规则**：仅客户端显式传 `reasoning_effort` 时才附加 reasoning 字段，否则移除所有 reasoning 相关字段（历史 #2071 教训） | 先用下方只读诊断命令确认请求体是否真含 reasoning 字段，再归因；非代理注入则属上游/客户端行为，代理层无法绕过 |
+
+### 6.1 内容过滤现象分类与归因（融合自探测交接文档）
+
+当 codebuddy 返回内容过滤类错误时，按以下分类与归因规则判断根因。**核心原则：代理层只负责转发，不修改语义内容；过滤是上游/客户端行为，代理无法绕过。**
+
+#### 现象分类
+
+| 分类 | 表现 | 典型归属 |
+|------|------|----------|
+| C1 显式敏感词 | 返回「您当前输入的信息存在敏感内容」「包含违规信息」等明确文案 | 上游安全策略（用户真实违规） |
+| C2 格式/协议校验 | 401/400/11101 等非内容文案，但被误判为"过滤" | 协议/认证层（非内容安全） |
+| C3 推理字段触发 | 请求体含 `reasoning_effort` / `reasoning_summary` 时触发，移除后正常 | 上游对推理参数的特殊校验（历史 #2071 类） |
+| C4 上游抖动/限流 | 偶发、重试即过，无稳定复现 | 上游负载或限流（非过滤） |
+
+#### 归因规则
+
+- **R1**：先确认返回文案是否为内容安全类（C1/C3），还是协议类（C2）。协议类错误走 §6 上方对应行处理。
+- **R2**：对 C3，用下方只读命令检查**请求体实际是否含 reasoning 字段**。当前 codebuddy 为纯 passthrough，正常情况下不含；若含，说明来自客户端或上游透传，而非代理注入。
+- **R3**：C4 需用"相同请求多次重试 + 换模型"验证稳定性，排除偶发。
+- **R4**：**禁止**为绕过过滤而删除安全字段、伪造身份、编码混淆、提示注入、拆分危险请求或修改审查参数——属安全越界，代理设计上不支持。
+
+#### 只读诊断命令（安全边界内）
+
+```bash
+# 1. 抓经过代理的真实请求体（确认是否含 reasoning 字段）—— 仅读代理日志
+tail -200 /root/shared-workspace/claude-code-proxy/proxy.log | grep -i "reasoning\|敏感\|filter"
+
+# 2. 直连上游对照（不代理，验证是上游还是代理问题）—— 用已提取 token
+curl -s https://copilot.tencent.com/v2/chat/completions \
+  -H "Authorization: Bearer $CODEBUDDY_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"deepseek-v4-flash","messages":[{"role":"user","content":"<同内容>"}],"stream":false}'
+
+# 3. 对照：同一内容去掉 reasoning 字段再试，确认是否 C3 类
+```
+
+> 对照实验设计（探测模板，保留备查）：直连对照 × 多模型 × 多轮，记录 JSON Lines（字段：timestamp / model / has_reasoning / round / result / classification）。未授权账号、无实测数据的不下结论。
 
 ---
 
@@ -153,7 +190,7 @@ CodeBuddy 无独立"每日签到"接口，积分由两部分构成：
 1. **上游只支持流式**：codebuddy 上游对非流式请求报 11101，代理已自动转流式聚合；新增错误特征判断时勿绕过该检测（AGENTS.md 陷阱 #10）。
 2. **refreshToken 轮换必须立即持久化**：刷新后旧 refreshToken 立即失效，未回写新值会导致登录态丢失（AGENTS.md 陷阱 #11）。
 3. **仅 Windows 破解**：`crack_codebuddy.py` 仅 Windows 支持；其他 OS 需手动在 dashboard 填写 `codebuddy_token`。
-4. **reasoning 参数必须 opt-in** (#2071)：codebuddy 上游对未请求推理的请求如果代理注入 `reasoning_effort` + `reasoning_summary`，会触发内容过滤返回错误。代理已修复——仅在客户端显式传 `reasoning_effort` 时才添加 `reasoning_summary`。新增处理 codebuddy 请求的代码必须遵循此规则。
+4. **reasoning 参数必须 opt-in**（历史 #2071 教训）：codebuddy 上游对推理参数（如 `reasoning_effort` / `reasoning_summary`）有特殊校验，可能引发内容安全类错误。当前 codebuddy 走纯 passthrough，代理不注入 reasoning 字段；**若未来在 `_handler_prepare_body` 增加 codebuddy 特判，必须遵循 opt-in 规则**——仅客户端显式传 `reasoning_effort` 时才附加 reasoning 相关字段，否则移除所有 reasoning 字段。新增处理 codebuddy 请求的代码必须遵循此规则。
 
 ---
 
@@ -165,6 +202,6 @@ CodeBuddy 无独立"每日签到"接口，积分由两部分构成：
 | `crack_codebuddy_q.py` | 额度 / 成长任务 / 账号 / 用量通知查询（`codebuddy_status`） |
 | `crack_common.py` | `CREDENTIAL_SCHEMAS["codebuddy"]`（凭据 schema）+ 注册表 |
 | `crack_daily.py` | `daily_codebuddy`：成长任务领取 + token 剩 <30 天刷新（refreshToken 轮换回写） |
-| `server.py` | 11101 检测 + `_aggregate_codebuddy_stream` 非流式聚合 + reasoning 字段清理 (#2071 修复) |
+| `server.py` | 11101 检测 + `_aggregate_codebuddy_stream` 非流式聚合；codebuddy 走纯 passthrough，**不**清理/注入 reasoning 字段（若未来加 codebuddy 特判须遵循 §6 的 opt-in 规则） |
 | `config_store.py` | `VALID_HANDLERS` 含 `passthrough` |
 | `targets.json` | codebuddy target 定义（8084、`copilot.tencent.com`、`routePrefix=/v2`、secretRef） |
