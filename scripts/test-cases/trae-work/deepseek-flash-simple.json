@@ -1,0 +1,1 @@
+{"model": "DeepSeek-V4-Flash", "messages": [{"role": "user", "content": "写一个 Python 函数计算斐波那契数列"}], "temperature": 0.3, "top_p": 0.9, "stop": ["\n\nHuman:", "\n\nAssistant:"], "max_tokens": 8000, "stream": true}
