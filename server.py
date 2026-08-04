@@ -2170,6 +2170,13 @@ _DSML_TOOLCALLS_BLOCK_RE = re.compile(
     r"<[｜|]DSML[｜|]tool_calls[｜|]?>[\s\S]*?</[｜|]DSML[｜|]tool_calls\s*>", re.S)
 # 检测用：任意 "<｜DSML｜任意标签" 前缀（含 invoke/parameter/tool_calls 等家族全部成员）
 _DSML_ANY_TAG_RE = re.compile(r"<[｜|]DSML[｜|][A-Za-z_]+")
+# seed-code 实测变体：<seed_call> 外层可能用 </seed_call>、</tool_call> 或
+# </seed:tool_call> 闭合。外层不能锚定开头，避免吞掉其前正常正文。
+_SEED_CALL_RE = re.compile(
+    r"<seed_call\b[^>]*>([\s\S]*?)(?:</seed_call\s*>|</tool_call\s*>|</seed:tool_call\s*>)", re.I)
+_SEED_CALL_INVOKE_RE = re.compile(r'<invoke\s+name="([^"]*)"[^>]*>([\s\S]*?)</invoke\s*>', re.I)
+_SEED_CALL_FUNCTION_RE = re.compile(r'<function\s+name="([^"]*)"[^>]*>([\s\S]*?)</function\s*>', re.I)
+_SEED_CALL_PARAM_OPEN_RE = re.compile(r'<parameter\s+name="([^"]*)"[^>]*>', re.I)
 
 
 def _build_trae_tool_prompt(tools: list) -> str:
@@ -2267,7 +2274,8 @@ def _resolve_trae_text(full_text: str) -> tuple[list, str, str]:
                         f"疑似新的工具调用标记变体，原始文本: {text[:2000]!r}")
     if tool_calls:
         # 工具调用文本本身不作为正文回显（DSML/[Tool Call:]/<tool_call> 全部清洗掉）
-        content_text = _DSML_BLOCK_RE.sub("", text)
+        content_text = _SEED_CALL_RE.sub("", text)
+        content_text = _DSML_BLOCK_RE.sub("", content_text)
         content_text = _DSML_TOOLCALLS_BLOCK_RE.sub("", content_text)
         content_text = _TOOLCALL_TEXT_RE.sub("", content_text)
         for m in re.finditer(_TOOLCALL_TEXT_RE, text):
@@ -2286,7 +2294,7 @@ def _parse_dsml_tool_calls(text: str) -> list:
 
     依次尝试：<｜DSML｜invoke name=".."><｜DSML｜parameter name="..">..</｜DSML｜parameter></｜DSML｜invoke>
     标签属性变体 → DSML 标记（<｜function｜> 块）→ [Tool Call: name]\nArguments: {...} 文本
-    → <tool_call>JSON</tool_call>。
+    → <tool_call>JSON</tool_call> → <seed_call> 异步闭合标签变体。
     """
     tcs = []
     # 变体 4（2026-08-03）：<｜DSML｜invoke name="bash"> + 内部多个
@@ -2357,6 +2365,33 @@ def _parse_dsml_tool_calls(text: str) -> list:
             args_val = obj.get("arguments", {})
             args_str = json.dumps(args_val, ensure_ascii=False) if not isinstance(args_val, str) else args_val
             tcs.append({"type": "function", "function": {"name": name, "arguments": args_str}})
+    if not tcs:
+        # 变体 5（2026-08-04）：<seed_call> 内的 invoke/function + parameter。
+        # 参数标签只用正则定位开标签，值通过闭合标签位置切片，避免非贪婪正则在
+        # JSON/JS 花括号内容上截断；JSON 值仍交给平衡括号扫描提取。
+        for seed_call in _SEED_CALL_RE.findall(text):
+            for variant_re in (_SEED_CALL_INVOKE_RE, _SEED_CALL_FUNCTION_RE):
+                for tool_name, invoke_body in variant_re.findall(seed_call):
+                    tool_name = tool_name.strip()
+                    if not tool_name:
+                        continue
+                    params = {}
+                    for param_match in _SEED_CALL_PARAM_OPEN_RE.finditer(invoke_body):
+                        param_name = param_match.group(1).strip()
+                        value_end = invoke_body.find("</parameter>", param_match.end())
+                        if not param_name or value_end < 0:
+                            continue
+                        param_value = invoke_body[param_match.end():value_end]
+                        json_start = param_value.find("{")
+                        if json_start >= 0:
+                            balanced_value = _extract_balanced_json(param_value, json_start)
+                            if balanced_value is not None and not param_value[:json_start].strip():
+                                param_value = balanced_value
+                        params[param_name] = param_value
+                    item = {"type": "function", "function": {"name": tool_name}}
+                    if params:
+                        item["function"]["arguments"] = json.dumps(params, ensure_ascii=False)
+                    tcs.append(item)
     return tcs
 
 
