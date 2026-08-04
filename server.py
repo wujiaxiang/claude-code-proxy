@@ -510,7 +510,7 @@ async def lifespan(app):
 
     # 启动诊断：验证 QClaw 链路是否正常
     import httpx as _httpx
-    _qclaw_diag_base = QCLAW_LOCAL_BASE_URL if PREFERRED_PROVIDER == "qclaw-local" else QCLAW_BASE_URL
+    _qclaw_diag_base = QCLAW_BASE_URL
     try:
         async with _httpx.AsyncClient(timeout=_httpx.Timeout(10.0), trust_env=False) as _diag:
             _r = await _diag.post(
@@ -630,9 +630,6 @@ USE_VERTEX_AUTH = os.environ.get("USE_VERTEX_AUTH", "False").lower() == "true"
 # ─── QClaw 上游直连配置 ───
 # 上游 LLM 接口（OpenAI 兼容），从 QClaw 客户端本地存储解密 API Key
 QCLAW_BASE_URL = os.environ.get("QCLAW_BASE_URL", "https://mmgrcalltoken.3g.qq.com/aizone/v1")
-# qclaw-local: 走 QClaw 进程内转发服务器（19001），绕过 19000 网关签名
-# 需先运行 _inject_forward_server.js 在 QClaw 进程内注入转发服务器
-QCLAW_LOCAL_BASE_URL = os.environ.get("QCLAW_LOCAL_BASE_URL", "http://127.0.0.1:19001")
 
 
 def _dpapi_unprotect(encrypted_bytes: bytes) -> bytes:
@@ -746,7 +743,7 @@ COPILOT_SMALL_MODEL  = os.environ.get("COPILOT_SMALL_MODEL",  "claude-haiku-4.5"
 
 # Get preferred provider
 PREFERRED_PROVIDER = os.environ.get("PREFERRED_PROVIDER", "openai").lower()
-valid_providers = ("openai", "anthropic", "qclaw", "qclaw-local", "gemini", "gemini-openai", "copilot")
+valid_providers = ("openai", "anthropic", "qclaw", "gemini", "gemini-openai", "copilot")
 if PREFERRED_PROVIDER not in valid_providers:
     print(f"Warning: Unknown PREFERRED_PROVIDER '{PREFERRED_PROVIDER}', falling back to 'openai'")
     PREFERRED_PROVIDER = "openai"
@@ -754,7 +751,7 @@ if PREFERRED_PROVIDER not in valid_providers:
 print(f"🚀 Preferred provider: {PREFERRED_PROVIDER}")
 
 # 注册 QClaw 模型到 LiteLLM，避免 "model isn't mapped" 错误
-if PREFERRED_PROVIDER in ("qclaw", "qclaw-local"):
+if PREFERRED_PROVIDER in ("qclaw",):
     _qclaw_all_models = {
         m: {
             "max_tokens": 16384, "input_cost_per_token": 0, "output_cost_per_token": 0,
@@ -1252,8 +1249,8 @@ def _handler_prepare_body(target: dict, body_bytes: bytes):
             body_json["model"] = mapped["model"]
         else:
             cross_port_target = dict(mapped)
-    if handler == "qclaw":
-        # QClaw 网关要求必须有 system message（与 FastAPI 透传路径一致）
+    if target.get("cleanQclawBody"):
+        # QClaw 网关要求必须有 system message 且只接受白名单字段（防 9002）
         msgs = body_json.get("messages", [])
         if not any(m.get("role") == "system" for m in msgs):
             msgs.insert(0, {"role": "system", "content": "You are Claude, a helpful AI assistant."})
@@ -3111,13 +3108,13 @@ def _handler_prepare_headers(target: dict, fwd_headers: dict, body_json: dict) -
     # 补充 header（如 copilot 的 Copilot-Integration-Id）
     for k, v in (target.get("extraHeaders") or {}).items():
         fwd_headers[k] = v
-    # qclaw 上游要求 UA 精确等于 OpenAI/JS 6.39.1
+    # qclaw（cleanQclawBody target）上游要求 UA 精确等于 OpenAI/JS 6.39.1
     # 客户端透传的 user-agent（python-httpx 等）必须清除——否则 httpx 会把两个 UA
     # 合并成逗号分隔值（"python-httpx/0.28.1, OpenAI/JS 6.39.1"），上游 400 invalid request。
-    if handler == "qclaw":
-        for _hk in [k for k in fwd_headers if k.lower() == "user-agent"]:
+    # UA 值由 target.extraHeaders 注入（见 _prepare_fwd_headers 上方），此处仅清旧 UA 防合并。
+    if target.get("cleanQclawBody"):
+        for _hk in [k for k in fwd_headers if k.lower() == "user-agent" and k != "User-Agent"]:
             del fwd_headers[_hk]
-        fwd_headers["User-Agent"] = "OpenAI/JS 6.39.1"
     return fwd_headers
 
 
@@ -3413,7 +3410,7 @@ def _choose_openai_upstream(body_json: dict):
                 "Content-Type": "application/json",
             },
         )
-    elif provider in ("qclaw", "qclaw-local"):
+    elif provider in ("qclaw",):
         return (
             f"{QCLAW_BASE_URL}/chat/completions",
             {
@@ -4169,7 +4166,7 @@ def _default_provider(req, litellm_req, _orig):
 def _qclaw_provider(req, litellm_req, orig):
     """QClaw 上游直连（OpenAI 兼容接口）"""
     litellm_req["api_key"] = QCLAW_API_KEY
-    litellm_req["api_base"] = QCLAW_LOCAL_BASE_URL if PREFERRED_PROVIDER == "qclaw-local" else QCLAW_BASE_URL
+    litellm_req["api_base"] = QCLAW_BASE_URL
     litellm_req["extra_headers"] = {"User-Agent": "OpenAI/JS 6.39.1"}  # 上游拒绝 python-httpx 默认 UA
     # 清理 litellm 内部字段和 Anthropic 专属字段，防止上游拒绝非标准参数
     for k in ("stop", "top_k", "metadata", "thinking", "reasoning",
@@ -4264,7 +4261,7 @@ def _copilot_provider(req, litellm_req, orig):
 _PROVIDER_STRATEGIES = {
     "openai": _default_provider,
     "qclaw": _qclaw_provider,
-    "qclaw-local": _qclaw_provider,
+
     "anthropic": _anthropic_provider,
     "gemini": _gemini_provider,
     "gemini-openai": _gemini_provider,
@@ -5448,7 +5445,7 @@ async def openai_chat_completions(raw_request: Request):
         is_stream = body.get("stream", False)
 
         # ── 透传模式：qclaw / openai / copilot / gemini-openai ──
-        _PASSTHROUGH_PROVIDERS = ("qclaw", "qclaw-local", "openai", "copilot", "gemini-openai")
+        _PASSTHROUGH_PROVIDERS = ("qclaw", "openai", "copilot", "gemini-openai")
         if PREFERRED_PROVIDER in _PASSTHROUGH_PROVIDERS:
             passthrough_model = req_model
             # 去掉 provider 前缀（如果有）
@@ -5461,7 +5458,7 @@ async def openai_chat_completions(raw_request: Request):
             headers = {"Content-Type": "application/json"}
             url = ""
 
-            if PREFERRED_PROVIDER in ("qclaw", "qclaw-local"):
+            if PREFERRED_PROVIDER in ("qclaw",):
                 body["model"] = passthrough_model
                 # QClaw 网关要求必须有 system message
                 msgs = body.get("messages", [])
@@ -5473,7 +5470,7 @@ async def openai_chat_completions(raw_request: Request):
                 logger.debug(f"🐙 QClaw passthrough: body keys={list(body.keys())} model={body.get('model')}")
                 headers["Authorization"] = f"Bearer {QCLAW_API_KEY}"
                 headers["User-Agent"] = "OpenAI/JS 6.39.1"  # 上游拒绝 python-httpx 默认 UA
-                _qclaw_base = QCLAW_LOCAL_BASE_URL if PREFERRED_PROVIDER == "qclaw-local" else QCLAW_BASE_URL
+                _qclaw_base = QCLAW_BASE_URL
                 url = f"{_qclaw_base}/chat/completions"
 
             elif PREFERRED_PROVIDER == "openai":
@@ -6860,7 +6857,7 @@ def _build_models_list(include_aliases: bool = True) -> List[dict]:
 
     # ── 无下游缓存的 fallback（qclaw / gemini / anthropic 等）──
     _passthrough_models = []
-    if PREFERRED_PROVIDER in ("qclaw", "qclaw-local"):
+    if PREFERRED_PROVIDER in ("qclaw",):
         _passthrough_models = [
             ("modelroute", "QClaw Model Route"),
             ("pool-deepseek-v4-pro", "DeepSeek V4 Pro"),
@@ -9952,7 +9949,6 @@ if __name__ == "__main__":
         print("  anthropic    Anthropic Claude API")
         print("  google       Google Gemini API")
         print("  qclaw        QClaw upstream (mmgrcalltoken.3g.qq.com, auto-decrypt API key)")
-        print("  qclaw-local  QClaw via 19001 parasitic forward server (needs qclaw_inject.js)")
         print("")
         print("Example: PREFERRED_PROVIDER=qclaw python server.py")
         sys.exit(0)

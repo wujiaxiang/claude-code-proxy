@@ -259,7 +259,7 @@
       "label": "qclaw",
       "listenPort": 8085,
       "category": "crack",
-      "handler": "qclaw",
+      "handler": "passthrough",
       "targetHost": "mmgrcalltoken.3g.qq.com",
       "targetPort": 443,
       "targetProtocol": "https",
@@ -319,7 +319,11 @@
         "small": "low"
       },
       "isFree": true,
-      "enabled": true
+      "enabled": true,
+      "extraHeaders": {
+        "User-Agent": "OpenAI/JS 6.39.1"
+      },
+      "cleanQclawBody": true
     },
     {
       "label": "trae-work",
