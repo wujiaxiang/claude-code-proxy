@@ -312,6 +312,79 @@ tcs, rtext, content = server._resolve_trae_text(full_xml_unclosed)
 check("XML 未闭合不崩溃且不丢内容", content == full_xml_unclosed)
 check("XML 未闭合无 tool_calls", tcs == [])
 
+# 7.7 Wave 2：<seed_call> 的 invoke/function 两种非对称闭合变体
+seed_call_invoke = '''<seed_call>
+<invoke name="bash">
+<parameter name="command">.venv/bin/python -c "import server; print('IMPORT OK')"</parameter>
+<parameter name="workdir">/root/shared-workspace/claude-code-proxy</parameter>
+</invoke>
+</tool_call>'''
+seed_a_expected = {
+    "command": '.venv/bin/python -c "import server; print(\'IMPORT OK\')"',
+    "workdir": "/root/shared-workspace/claude-code-proxy",
+}
+seed_a_tcs, seed_a_reasoning, seed_a_content = server._resolve_trae_text(seed_call_invoke)
+check("seed_call invoke 非对称闭合精确解析",
+      len(seed_a_tcs) == 1
+      and seed_a_tcs[0]["function"]["name"] == "bash"
+      and json.loads(seed_a_tcs[0]["function"]["arguments"]) == seed_a_expected
+      and seed_a_reasoning == ""
+      and seed_a_content == ""
+      and "seed_call" not in seed_a_content
+      and "parameter" not in seed_a_content)
+
+seed_call_function = ('<seed_call><function name="bash"><parameter name="command" string="true">'
+                      'git add server.py && git status</parameter><parameter name="workdir" string="true">'
+                      '/root/shared-workspace/claude-code-proxy</parameter></function></seed:tool_call>')
+seed_b_expected = {
+    "command": "git add server.py && git status",
+    "workdir": "/root/shared-workspace/claude-code-proxy",
+}
+seed_b_tcs, seed_b_reasoning, seed_b_content = server._resolve_trae_text(seed_call_function)
+check("seed_call function string 属性精确解析",
+      len(seed_b_tcs) == 1
+      and seed_b_tcs[0]["function"]["name"] == "bash"
+      and json.loads(seed_b_tcs[0]["function"]["arguments"]) == seed_b_expected
+      and seed_b_reasoning == ""
+      and seed_b_content == ""
+      and "seed_call" not in seed_b_content
+      and "string=\"true\"" not in seed_b_content)
+
+# Todo 6 合成 fixture：同一 command 常量既构造 XML JSON，也作为精确期望值，避免
+# fixture 与断言分别维护；保留多行、嵌套花括号和转义引号三类历史截断风险。
+mixed_prefix = ("Now I'll perform all deletions and insertions using precise multi-line matches.\n"
+                "First, let me read the file to understand its structure.")
+mixed_command = ("cd /root/shared-workspace/claude-code-proxy && python3 -c '\n"
+                 "import re\n"
+                 'pattern = re.compile(r"[{\\\\}]")\n'
+                 "def process(data):\n"
+                 "    result = {key: [item for item in value] for key, value in data.items()}\n"
+                 "    return result\n"
+                 'print(process({"a": [1, 2, {\\"nested\\": True}]}))\n'
+                 "'\n")
+mixed_suffix = "Let me verify the change took effect."
+mixed_fixture = (mixed_prefix + "\n<tool_call>\n"
+                 + json.dumps({"name": "bash", "arguments": {"command": mixed_command}}, ensure_ascii=False)
+                 + "\n</tool_call>\n" + mixed_suffix)
+mixed_tcs, mixed_reasoning, mixed_content = server._resolve_trae_text(mixed_fixture)
+check("自由文本混杂多行 tool_call JSON 精确解析",
+      len(mixed_tcs) == 1
+      and mixed_tcs[0]["function"]["name"] == "bash"
+      and json.loads(mixed_tcs[0]["function"]["arguments"]) == {"command": mixed_command}
+      and mixed_reasoning == ""
+      and mixed_content == f"{mixed_prefix}\n\n{mixed_suffix}"
+      and "<tool_call>" not in mixed_content
+      and '"arguments"' not in mixed_content)
+
+wave2_plain_text = "This is ordinary prose with braces {not JSON} and no tool marker."
+plain_tcs, plain_reasoning, plain_content = server._resolve_trae_text(wave2_plain_text)
+check("Wave 2 纯自由文本不误判工具调用",
+      plain_tcs == []
+      and plain_reasoning == ""
+      and plain_content == wave2_plain_text
+      and "<tool_call>" not in plain_content
+      and '"arguments"' not in plain_content)
+
 # 7.7 空文本 → 全部返回空
 tcs, rtext, content = server._resolve_trae_text("")
 check("空文本 tool_calls 为空", tcs == [])
