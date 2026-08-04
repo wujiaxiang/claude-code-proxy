@@ -999,10 +999,11 @@ async def _write_error_response(writer, status, message, *, content_type="applic
         pass
 
 
-async def _write_response(writer, resp, *, stats=None):
+async def _write_response(writer, resp, *, stats=None, write_state=None):
     """统一从 httpx 响应回写到 writer。
     自动区分流式/非流式，非 200 自动记录日志。
     返回 (status_code, body_bytes) — body_bytes=None 表示流式已写完。
+    write_state: 可选的可变字典，用于跟踪 headers_sent 状态（流式场景下避免二次写状态行）
     """
     status, body_bytes, is_stream = None, None, False
     try:
@@ -1022,6 +1023,9 @@ async def _write_response(writer, resp, *, stats=None):
                 if k.lower() not in _PROXY_STRIP_RESP_HEADERS:
                     writer.write(f"{k}: {v}\r\n".encode())
             writer.write(b"\r\n")
+            # 标记 headers 已写入（流式场景：状态行+headers 已发送到 writer 缓冲区）
+            if write_state is not None:
+                write_state["headers_sent"] = True
             async for chunk in resp.aiter_bytes():
                 writer.write(chunk)
                 await writer.drain()
@@ -3376,6 +3380,8 @@ async def _handle_target_request(reader, writer, target):
         "startedAt": datetime.now().isoformat(),
     })
     try:
+        # 可变状态对象：跟踪响应 headers 是否已写入下游（用于流式中途异常时避免二次写状态行）
+        write_state = {"headers_sent": False}
         method, path, raw_path, headers, body = await _parse_http_request(reader)
         if method is None:
             return
@@ -3435,6 +3441,8 @@ async def _handle_target_request(reader, writer, target):
                         if k.lower() not in _PROXY_STRIP_RESP_HEADERS:
                             writer.write(f"{k}: {v}\r\n".encode())
                     writer.write(b"\r\n")
+                    # 标记 headers 已写入（避免后续异常时二次写状态行）
+                    write_state["headers_sent"] = True
                     async for chunk in resp.aiter_bytes():
                         writer.write(chunk)
                         await writer.drain()
@@ -3547,12 +3555,14 @@ async def _handle_target_request(reader, writer, target):
                     # 上游 /responses SSE → chat.completions SSE
                     writer.write(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\n\r\n")
                     await writer.drain()
+                    # 标记 headers 已写入（避免后续异常时二次写状态行）
+                    write_state["headers_sent"] = True
                     await _write_copilot_responses_stream(writer, resp, str(_req_model), label)
                     if _req_model:
                         _bump_model_stats(label, _req_model, "ok")
                     writer.close()
                     return
-                status, _ = await _write_response(writer, resp, stats=stats)
+                status, _ = await _write_response(writer, resp, stats=stats, write_state=write_state)
                 if _req_model:
                     _bump_model_stats(label, _req_model, "ok" if (status or 0) < 400 else "err")
                 if status and status >= 400:
@@ -3657,29 +3667,49 @@ async def _handle_target_request(reader, writer, target):
             else:
                 if _req_model:
                     _bump_model_stats(label, _req_model, "ok" if resp.status_code < 400 else "err")
-                await _write_response(writer, resp, stats=stats)
+                await _write_response(writer, resp, stats=stats, write_state=write_state)
     except (httpx.ConnectError, httpx.ConnectTimeout) as exc:
         stats["passthroughError"] += 1
         logger.exception(f"[{label}] upstream connect failed")
-        try:
-            await _write_error_response(writer, 502, f"Upstream connection failed for {label}")
-        except Exception:
-            pass
+        if write_state.get("headers_sent"):
+            logger.warning(f"[{label}] stream aborted mid-transfer after headers sent, closing connection: {exc}")
+            try:
+                writer.close()
+            except Exception:
+                pass
+        else:
+            try:
+                await _write_error_response(writer, 502, f"Upstream connection failed for {label}")
+            except Exception:
+                pass
     except httpx.ReadTimeout as exc:
         stats["passthroughError"] += 1
         logger.exception(f"[{label}] upstream read timeout")
-        try:
-            await _write_error_response(writer, 504, f"Upstream read timeout for {label}")
-        except Exception:
-            pass
+        if write_state.get("headers_sent"):
+            logger.warning(f"[{label}] stream aborted mid-transfer after headers sent, closing connection: {exc}")
+            try:
+                writer.close()
+            except Exception:
+                pass
+        else:
+            try:
+                await _write_error_response(writer, 504, f"Upstream read timeout for {label}")
+            except Exception:
+                pass
     except httpx.RemoteProtocolError as exc:
-        # TODO(Todo 3): 完整逻辑 - headers 已提交(write_state["headers_sent"])时只 warning+close；未提交时 502
         stats["passthroughError"] += 1
         logger.exception(f"[{label}] upstream protocol error")
-        try:
-            await _write_error_response(writer, 502, f"Upstream protocol error for {label}")
-        except Exception:
-            pass
+        if write_state.get("headers_sent"):
+            logger.warning(f"[{label}] stream aborted mid-transfer after headers sent, closing connection: {exc}")
+            try:
+                writer.close()
+            except Exception:
+                pass
+        else:
+            try:
+                await _write_error_response(writer, 502, f"Upstream protocol error for {label}")
+            except Exception:
+                pass
     except (ConnectionResetError, RuntimeError):
         # 客户端提前断开（写阶段异常，如 RuntimeError: unable to perform operation on <TCPTransport closed=True>）
         # 此异常发生在写入阶段，headers 已提交或正在提交，二次写无意义 → 仅记录 + 关闭连接
@@ -3691,10 +3721,17 @@ async def _handle_target_request(reader, writer, target):
     except Exception:
         stats["passthroughError"] += 1
         logger.exception(f"[{label}] target proxy exception")
-        try:
-            await _write_error_response(writer, 503, f"Proxy error for {label}")
-        except Exception:
-            pass
+        if write_state.get("headers_sent"):
+            logger.warning(f"[{label}] stream aborted mid-transfer after headers sent, closing connection")
+            try:
+                writer.close()
+            except Exception:
+                pass
+        else:
+            try:
+                await _write_error_response(writer, 503, f"Proxy error for {label}")
+            except Exception:
+                pass
 
 
 async def _vendor_server(host, port, target):
