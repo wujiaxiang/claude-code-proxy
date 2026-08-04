@@ -305,11 +305,14 @@ if tcs:
     check("XML 嵌套花括号 newString 完整", args.get("newString") == "function f(x) {{\n  return x + 1;\n}}")
 check("XML 嵌套花括号场景无原始标记泄漏到正文", "tool_call" not in content, f"content={content!r}")
 
-# 7.6c <tool_call> 未闭合（模型输出被截断）—— 不应崩溃，原样保留在 content
-# （既然流已结束，这是真实截断，原样展示比静默丢弃更利于排查）
+# 7.6c <tool_call> 未闭合（模型输出被截断）—— 不应崩溃；2026-08-04 起剥离未闭合
+# 开标签到文本末尾（命中疑似工具调用标记即剥离，不再原样透传半截 XML/JSON），
+# 开标签之前的正文保留。此前"原样保留"会让客户端看到裸露的 <tool_call> 半截。
 full_xml_unclosed = '开始执行。<tool_call>\n{"name": "bash", "arguments": {"command": "ls'
 tcs, rtext, content = server._resolve_trae_text(full_xml_unclosed)
-check("XML 未闭合不崩溃且不丢内容", content == full_xml_unclosed)
+check("XML 未闭合不崩溃", True)
+check("XML 未闭合剥离标记不泄漏", "<tool_call>" not in content, f"content={content!r}")
+check("XML 未闭合正文保留", "开始执行" in content, f"content={content!r}")
 check("XML 未闭合无 tool_calls", tcs == [])
 
 # 7.7 Wave 2：<seed_call> 的 invoke/function 两种非对称闭合变体
@@ -384,6 +387,89 @@ check("Wave 2 纯自由文本不误判工具调用",
       and plain_content == wave2_plain_text
       and "<tool_call>" not in plain_content
       and '"arguments"' not in plain_content)
+
+# ─── 8. Wave 3：<tool_call> XML 子标签变体 + <seed:tool_result> 复述块 ───
+# （2026-08-04 实测抓包：ses_032871f10ffeUFPADwt7q2qizX 会话末尾泄漏）
+# 根因：模型从上下文学到 opencode 客户端工具调用历史格式，<tool_call> 块内
+# 输出 XML 子标签（<tool_name>/<parameters>/<parameter name=..>）而非 JSON，
+# _TOOLCALL_XML_RE 分支 find("{") 失败 → 整段原样泄漏；<seed:tool_result>
+# 复述历史工具结果（无闭合标签）也不在任何检测特征里，静默透传。
+print("[8] Wave 3: <tool_call> XML 子标签 + <seed:tool_result>")
+
+# 8.1 <tool_call> 内 XML 子标签（真实泄漏：bash + git status）
+wave3_tc = '''我来检查当前的 git 状态，看看有哪些修改需要提交。
+
+<tool_call>
+<tool_name>bash</tool_name>
+<parameters>
+<parameter name="command" string="true">cd /root/shared-workspace/claude-code-proxy && git status</parameter>
+<parameter name="timeout" string="false">10000</parameter>
+</parameters>
+</tool_call>'''
+w3_tcs, w3_r, w3_c = server._resolve_trae_text(wave3_tc)
+check("tool_call 子标签识别为疑似标记", server._looks_like_dsml(wave3_tc))
+check("tool_call 子标签解析出 1 个", len(w3_tcs) == 1)
+check("tool_call 子标签 name 正确",
+      w3_tcs and w3_tcs[0]["function"]["name"] == "bash")
+check("tool_call 子标签 arguments 完整",
+      w3_tcs and json.loads(w3_tcs[0]["function"]["arguments"])["command"]
+      == "cd /root/shared-workspace/claude-code-proxy && git status")
+check("tool_call 子标签正文已清洗（无标记泄漏）",
+      "<tool_call>" not in w3_c and "<tool_name>" not in w3_c and "parameter" not in w3_c,
+      f"content={w3_c!r}")
+check("tool_call 子标签正文保留前置说明", "我来检查当前的 git 状态" in w3_c)
+
+# 8.2 <seed:tool_result> 纯复述（真实泄漏：历史 grep 结果整段）
+wave3_seed = '''<seed:tool_result>
+Found 18 match(es) in 1 file(s)
+
+/root/shared-workspace/claude-code-proxy/server.py
+  389: yield f"data: {{\\"error\\":\\"upstream ...\\"}}"
+  807: re.compile(r'"ResourceExhausted"'),
+'''
+w3s_tcs, w3s_r, w3s_c = server._resolve_trae_text(wave3_seed)
+check("seed:tool_result 判定为疑似标记", server._looks_like_dsml(wave3_seed))
+check("seed:tool_result 不解析出 tool_calls", w3s_tcs == [])
+check("seed:tool_result 复述块已剥离",
+      "seed:tool_result" not in w3s_c and "server.py" not in w3s_c,
+      f"content={w3s_c!r}")
+
+# 8.3 混合结构：seed:tool_result 复述 + 正文 + 新 tool_call（真实日志 897 行形态）
+wave3_mixed = '''<seed:tool_result>
+/root/shared-workspace/claude-code-proxy/targets.json:417:   "label": "openrouter",
+/root/shared-workspace/claude-code-proxy/targets.json:418:   "listenPort": 8090,
+/root/shared-workspace/claude-code-proxy/targets.json:2659:   "port": 8090,
+现在让我检查 server.py 中这两个端口的错误处理逻辑：
+
+<tool_call>
+<tool_name>grep</tool_name>
+<parameters>
+<parameter name="pattern" string="true">error.*rewrite|rewrite.*error</parameter>
+<parameter name="path" string="true">/root/shared-workspace/claude-code-proxy/server.py</parameter>
+</parameters>
+</tool_call>'''
+w3m_tcs, w3m_r, w3m_c = server._resolve_trae_text(wave3_mixed)
+check("混合结构新调用解析出 1 个", len(w3m_tcs) == 1)
+check("混合结构新调用 name 正确",
+      w3m_tcs and w3m_tcs[0]["function"]["name"] == "grep")
+check("混合结构无标记泄漏",
+      "seed:tool_result" not in w3m_c
+      and "<tool_call>" not in w3m_c
+      and "<tool_name>" not in w3m_c,
+      f"content={w3m_c!r}")
+check("混合结构正文保留", "现在让我检查" in w3m_c, f"content={w3m_c!r}")
+
+# 8.4 纯文本不受影响
+w3_plain = "完全普通的回复，没有工具调用。"
+w3p_tcs, w3p_r, w3p_c = server._resolve_trae_text(w3_plain)
+check("Wave 3 纯文本不误判", w3p_tcs == [] and w3p_c == w3_plain)
+
+# 8.5 未闭合 <tool_call>（截断）剥离但保留正文
+w3_unclosed = '开始执行。<tool_call>\n{"name": "bash", "arguments": {"command": "ls'
+w3u_tcs, w3u_r, w3u_c = server._resolve_trae_text(w3_unclosed)
+check("未闭合 tool_call 不崩溃且剥离标记",
+      "<tool_call>" not in w3u_c and "开始执行" in w3u_c,
+      f"content={w3u_c!r}")
 
 # 7.7 空文本 → 全部返回空
 tcs, rtext, content = server._resolve_trae_text("")

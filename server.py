@@ -323,6 +323,30 @@ def _is_auth_expired_error(exc: Exception) -> bool:
     return "9002" in msg or "该功能暂不可用" in msg
 
 
+# 限流/资源耗尽错误特征：优先按 litellm 异常类型判断，兜底按消息特征匹配，
+# 避免把真正的 5xx / 鉴权失败误判为 429。
+_RATE_LIMIT_ERROR_KEYWORDS = (
+    "ResourceExhausted",
+    "Worker local total request limit reached",
+    "rate_limit_error",
+    "RateLimitError",
+)
+
+
+def _is_rate_limit_error(exc: Exception) -> bool:
+    """识别 LiteLLM 抛出的限流类异常（含 qclaw 的 ResourceExhausted / Worker local ...）。
+
+    命中后调用方应返回 HTTP 429 + Retry-After，让下游客户端（如 opencode）自动重试。
+    关键字复用 _VENDOR_ERROR_MAPS，保持单点维护。
+    """
+    if isinstance(exc, (litellm.RateLimitError, getattr(litellm, "RouterRateLimitError", ()))):
+        return True
+    text = str(exc)
+    if not text:
+        return False
+    return any(k in text for k, _s, _t, _d in _VENDOR_ERROR_MAPS)
+
+
 # QClaw 网关只接受标准 OpenAI chat completion 字段，非标准字段会导致 9002
 _QCLAW_ALLOWED_KEYS = {
     "model", "messages", "max_tokens", "max_completion_tokens",
@@ -810,10 +834,44 @@ _VENDOR_ERROR_PATTERNS = [
     re.compile(r'"type"\s*:\s*"rate_limit_error"', re.IGNORECASE),
 ]
 
+# ─── 上游错误码映射表（数据驱动，新增网关只需追加一行）───
+# 透传网关遇到下列「字段特征」（子串匹配，大小写敏感）即把上游错误体
+# 标准化为 (目标 HTTP 状态码, SSE error type)，让下游客户端（opencode 等）
+# 按标准错误重试/降级，而不是把伪成功/5xx 透传导致 UnknownError。
+# 字段特征, 目标状态码, SSE error type, 说明
+_VENDOR_ERROR_MAPS = [
+    ("ResourceExhausted", 429, "rate_limit_error", "qclaw/nvidia/openrouter 资源耗尽（并发限制）"),
+    ("Worker local total request limit reached", 429, "rate_limit_error", "nvidia/openrouter 本地并发已满"),
+    ("rate_limit_exceeded", 429, "rate_limit_error", "OpenAI 标准限流码"),
+    ("too_many_requests", 429, "rate_limit_error", "OpenAI 标准限流码"),
+    ("RateLimitError", 429, "rate_limit_error", "litellm 限流异常类名"),
+]
+
+
+def _map_upstream_error(body_text: str):
+    """根据错误映射表把上游错误体转成 (http_status, sse_error_type)。
+
+    匹配顺序：
+    1. 先按 _VENDOR_ERROR_MAPS 做子串匹配——覆盖无标准 error 信封的格式，如：
+       - openrouter: {"code":502,"message":"Upstream error from Nvidia: ResourceExhausted: ..."}
+       - nvidia:     裸字符串 "ResourceExhausted: Worker local total request limit reached (32/32)"
+    2. 回退到标准 OpenAI error 信封 {"error":{...}} 含 _VENDOR_ERROR_PATTERNS 特征。
+    返回 None 表示不是可识别的限流/错误信封。
+    """
+    if not body_text:
+        return None
+    for _keyword, _status, _err_type, _desc in _VENDOR_ERROR_MAPS:
+        if _keyword in body_text:
+            return (_status, _err_type)
+    if re.search(r'"error"\s*:', body_text):
+        if any(p.search(body_text) for p in _VENDOR_ERROR_PATTERNS):
+            return (429, "rate_limit_error")
+    return None
+
+
 def _vendor_body_retryable(body_text: str) -> bool:
-    if not re.search(r'"error"\s*:', body_text):
-        return False
-    return any(p.search(body_text) for p in _VENDOR_ERROR_PATTERNS)
+    """判断上游错误体是否应被转成可重试的标准错误（429）。"""
+    return _map_upstream_error(body_text) is not None
 
 
 async def _aggregate_codebuddy_stream(target, upstream_url, fwd_headers, body_json, label):
@@ -2177,6 +2235,17 @@ _SEED_CALL_RE = re.compile(
 _SEED_CALL_INVOKE_RE = re.compile(r'<invoke\s+name="([^"]*)"[^>]*>([\s\S]*?)</invoke\s*>', re.I)
 _SEED_CALL_FUNCTION_RE = re.compile(r'<function\s+name="([^"]*)"[^>]*>([\s\S]*?)</function\s*>', re.I)
 _SEED_CALL_PARAM_OPEN_RE = re.compile(r'<parameter\s+name="([^"]*)"[^>]*>', re.I)
+# 变体 6（2026-08-04 实测，Doubao-Seed-Code）：<tool_call> 内部不是 JSON 而是
+# XML 子标签：<tool_name>bash</tool_name><parameters><parameter name="command"
+# string="true">...</parameter>...</parameters>。曾因 _TOOLCALL_XML_RE 分支要求
+# 块内 find("{") 而解析失败，整段 <tool_call> 原样泄漏到正文（IDE 显示裸露 XML，
+# 工具未执行）。
+_TOOLCALL_NAME_RE = re.compile(r"<tool_name\b[^>]*>([\s\S]*?)</tool_name\s*>", re.I)
+_TOOLCALL_PARAM_RE = re.compile(
+    r'<parameter\s+name="([^"]*)"[^>]*>([\s\S]*?)</parameter\s*>', re.I)
+# 变体 7（2026-08-04 实测）：模型把历史工具结果用 <seed:tool_result> 包裹复述
+# （无闭合标签，直接透传给客户端显示重复的历史 grep 结果）。识别用于剥离。
+_SEED_TOOL_RESULT_OPEN_RE = re.compile(r"<seed:tool_result\b[^>]*>", re.I)
 
 
 def _build_trae_tool_prompt(tools: list) -> str:
@@ -2223,13 +2292,17 @@ def _looks_like_dsml(text: str) -> bool:
     """文本是否含工具调用标记特征（seed-code 系模型输出）。
 
     兼容形态：DSML 标记（<｜DSML｜>...）、[Tool Call: name] 文本格式、
-    {"reasoning_content":"..."} JSON 字面量（思考封装），以及各形态的
-    分片半截（尽早进入缓冲累积，避免原始标记/JSON 字面量透传给客户端）。
+    {"reasoning_content":"..."} JSON 字面量（思考封装）、<tool_call> XML、
+    <seed_call>/<seed:tool_result> 等 seed 系标签，以及各形态的分片半截
+    （尽早进入缓冲累积，避免原始标记/JSON 字面量透传给客户端）。
     """
     t = text or ""
     return bool(_DSML_LIKE_RE.search(t) or _TOOLCALL_TEXT_RE.search(t)
                 or _DSML_REASONING_RE.search(t) or _TOOLCALL_XML_RE.search(t)
                 or _DSML_ANY_TAG_RE.search(t)
+                or _SEED_CALL_RE.search(t) or _SEED_TOOL_RESULT_OPEN_RE.search(t)
+                or _TOOLCALL_NAME_RE.search(t) or _TOOLCALL_PARAM_RE.search(t)
+                or "<seed:" in t or "<tool_" in t
                 or "[Tool Call" in t or "Arguments:" in t
                 or '{"reasoning_content"' in t or "reasoning_content" in t
                 or "tool_call" in t or t.startswith('{"'))
@@ -2250,6 +2323,36 @@ def _looks_like_dsml(text: str) -> bool:
 # 本实现采用同样策略：resp_text 流式阶段只做纯累积（不做任何 content 提前
 # 转发），reasoning_content/tool_calls 等结构化字段（上游明确给出、非文本
 # 猜测）仍然逐 chunk 立即转发，因为它们不存在"文本标记未闭合"的歧义。
+def _strip_seed_tool_result_blocks(text: str) -> str:
+    """剥离 <seed:tool_result> 复述块（2026-08-04 实测，Doubao-Seed-Code）。
+
+    模型会把历史工具结果用 <seed:tool_result> 开标签包裹复述（无闭合标签），
+    原样透传给客户端 = 重复显示历史 grep 结果。处理策略（按开标签后是否有
+    新的强工具标记区分）：
+      - 无后续强标记（纯复述）：整块丢弃，避免历史结果整段泄漏
+      - 有后续强标记（混合结构：复述 + 正文 + 新调用）：开标签后内容与正文
+        无闭合标签无法可靠分界，保守只剥开标签本身、保留后续全部——正文不丢，
+        且新工具调用块由 _TOOLCALL_XML_RE 等后续清洗删除。
+    """
+    if "<seed:tool_result" not in text:
+        return text
+    parts = []
+    i = 0
+    while True:
+        m = _SEED_TOOL_RESULT_OPEN_RE.search(text, i)
+        if not m:
+            parts.append(text[i:])
+            break
+        parts.append(text[i:m.start()])  # 开标签之前的正文保留
+        nxt = re.search(r"<tool_call\b|<seed_call\b|<invoke\b|<function\b", text[m.end():], re.I)
+        if nxt:
+            # 混合结构：剥掉开标签，从开标签后继续（正文与新调用保留）
+            i = m.end()
+        else:
+            break  # 纯复述：后续内容全部丢弃
+    return "".join(parts)
+
+
 def _resolve_trae_text(full_text: str) -> tuple[list, str, str]:
     """对一整轮已完整接收的 response/content 文本做工具调用/reasoning 解析。
 
@@ -2266,15 +2369,23 @@ def _resolve_trae_text(full_text: str) -> tuple[list, str, str]:
     tool_calls = _parse_dsml_tool_calls(text)
     if not tool_calls and _looks_like_dsml(text):
         # 兜底告警（2026-08-03 新增）：文本命中"疑似工具调用标记"特征，但所有已知
-        # 解析器（DSML 独立标签/invoke 属性变体/[Tool Call:] 文本/<tool_call> XML）
-        # 均未能解析出 tool_calls——大概率是模型又输出了一种尚未支持的第 5 种变体。
-        # 直接记录 WARNING + 原始文本，以便第一时间从日志发现新变体，而不是被动
-        # 等用户反馈"工具没执行"。不中断流程：仍按普通文本处理，避免整段吞掉。
+        # 解析器均未能解析出 tool_calls——大概率是模型又输出了一种尚未支持的新变体。
+        # 记录 WARNING + 原始文本，便于从日志第一时间发现新变体。
+        # 2026-08-04 修复：不再"按普通文本原样透传"——命中疑似标记的文本直接透传
+        # 会把未解析的 <tool_call>/<seed:tool_result> 等原始标记泄漏给客户端（IDE
+        # 显示裸露 XML、工具不执行）。改为剥离已知强标记块（tool_call/seed_call/
+        # seed:tool_result 复述块等），只保留剩余正文；剥离后若为空则正文为空，
+        # 宁可丢内容也不泄漏未解析的调用标记（调用意图已丢失，正文保留也无意义）。
         logger.warning(f"[trae-work] _looks_like_dsml=True 但未解析出 tool_calls，"
-                        f"疑似新的工具调用标记变体，原始文本: {text[:16384]!r}")
-    if tool_calls:
+                        f"疑似新的工具调用标记变体，已剥离强标记。原始文本: {text[:16384]!r}")
+        content_text = _strip_strong_tool_markers(text).strip()
+    elif tool_calls:
         # 工具调用文本本身不作为正文回显（DSML/[Tool Call:]/<tool_call> 全部清洗掉）
+        # 顺序关键：先剥 <seed:tool_result> 复述块（依赖 <tool_call>/<invoke> 等
+        # 强标记界定块边界），再删 <tool_call> 等调用块——反序会因调用块已删
+        # 找不到边界而吞掉复述块之后的正文（2026-08-04 实测）。
         content_text = _SEED_CALL_RE.sub("", text)
+        content_text = _strip_seed_tool_result_blocks(content_text)
         content_text = _DSML_BLOCK_RE.sub("", content_text)
         content_text = _DSML_TOOLCALLS_BLOCK_RE.sub("", content_text)
         content_text = _TOOLCALL_TEXT_RE.sub("", content_text)
@@ -2287,6 +2398,76 @@ def _resolve_trae_text(full_text: str) -> tuple[list, str, str]:
     else:
         content_text = text.strip()
     return tool_calls, reasoning_text, content_text
+
+
+def _strip_strong_tool_markers(text: str) -> str:
+    """剥离所有已知"强工具调用标记"块，保留剩余文本（2026-08-04 兜底用）。
+
+    覆盖：<tool_call>...</tool_call>（含 XML 子标签变体）、<seed_call>...</...>、
+    DSML 独立块、[Tool Call: xxx]\nArguments: {...} 文本、<seed:tool_result> 复述块。
+    另处理未闭合的 <tool_call> 开标签（模型输出被截断）：从开标签剥离到文本
+    末尾——既然模型已进入调用输出模式，其后内容都是调用参数，原样透传只会把
+    半截 JSON/XML 泄漏给客户端（2026-08-04 实测：IDE 显示裸露 <tool_call>）。
+    供 _resolve_trae_text 解析失败兜底时调用——把未识别变体的标记外壳剥掉，
+    防止原始 XML/文本标记原样泄漏给客户端；剩余正文继续展示。
+    """
+    out = text
+    out = _SEED_CALL_RE.sub("", out)
+    # 先剥 <seed:tool_result>（依赖 <tool_call>/<invoke> 等强标记界定边界），再删调用块
+    out = _strip_seed_tool_result_blocks(out)
+    out = _TOOLCALL_XML_RE.sub("", out)
+    out = _DSML_BLOCK_RE.sub("", out)
+    out = _DSML_TOOLCALLS_BLOCK_RE.sub("", out)
+    out = _TOOLCALL_TEXT_RE.sub("", out)
+    for m in re.finditer(_TOOLCALL_TEXT_RE, text):
+        args = _extract_balanced_json(text, m.start(2))
+        if args is not None:
+            out = out.replace(args, "", 1)
+    # 未闭合 <tool_call> 开标签（无闭合标签，_TOOLCALL_XML_RE 匹配不到）→ 剥到末尾
+    unclosed = re.search(r"<tool_call\b[^>]*>", out, re.I)
+    if unclosed:
+        out = out[:unclosed.start()]
+    return out
+
+
+def _parse_toolcall_subtags(block: str) -> list:
+    """变体 6（2026-08-04 实测，Doubao-Seed-Code）：<tool_call> 块内 XML 子标签。
+
+    形态（与 opencode 客户端工具调用的历史格式同源，模型从上下文学到）：
+      <tool_call>
+      <tool_name>bash</tool_name>
+      <parameters>
+      <parameter name="command" string="true">cd /x && git status</parameter>
+      <parameter name="timeout" string="false">10000</parameter>
+      </parameters>
+      </tool_call>
+
+    解析 <tool_name> 为工具名，所有 <parameter name=".."> 收集为 arguments 的
+    {param_name: value}。JSON 值仍走 _extract_balanced_json（防嵌套花括号截断），
+    普通字符串值按标签位置切片。无 tool_name 或参数异常返回 []（交由上层兜底）。
+    """
+    tcs = []
+    for name_match in _TOOLCALL_NAME_RE.finditer(block):
+        tool_name = name_match.group(1).strip()
+        if not tool_name:
+            continue
+        params = {}
+        for pm in _TOOLCALL_PARAM_RE.finditer(block):
+            param_name = pm.group(1).strip()
+            if not param_name:
+                continue
+            param_value = pm.group(2)
+            json_start = param_value.find("{")
+            if json_start >= 0:
+                balanced = _extract_balanced_json(param_value, json_start)
+                if balanced is not None and not param_value[:json_start].strip():
+                    param_value = balanced
+            params[param_name] = param_value
+        item = {"type": "function", "function": {"name": tool_name}}
+        if params:
+            item["function"]["arguments"] = json.dumps(params, ensure_ascii=False)
+        tcs.append(item)
+    return tcs
 
 
 def _parse_dsml_tool_calls(text: str) -> list:
@@ -2351,6 +2532,13 @@ def _parse_dsml_tool_calls(text: str) -> list:
             block = block.strip()
             obj_start = block.find("{")
             if obj_start < 0:
+                # 变体 6（2026-08-04 实测）：<tool_call> 块内不是 JSON 而是
+                # XML 子标签（<tool_name>...</tool_name><parameters><parameter
+                # name=".." string="true">..</parameter></parameters>）。
+                # 按子标签解析：tool_name → 工具名，parameter → arguments。
+                subtags = _parse_toolcall_subtags(block)
+                if subtags:
+                    tcs.extend(subtags)
                 continue
             obj_str = _extract_balanced_json(block, obj_start)
             if obj_str is None:
@@ -3680,20 +3868,22 @@ async def _handle_target_request(reader, writer, target):
                         writer.close(); return
                     # 聚合失败：继续走下方错误处理（透传上游 400）
 
-            if _vendor_body_retryable(body_text):
+            mapped = _map_upstream_error(body_text)
+            if mapped is not None:
+                target_status, err_type = mapped
                 stats["translated429"] += 1
                 if _req_model:
                     _bump_model_stats(label, _req_model, "translated429")
-                logger.info(f"[{label}] translated HTTP {status} → 429 (rate_limit_error)")
+                logger.info(f"[{label}] translated HTTP {status} → {target_status} ({err_type})")
                 err_payload = json.dumps({
                     "error": {
-                        "type": "rate_limit_error",
+                        "type": err_type,
                         "message": "Upstream temporarily over capacity.",
                         "original_status": resp.status_code,
                     }
                 })
                 writer.write(
-                    f"HTTP/1.1 429 Too Many Requests\r\n"
+                    f"HTTP/1.1 {target_status} {'Too Many Requests' if target_status == 429 else 'Error'}\r\n"
                     f"Content-Type: application/json\r\n"
                     f"Retry-After: {_VENDOR_RETRY_AFTER}\r\n"
                     f"Content-Length: {len(err_payload.encode())}\r\n"
@@ -5037,11 +5227,22 @@ def convert_litellm_to_anthropic(
 
 async def _litellm_oai_stream(response_generator):
     """把 LiteLLM 流式输出转成 OpenAI SSE 格式（bytes）"""
-    async for chunk in response_generator:
-        try:
-            yield f"data: {json.dumps(chunk.model_dump())}\n\n".encode()
-        except Exception:
-            pass
+    try:
+        async for chunk in response_generator:
+            try:
+                yield f"data: {json.dumps(chunk.model_dump())}\n\n".encode()
+            except Exception:
+                pass
+    except Exception as e:
+        # 流中途上游抛限流异常（headers 已发送，无法改状态码）：
+        # 发出 SSE error 事件让客户端感知，而不是伪成功 [DONE]。
+        if _is_rate_limit_error(e):
+            logger.warning(f"🕐 LiteLLM stream rate-limited (SSE error event): {e}")
+            err = {"error": {"type": "rate_limit_error", "message": str(e)}}
+            yield f"data: {json.dumps(err)}\n\n".encode()
+        else:
+            # 非限流异常保持原行为：向上抛出中断流（由框架处理）
+            raise
     yield b"data: [DONE]\n\n"
 
 
@@ -5135,10 +5336,30 @@ async def openai_chat_completions(raw_request: Request):
                         client = httpx.AsyncClient(timeout=httpx.Timeout(300.0, connect=10.0), trust_env=False)
                         try:
                             async with client.stream("POST", url, json=body, headers=headers) as resp:
-                                if resp.status_code >= 500:
-                                    await resp.aread()
-                                    last_err = f"upstream {resp.status_code}"
-                                    continue
+                                if resp.status_code >= 400:
+                                    # 读 body 判断是否为可识别的限流错误（数据驱动，见 _VENDOR_ERROR_MAPS）
+                                    if resp.status_code == 429 or resp.status_code >= 500:
+                                        err_text = await resp.aread()
+                                        mapped = _map_upstream_error(err_text.decode("utf-8", "replace"))
+                                        if mapped is not None:
+                                            # 限流类：不重试，直接发 SSE error 事件让客户端（opencode 等）感知并重试，
+                                            # 避免对稳定限流盲目重试 3 次浪费时间。
+                                            _st, _et = mapped
+                                            ev = {"error": {"type": _et, "message": err_text.decode("utf-8", "replace")[:500]}}
+                                            yield json.dumps(ev).encode()
+                                            yield b"data: [DONE]\n\n"
+                                            return
+                                        if resp.status_code >= 500:
+                                            last_err = f"upstream {resp.status_code}"
+                                            continue
+                                        # 429 但非限流特征（罕见）：透传原始响应
+                                        yield err_text
+                                        yield b"data: [DONE]\n\n"
+                                        return
+                                    # 其他 4xx（400/401/403 等）：直接透传原始响应流
+                                    async for chunk in resp.aiter_bytes():
+                                        yield chunk
+                                    return
                                 async for chunk in resp.aiter_bytes():
                                     yield chunk
                                 return
@@ -5271,6 +5492,14 @@ async def openai_chat_completions(raw_request: Request):
                 "max_completion_tokens": body.get("max_completion_tokens"),
             },
         )
+        # 限流/资源耗尽（如 qclaw: ResourceExhausted / Worker local total request limit reached）
+        # 转成 HTTP 429 + Retry-After，让下游客户端（opencode 等）自动重试，而非 500 UnknownError。
+        if _is_rate_limit_error(e):
+            raise HTTPException(
+                status_code=429,
+                headers={"Retry-After": str(_VENDOR_RETRY_AFTER)},
+                detail=str(e),
+            )
         raise HTTPException(status_code=500, detail=str(e))
 
 

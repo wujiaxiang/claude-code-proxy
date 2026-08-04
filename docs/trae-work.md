@@ -231,6 +231,38 @@ event: queue_*         # 排队事件（request_wait_in_queue 含 position，不
 - 上游 `request_wait_in_queue` 事件（字节原生排队能力，data 含 position）→ **模型繁忙，直接终止**返回 `[模型繁忙，排队位置 #N，请稍后重试]`，**不做降级重发**
 - 曾实现排队感知降级（参考 trae-local-api 分档重发），用户评估后撤回——排队即繁忙，保持简单
 
+### DeepSeek-V4-Flash 实测结论（2026-08-04）
+
+**测试环境**：CT105（Linux 代理）+ 192.168.2.177（Windows Trae Work 客户端），targets.json 启用 8086 端口，模型 `DeepSeek-V4-Flash`（targets.json 中 `models[]` 启用白名单，而非 `modelMapping`）。
+
+**Seed 基线**：`test_trae_work_e2e.py --only seed-simple --port 8086`，**4/4 通过**（流式/非流式 × 简单/多轮）。
+
+**DeepSeek-V4-Flash 专项用例**（来自 `scripts/test-cases/trae-work/`）：
+
+| 用例文件 | 场景 | 结果 |
+|----------|------|------|
+| `scripts/test-cases/trae-work/deepseek-flash-simple.json` | 简单对话（流式） | HTTP/SSE 基础断言通过，**但每次专项运行被判定 busy（上游 queue position #341）** |
+| `scripts/test-cases/trae-work/deepseek-flash-tool-history.json` | 工具历史（流式） | HTTP/SSE 基础断言通过，**但每次专项运行被判定 busy（上游 queue position #340）** |
+
+**每次专项运行结果**：**7 passed / 2 failed**，失败原因均为上游 `queue position #341` / `#340` 的 busy。
+
+**代理当前行为**（`_handle_traework`）：
+
+- 检测到上游 `request_wait_in_queue` 事件且 `position > 0` 时，写入文本 chunk `[模型繁忙，排队位置 #N，请稍后重试]`
+- 仍发送 **HTTP 200**、**finish_reason=stop**、**SSE `[DONE]`**
+- **不做降级重发**，不抛出异常，不返回非 2xx 状态码
+
+**对客户端（OMO/opencode）的影响**：
+
+- OMO/opencode 看到 HTTP 200 + 正常 SSE 流 + finish stop + [DONE]，**通常不会按失败触发重试/换模型**
+- 这是典型的**“业务失败被 HTTP 200 伪装成功”**的已知问题：客户端层面看起来请求成功了，实际内容是排队提示
+
+**后续改进方向（未实现，仅记录方向）**：
+
+- 若要让客户端识别并重试，应将 busy 映射为可识别的非 2xx 错误（如 503/429），或由聚合层（8080）专门识别该错误文本并触发降级
+- 需评估流式协议兼容性：中途切换状态码会破坏 SSE 流，可能需在流式开始前预检或改为非流式预检
+- 保留现有“不做降级重发”的历史决策（2026-08-02），本次事实不与之冲突——当前策略是“检测到排队即终止并返回提示”，未来可演进为“检测到排队 → 返回可识别错误码 → 触发客户端/聚合层重试”
+
 ### 响应侧（按模型分两类）
 
 上游实测（2026-08-02，9 模型全测）：
@@ -483,7 +515,7 @@ setsid .venv/bin/python server.py > /tmp/proxy.log 2>&1 < /dev/null &
 | `crack_common.py` | tc 解密公共函数 + `CRACK_STATUS_HANDLERS` 注册表 |
 | `server.py` | `_handle_traework` handler（OpenAI ↔ llm_utils_chat 转换）+ `_crack_env_check` trae 分支 + 状态/批量导入 API |
 | `config_store.py` | `VALID_HANDLERS` 含 `trae-work` |
-| `targets.json` | trae-work target 定义（8086、19 模型 + modelMapping） |
+| `targets.json` | trae-work target definition（8086、19 个模型 enabled 白名单配置） |
 | `trae_work_daily.sh` | cron 每日签到 + token 剩 <3 天刷新 |
 
 ---

@@ -20,6 +20,7 @@
 | 客户端接入 | `base_url = http://<host>:8084/v1`，`api_key = "dummy"`（crack 类代理不校验） |
 | secrets 字段 | `codebuddy_token`（JWT，必填）/ `codebuddy_refresh_token`（可空）/ `codebuddy_uid`（数字）/ `codebuddy_nickname`（只读展示） |
 | 模型 | targets.json 白名单：`deepseek-v4-pro` / `deepseek-v4-flash` / `glm-5.2` / `kimi-k3-1` / `hy3` 等 |
+| 内容过滤排查 | 详见交接文档 [`codebuddy-content-filter-probe-handoff.md`](codebuddy-content-filter-probe-handoff.md) |
 
 认证方式：`Authorization: Bearer <codebuddy_token>`（JWT）。
 
@@ -95,7 +96,46 @@ python crack_codebuddy.py [--secrets secrets.json] [--force]
 
 ---
 
-## 5. 错误排查
+## 5. 成长计划任务（每日自动领取）
+
+### 5.1 机制
+
+CodeBuddy 无独立"每日签到"接口，积分由两部分构成：
+1. **每日自动发放** — 登录 CodeBuddy 客户端即触发，代理无需干预
+2. **成长计划任务奖励** — 需在 CodeBuddy 客户端完成指定操作后手动领取
+
+代理通过 `crack_daily.py` 每天 03:00 自动调用 `GET /v2/activity/growth/tasks` 查可领取任务，再调 `POST /activity/growth/tasks/{code}/claim` 领取。
+
+### 5.2 已完成任务 vs 可领取任务
+
+任务状态有 `not_accepted` / `accepted` / `completed` / `claimed` 几种。只有 `completed` 状态的任务才能领取奖励。常见问题：
+
+| 现象 | 原因 | 解决 |
+|------|------|------|
+| `领取任务 xxx → task not completed` | 任务已接受但在客户端的进度还没完成 | 在 CodeBuddy 客户端完成对应操作后，代理下次 cron 自动领 |
+| 有任务显示 `accepted` 但领不了 | 代理无法代替客户端完成前端交互任务 | 用户需在 CodeBuddy 客户端完成任务 |
+
+### 5.3 典型任务与完成方式
+
+| 任务 | 完成条件 | 代理能否代替 |
+|------|----------|-------------|
+| `create_canvas` 体验设计创意模式 | 客户端进入创意模式创建画布 | 否 — 需前端交互 |
+| `playbook_prompt` 探索优秀灵感 | 客户端点击灵感案例做同款 | 否 — 需前端交互 |
+| `chat_5` 和 AI 聊天 5 次 | 累计 5 次对话 | 理论可行但违反服务条款 |
+| `expert_5` 召唤 5 次专家 | 召唤 5 位不同专家 | 理论可行但违反服务条款 |
+| `expert_5` 召唤 5 次专家 | 召唤 5 位不同专家 | 理论可行但违反服务条款 |
+
+⚠️ **限制**：成长计划任务大多依赖 CodeBuddy 客户端前端交互（如打开特定页面、点击按钮、选择模板等），代理 API 层面无法代替用户完成这些操作。
+
+### 5.4 未来改进方向（TODO）
+
+1. **自动完成对话类任务**：部分任务（如 `chat_5`、`expert_5`、`template_5`）可通过代理转发 API 请求模拟完成，需研究 CodeBuddy 任务进度上报机制
+2. **更积极的领取重试**：当前 cron 只尝试一次，可改为多次重试直到 `completed`
+3. **任务进度监控**：检测 `current < target` 时主动提醒用户在客户端完成
+
+---
+
+## 6. 错误排查
 
 | 现象 | 原因 | 处理 |
 |------|------|------|
@@ -103,6 +143,8 @@ python crack_codebuddy.py [--secrets secrets.json] [--force]
 | 401/403 | token 过期 / 该 base 不认此 token（如 `www.codebuddy.ai` 对 IOA token 直接 401） | 重新提取 token；`_call` 会自动换 base |
 | 额度显示 error | token 无权限 / 接口异常 | 检查 `codebuddy_token` 有效性（`GET /v2/accounts` 可验证） |
 | 登录态丢失 | 刷新后未持久化轮换的 refreshToken | 回写新 refreshToken 到 secrets.json（陷阱 #11） |
+| 内容过滤/阻断 | 上游触发内容安全策略或格式校验阻断 | 参考 [`codebuddy-content-filter-probe-handoff.md`](codebuddy-content-filter-probe-handoff.md) 进行现象分类与对照排查 |
+| **返回"您当前输入的信息存在敏感内容"** | 代理强制注入 `reasoning_effort:"medium"` + `reasoning_summary:"auto"`，即使客户端未请求推理也会触发 CodeBuddy 内容过滤 (#2071) | **已修复**（2026-08-04）：代理现在仅在客户端显式传了 `reasoning_effort` 时才添加 `reasoning_summary`；未请求推理时移除所有 reasoning 字段。无需客户端改动。 |
 
 ---
 
@@ -111,6 +153,7 @@ python crack_codebuddy.py [--secrets secrets.json] [--force]
 1. **上游只支持流式**：codebuddy 上游对非流式请求报 11101，代理已自动转流式聚合；新增错误特征判断时勿绕过该检测（AGENTS.md 陷阱 #10）。
 2. **refreshToken 轮换必须立即持久化**：刷新后旧 refreshToken 立即失效，未回写新值会导致登录态丢失（AGENTS.md 陷阱 #11）。
 3. **仅 Windows 破解**：`crack_codebuddy.py` 仅 Windows 支持；其他 OS 需手动在 dashboard 填写 `codebuddy_token`。
+4. **reasoning 参数必须 opt-in** (#2071)：codebuddy 上游对未请求推理的请求如果代理注入 `reasoning_effort` + `reasoning_summary`，会触发内容过滤返回错误。代理已修复——仅在客户端显式传 `reasoning_effort` 时才添加 `reasoning_summary`。新增处理 codebuddy 请求的代码必须遵循此规则。
 
 ---
 
@@ -122,6 +165,6 @@ python crack_codebuddy.py [--secrets secrets.json] [--force]
 | `crack_codebuddy_q.py` | 额度 / 成长任务 / 账号 / 用量通知查询（`codebuddy_status`） |
 | `crack_common.py` | `CREDENTIAL_SCHEMAS["codebuddy"]`（凭据 schema）+ 注册表 |
 | `crack_daily.py` | `daily_codebuddy`：成长任务领取 + token 剩 <30 天刷新（refreshToken 轮换回写） |
-| `server.py` | 11101 检测 + `_aggregate_codebuddy_stream` 非流式聚合 |
+| `server.py` | 11101 检测 + `_aggregate_codebuddy_stream` 非流式聚合 + reasoning 字段清理 (#2071 修复) |
 | `config_store.py` | `VALID_HANDLERS` 含 `passthrough` |
 | `targets.json` | codebuddy target 定义（8084、`copilot.tencent.com`、`routePrefix=/v2`、secretRef） |
