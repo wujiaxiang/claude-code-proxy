@@ -910,9 +910,6 @@ def _vendor_body_retryable(body_text: str) -> bool:
     return _map_upstream_error(body_text) is not None
 
 
-_CODEBUDDY_CONTENT_FILTER = object()
-
-
 async def _aggregate_codebuddy_stream(target, upstream_url, fwd_headers, body_json, label):
     """codebuddy 非流式请求转流式聚合：stream:true 重试，收集 SSE 拼装完整 JSON。
 
@@ -979,9 +976,6 @@ async def _aggregate_codebuddy_stream(target, upstream_url, fwd_headers, body_js
                                 tgt["function"]["arguments"] += fn["arguments"]
                     if c.get("finish_reason"):
                         finish_reason = c["finish_reason"]
-                        if finish_reason == "content_filter":
-                            logger.warning(f"[{label}] content_filter blocked: upstream SSE finish_reason=content_filter")
-                            return _CODEBUDDY_CONTENT_FILTER
 
             choices = [{
                 "index": i,
@@ -1097,25 +1091,6 @@ async def _write_error_response(writer, status, message, *, content_type="applic
         writer.close()
     except Exception:
         pass
-
-
-async def _write_codebuddy_content_filter_response(writer):
-    """将 CodeBuddy 的 200/SSE 内容审查拦截转换为可回退的 HTTP 错误。"""
-    payload = json.dumps({
-        "error": {
-            "type": "content_filter_blocked",
-            "message": "Upstream content filter triggered for codebuddy; client should retry with fallback model.",
-            "original_status": 200,
-        }
-    }, ensure_ascii=False).encode("utf-8")
-    writer.write(
-        b"HTTP/1.1 422 Unprocessable Entity\r\n"
-        b"Content-Type: application/json\r\n"
-        + f"Content-Length: {len(payload)}\r\n\r\n".encode()
-        + payload
-    )
-    await writer.drain()
-    writer.close()
 
 
 async def _write_response(writer, resp, *, stats=None, write_state=None):
@@ -4066,77 +4041,6 @@ async def _handle_target_request(reader, writer, target):
                         _bump_model_stats(label, _req_model, "ok")
                     writer.close()
                     return
-                if target.get("label") == "codebuddy":
-                    # content_filter 通常在首个 chunk 返回；在有内容前暂不写 200 headers，
-                    # 这样空内容拦截才能转换为 HTTP 422，供客户端触发 fallback。
-                    buffered_lines = []
-                    content_started = False
-                    headers_written = False
-                    async for raw_line in resp.aiter_lines():
-                        line = raw_line.strip()
-                        is_filter_blocked = False
-                        if line.startswith("data:"):
-                            data_str = line[5:].strip()
-                            if data_str and data_str != "[DONE]":
-                                try:
-                                    chunk = json.loads(data_str)
-                                    for choice in chunk.get("choices", []) or []:
-                                        if choice.get("finish_reason") == "content_filter":
-                                            is_filter_blocked = True
-                                            break
-                                        if (choice.get("delta", {}) or {}).get("content"):
-                                            content_started = True
-                                except (json.JSONDecodeError, AttributeError):
-                                    pass
-
-                        if is_filter_blocked:
-                            logger.warning(f"[{label}] content_filter blocked: upstream SSE finish_reason=content_filter")
-                            if not headers_written:
-                                await _write_codebuddy_content_filter_response(writer)
-                            else:
-                                error_payload = json.dumps({
-                                    "error": {
-                                        "type": "content_filter_blocked",
-                                        "message": "Upstream content filter triggered for codebuddy; client should retry with fallback model.",
-                                        "original_status": 200,
-                                    }
-                                }, ensure_ascii=False)
-                                writer.write(f"event: error\ndata: {error_payload}\n\ndata: [DONE]\n\n".encode())
-                                await writer.drain()
-                                writer.close()
-                            if _req_model:
-                                _bump_model_stats(label, _req_model, "err")
-                            return
-
-                        buffered_lines.append(raw_line)
-                        if content_started and not headers_written:
-                            writer.write(f"HTTP/1.1 {resp.status_code} {resp.reason_phrase or 'OK'}\r\n".encode())
-                            for key, value in resp.headers.items():
-                                if key.lower() not in _PROXY_STRIP_RESP_HEADERS:
-                                    writer.write(f"{key}: {value}\r\n".encode())
-                            writer.write(b"\r\n")
-                            writer.write("\n".join(buffered_lines).encode() + b"\n")
-                            await writer.drain()
-                            buffered_lines.clear()
-                            write_state["headers_sent"] = True
-                            headers_written = True
-                        elif headers_written:
-                            writer.write(raw_line.encode() + b"\n")
-                            await writer.drain()
-
-                    if not headers_written:
-                        # 未出现内容且未被拦截时，保持既有的空 SSE 透传语义。
-                        writer.write(f"HTTP/1.1 {resp.status_code} {resp.reason_phrase or 'OK'}\r\n".encode())
-                        for key, value in resp.headers.items():
-                            if key.lower() not in _PROXY_STRIP_RESP_HEADERS:
-                                writer.write(f"{key}: {value}\r\n".encode())
-                        writer.write(b"\r\n")
-                        writer.write("\n".join(buffered_lines).encode() + b"\n")
-                        await writer.drain()
-                    if _req_model:
-                        _bump_model_stats(label, _req_model, "ok")
-                    writer.close()
-                    return
                 status, _ = await _write_response(writer, resp, stats=stats, write_state=write_state)
                 if _req_model:
                     _bump_model_stats(label, _req_model, "ok" if (status or 0) < 400 else "err")
@@ -4208,11 +4112,6 @@ async def _handle_target_request(reader, writer, target):
                     aggregated = await _aggregate_codebuddy_stream(
                         target, upstream_url, fwd_headers, _agg_body, label
                     )
-                    if aggregated is _CODEBUDDY_CONTENT_FILTER:
-                        if _req_model:
-                            _bump_model_stats(label, _req_model, "err")
-                        await _write_codebuddy_content_filter_response(writer)
-                        return
                     if aggregated is not None:
                         if _req_model:
                             _bump_model_stats(label, _req_model, "ok")
