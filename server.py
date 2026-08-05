@@ -205,6 +205,51 @@ if LOG_FILE:
         f"📄 File log enabled: path={_log_path} rotate={LOG_ROTATE_WHEN}/{LOG_ROTATE_INTERVAL} retention_days={LOG_RETENTION_DAYS}"
     )
 
+# ── 网关专用日志（codebuddy / trae-work 独立文件，2026-08-05）─────
+# 破解网关请求量大且排查需要细粒度请求/响应日志（content_filter 拦截、
+# tool_call 变体等），独立文件避免污染 proxy.log 主日志。
+# 命名规则：<LOG_FILE 同名目录>/<label>.log（如 proxy.log → codebuddy.log）。
+# 仅 DEBUG 模式写入完整请求/响应（含 body 摘要）；INFO 只记关键事件。
+_GATEWAY_LOG_SUFFIX = {
+    "codebuddy": "codebuddy",
+    "trae-work": "traework",
+}
+
+
+def _setup_gateway_logger(name: str) -> logging.Logger:
+    """为指定网关建独立文件 logger（同 root 的轮转+清理策略）。"""
+    gw = logging.getLogger(f"gateway.{name}")
+    gw.setLevel(logging.DEBUG if DEBUG else logging.INFO)
+    gw.propagate = False  # 不冒泡到 root，避免重复写 proxy.log
+    if LOG_FILE:
+        try:
+            suffix = _GATEWAY_LOG_SUFFIX.get(name, name)
+            _base = Path(LOG_FILE).expanduser()
+            _gw_path = _base.with_name(f"{_base.stem}-{suffix}.log")
+            _gh = TimedRotatingFileHandler(
+                filename=str(_gw_path),
+                when=LOG_ROTATE_WHEN,
+                interval=max(1, LOG_ROTATE_INTERVAL),
+                backupCount=max(0, LOG_RETENTION_DAYS),
+                encoding="utf-8",
+            )
+            _gh.setLevel(logging.DEBUG if DEBUG else logging.INFO)
+            _gh.setFormatter(logging.Formatter(_log_fmt))
+            gw.addHandler(_gh)
+            _cleanup_old_log_files(str(_gw_path), LOG_RETENTION_DAYS)
+            logger.warning(f"📄 Gateway log enabled: {name} → {_gw_path}")
+        except Exception as _e:
+            logger.warning(f"⚠️  Gateway log setup failed for {name}: {_e}")
+    else:
+        # 无 LOG_FILE 时退回 console（跟随 root 配置）
+        gw.addHandler(logging.StreamHandler())
+        gw.handlers[0].setFormatter(logging.Formatter(_log_fmt))
+    return gw
+
+
+codebuddy_logger = _setup_gateway_logger("codebuddy")
+traework_logger = _setup_gateway_logger("trae-work")
+
 # Configure uvicorn to be quieter
 import uvicorn
 
@@ -998,7 +1043,7 @@ async def _aggregate_codebuddy_stream(target, upstream_url, fwd_headers, body_js
                 },
             }
     except Exception as e:
-        logger.warning(f"[{label}] codebuddy aggregate failed: {e}")
+        codebuddy_logger.warning(f"[{label}] codebuddy aggregate failed: {e}")
         return None
 
 
@@ -1093,11 +1138,13 @@ async def _write_error_response(writer, status, message, *, content_type="applic
         pass
 
 
-async def _write_response(writer, resp, *, stats=None, write_state=None):
+async def _write_response(writer, resp, *, stats=None, write_state=None, log_sse=False, _label=""):
     """统一从 httpx 响应回写到 writer。
     自动区分流式/非流式，非 200 自动记录日志。
     返回 (status_code, body_bytes) — body_bytes=None 表示流式已写完。
     write_state: 可选的可变字典，用于跟踪 headers_sent 状态（流式场景下避免二次写状态行）
+    log_sse: 可选，流式透传时解析 SSE 记录 finish_reason 诊断日志（不改写行为，
+      仅用于排查上游 content_filter 拦截等"200 但内容异常"场景）。
     """
     status, body_bytes, is_stream = None, None, False
     try:
@@ -1120,9 +1167,43 @@ async def _write_response(writer, resp, *, stats=None, write_state=None):
             # 标记 headers 已写入（流式场景：状态行+headers 已发送到 writer 缓冲区）
             if write_state is not None:
                 write_state["headers_sent"] = True
-            async for chunk in resp.aiter_bytes():
-                writer.write(chunk)
-                await writer.drain()
+            if log_sse:
+                # codebuddy 透传 + SSE 诊断日志（2026-08-05）：仅解析记录，不改写行为。
+                # 用于定位上游 content_filter 拦截（透传下客户端收到 200 空 SSE 无法感知原因）。
+                saw_filter = False
+                saw_finish = set()
+                data_lines = 0
+                async for chunk in resp.aiter_bytes():
+                    writer.write(chunk)
+                    await writer.drain()
+                    for line in chunk.decode("utf-8", errors="replace").splitlines():
+                        if not line.startswith("data:"):
+                            continue
+                        data_str = line[5:].strip()
+                        if not data_str or data_str == "[DONE]":
+                            continue
+                        data_lines += 1
+                        try:
+                            obj = json.loads(data_str)
+                            for choice in obj.get("choices", []) or []:
+                                fr = choice.get("finish_reason")
+                                if fr:
+                                    saw_finish.add(fr)
+                                    if fr == "content_filter":
+                                        saw_filter = True
+                        except (json.JSONDecodeError, AttributeError):
+                            pass
+                _gw_logger = codebuddy_logger if _label == "codebuddy" else (traework_logger if _label == "trae-work" else logger)
+                if saw_filter:
+                    _gw_logger.warning(f"[{_label}] SSE content_filter 透传: "
+                                       f"data_lines={data_lines} finish_reasons={sorted(saw_finish)}")
+                else:
+                    _gw_logger.debug(f"[{_label}] SSE 透传完成: data_lines={data_lines} "
+                                     f"finish_reasons={sorted(saw_finish) or '无'}")
+            else:
+                async for chunk in resp.aiter_bytes():
+                    writer.write(chunk)
+                    await writer.drain()
             if stats:
                 stats["passthroughOk"] += 1
             return status, None
@@ -2888,6 +2969,8 @@ async def _handle_traework(writer, target, method, path, headers, body, stats, l
     if not token:
         await _write_error_response(writer, 401, "Trae Work token 缺失，请到 dashboard 填写 trae_work_token")
         return
+    # 函数内所有日志切到 trae-work 独立文件（traework.log），不污染 proxy.log
+    logger = traework_logger
     api_headers = _trae_build_headers(token)
 
     try:
@@ -3976,6 +4059,26 @@ async def _handle_target_request(reader, writer, target):
             except Exception:
                 pass
 
+        # ── codebuddy 请求入站诊断日志（2026-08-05）──
+        # 独立 codebuddy.log：记录请求 model/stream/body 摘要 + system prompt 前 200 字符，
+        # 用于定位上游 content_filter 拦截的触发因素（透传模式下客户端只能看到 200 空 SSE）。
+        if target.get("label") == "codebuddy" and _req_model:
+            _sys_preview = ""
+            if body_json and isinstance(body_json, dict):
+                for _m in (body_json.get("messages") or []):
+                    if isinstance(_m, dict) and _m.get("role") == "system":
+                        _sc = _m.get("content")
+                        if isinstance(_sc, str):
+                            _sys_preview = _sc[:200]
+                        elif isinstance(_sc, list):
+                            _sys_preview = json.dumps(_sc, ensure_ascii=False)[:200]
+                        break
+            _cb_body_preview = body[:300].decode("utf-8", errors="replace") if body else ""
+            codebuddy_logger.debug(
+                f"[codebuddy] {method} {path} model={_req_model} stream={bool(body_json and body_json.get('stream'))} "
+                f"sys[:200]={_sys_preview!r} body[:300]={_cb_body_preview!r}"
+            )
+
         # ── Copilot /responses 桥接：responsesModels 名单内的模型走 /responses 协议 ──
         # 上游部分模型（gpt-5.6-terra 等）只支持 /responses 端点，不支持 /chat/completions。
         # 客户端统一用 OpenAI chat.completions 格式请求，网关负责双向格式转换：
@@ -4041,7 +4144,10 @@ async def _handle_target_request(reader, writer, target):
                         _bump_model_stats(label, _req_model, "ok")
                     writer.close()
                     return
-                status, _ = await _write_response(writer, resp, stats=stats, write_state=write_state)
+                status, _ = await _write_response(
+                    writer, resp, stats=stats, write_state=write_state,
+                    log_sse=(target.get("label") == "codebuddy"), _label=label,
+                )
                 if _req_model:
                     _bump_model_stats(label, _req_model, "ok" if (status or 0) < 400 else "err")
                 if status and status >= 400:
