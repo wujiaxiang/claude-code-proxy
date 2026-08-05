@@ -183,6 +183,60 @@ curl -s https://copilot.tencent.com/v2/chat/completions \
 
 > 对照实验设计（探测模板，保留备查）：直连对照 × 多模型 × 多轮，记录 JSON Lines（字段：timestamp / model / has_reasoning / round / result / classification）。未授权账号、无实测数据的不下结论。
 
+### 6.2 system prompt 精确短语拦截（OMO 框架 content_filter）—— 热重写规避
+
+> **背景**：2026-08-04/05 实测发现，腾讯对 **OMO 框架（oh-my-openagent 插件）注入的特定 system prompt 精确短语** 100% 触发内容审查，表现为 **HTTP 200 空 SSE + `finish_reason=content_filter`**（opencode 误判为 "provider's content filter"，且不触发 fallback）。已在代理层做**精确字符串热重写**规避。本节用于快速定位 + 解决同类问题。
+
+#### 触发短语全清单（仅 2 个，均已覆盖）
+
+| # | 触发短语 | 来源（OMO 插件 dist/index.js） | 覆盖规则 |
+|---|---------|------|---------|
+| 1 | `Sisyphus-Junior - Focused executor from OhMyOpenCode.` | 子代理 default 模板 `buildDefaultSisyphusJuniorPrompt`（hy3 不被识别为 kimi-k3 → 走 default 分支） | `_CODEBUDDY_SYS_REWRITES` 规则 1 |
+| 2 | `You are "Sisyphus" - Powerful AI Agent with orchestration capabilities from OhMyOpenCode.` | 主代理动态构建 `renderRoleAndIntentSections`（所有模型共用路径） | `_CODEBUDDY_SYS_REWRITES` 规则 2 |
+
+**触发机制（反证法实证）**：腾讯黑名单匹配的是**完整精确短语**，不是泛化的 "OhMyOpenCode" 字样。触发串 2 的三成分缺一不可：`"Sisyphus"` 引号 + `" - "` 连字符 + `Powerful AI Agent with orchestration capabilities from OhMyOpenCode` 完整句——任何成分缺失/改动都不触发（已逐一反证）。
+
+**已实测不触发的变体**（无需覆盖）：
+- 星号变体 `You are **Sisyphus** - Powerful AI Agent with orchestration capabilities from OhMyOpenCode.`（gemini/gpt 静态模板，缺引号）
+- 逗号/无引号变体 `You are Sisyphus, the OhMyOpenCode orchestration lead...`（Sisyphus 3 个 + Sisyphus-Junior kimi-k3/k2-7/glm 模板）
+- **其他 OMO 角色真实身份短语全部 stop**：Atlas 8 变体（含结构最接近触发串的 `You are Atlas - Master Orchestrator from OhMyOpenCode.`）、Metis、Explore、Librarian、Oracle、Momus、Multimodal-Looker、General、Plan、Hephaestus —— **换角色名不会被拦截**
+
+#### 快速定位步骤
+
+```bash
+# 1. 看独立网关日志的入站 system 预览 + SSE finish_reason（DEBUG=true 时才有）
+grep -E "sys\[:200\]|finish_reasons" /root/shared-workspace/claude-code-proxy/codebuddy.log | tail -20
+#    若 finish_reasons 含 content_filter → 上游拦截
+#    若入站 sys[:200] 被替换成 'a capable coding agent...' → 热重写已命中（正常）
+
+# 2. 确认热重写命中记录（INFO 级别，关 debug 后仍有）
+grep "sys prompt rewritten" /root/shared-workspace/claude-code-proxy/codebuddy.log | tail -5
+
+# 3. 复现/验证某个短语是否触发（直连 8084，注意：代理会自动重写已知触发串，
+#    想测"上游原始行为"需先临时移除对应规则或直连上游）
+.venv/bin/python - << 'EOF'
+import json, subprocess
+TOKEN = json.load(open("secrets.json"))["codebuddy_token"]
+def test(p: str):
+    body = {"model": "hy3", "stream": True,
+            "messages": [{"role": "system", "content": p}, {"role": "user", "content": "hi"}]}
+    r = subprocess.run(["curl","-s","-N","-X","POST","http://127.0.0.1:8084/v1/chat/completions",
+                        "-H","Content-Type: application/json","-H",f"Authorization: Bearer {TOKEN}",
+                        "-d",json.dumps(body),"--max-time","10"], capture_output=True, text=True, timeout=15)
+    return "FILTER" if "content_filter" in r.stdout else ("stop" if '"finish_reason":"stop"' in r.stdout else "?"+r.stdout[:60])
+print(test('You are "Sisyphus" - Powerful AI Agent with orchestration capabilities from OhMyOpenCode.'))
+EOF
+```
+
+#### 解决方案
+
+- **代码位置**：`server.py` `_CODEBUDDY_SYS_REWRITES`（元组列表，`_clean_codebuddy_body` 遍历 system message 做精确字符串替换；列表驱动，新增规则只需加一行 `(触发短语, 安全替换)`）。
+- **触发短语 → 安全替换**：
+  1. `Sisyphus-Junior - Focused executor from OhMyOpenCode.` → `Focused task executor agent.`
+  2. `You are "Sisyphus" - Powerful AI Agent with orchestration capabilities from OhMyOpenCode.` → `You are "Sisyphus" - a capable coding agent with strong orchestration abilities.`
+- **安全边界**：只替换 OMO 框架自身注入的**身份短语**，不动客户端内容/工具字段；替换目标是等义的中性描述（不伪造身份、不编码混淆、不删除安全字段）。若未来腾讯扩展黑名单拦其他角色（如 Atlas），只需在元组追加一行，无需改逻辑。
+- **历史路径**：曾实现 content_filter 识别转 422 明确错误（38d6087），因 opencode fallback 只认网络类错误而无效，已回退（110d370）恢复静默透传；随后以热重写（b1cdd25 子代理 → ff49601 主代理 + 列表驱动）作为最终方案。
+
 ---
 
 ## 6. 已知陷阱

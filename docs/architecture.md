@@ -74,6 +74,8 @@ Anthropic 协议：base_url = http://192.168.2.128:8081，api_key = "dummy"
 
 **secrets 优先级**：`secrets.json` > `apikeyEnv` 环境变量 > 客户端透传（free/paid）。
 
+> **私密凭据收敛约定（2026-08-05）**：私密凭据唯一事实源是 `secrets.json`（dashboard 可热编辑、mtime 热重载 2s 生效）。`.env` **只放非私密运行配置**（`DEBUG`/`LOG_*`/`COPILOT_GHE_HOST`/`COPILOT_INTEGRATION_ID`/`COPILOT_*_MODEL` 等）。`apikeyEnv` 仅为兼容旧部署的兜底。已收敛：`COPILOT_GHE_TOKEN` 并入 `secrets.json` 的 `copilot_token`（同源，server.py 翻译层热重载同步），`CODEBUDDY_TOKEN` 冗余已删。
+
 **热重载**：`targets.json` / `secrets.json` mtime 轮询（2s），修改后自动生效，无需重启。
 
 ## 聚合网关（8080）

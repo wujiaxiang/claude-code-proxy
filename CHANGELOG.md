@@ -39,6 +39,7 @@
 - 8081 转发目标由 anthropicForwardPort 配置（默认 8082）
 - 8092 gemini-openai → gemini（handler=gemini-native）
 - README 精简为多端口架构视角，Windows 部署坑拆至 docs/windows-deployment.md
+- **配置架构收敛（2026-08-05）**：私密凭据唯一事实源 = `secrets.json`（dashboard 热编辑 + mtime 热重载 2s 生效）。`.env` 只留非私密运行配置（`DEBUG`/`LOG_*`/`COPILOT_GHE_HOST`/`COPILOT_INTEGRATION_ID`/`COPILOT_*_MODEL`/`PREFERRED_PROVIDER`）。`COPILOT_GHE_TOKEN` 并入 secrets.json `copilot_token`（同源，server.py 翻译层 `_load_vendor_targets`/`_reload_targets`/`_refresh_secrets` 热重载同步）；`.env` 冗余 `CODEBUDDY_TOKEN` 已删（target 走 secretRef）
 
 ### Fixed
 - 【模型映射】按钮误扩散到所有 target 卡片 —— 改为仅 8081 转发网关专属

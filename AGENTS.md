@@ -53,9 +53,9 @@ tail -f /root/shared-workspace/claude-code-proxy/proxy.log
 
 ## 3. 配置文件
 
-- **`.env`**（全局，gitignored）：`DEBUG` / `LOG_FILE` / `LOG_RETENTION_DAYS` / `LOG_ROTATE_WHEN` / `LOG_ROTATE_INTERVAL` + 各网关 apikeyEnv（`COPILOT_GHE_TOKEN` 等）。**已废弃**：`PREFERRED_PROVIDER`（多端口架构下不再控制路由，server.py 仍读取但无实际作用）
+- **`.env`**（全局，gitignored）：**仅运行配置（非私密）**——`DEBUG` / `LOG_FILE` / `LOG_RETENTION_DAYS` / `LOG_ROTATE_WHEN` / `LOG_ROTATE_INTERVAL` / `COPILOT_GHE_HOST` / `COPILOT_INTEGRATION_ID` / `COPILOT_BIG|MEDIUM|SMALL_MODEL`。**已废弃**：`PREFERRED_PROVIDER`（多端口架构下不再控制路由，server.py 仍读取但无实际作用）。**私密凭据一律放 secrets.json**（2026-08-05 收敛）：`COPILOT_GHE_TOKEN` 已并入 secrets.json `copilot_token`，`CODEBUDDY_TOKEN` 冗余已删（target 走 secretRef）
 - **`targets.json`**（Target 定义，核心配置）：必填 `label / listenPort / category / handler / targetHost`；category ∈ `crack|free|paid|aggregate`；handler ∈ `passthrough|copilot|qclaw|gemini-native|trae-work|aggregator`；crack 类必须有 `crackTool`；label/端口不能冲突；`enabled=false` 跳过必填校验（预留位）。secrets 优先级：`secrets.json > apikeyEnv 环境变量 > 客户端透传`。**热重载**：mtime 轮询 2s，改完即生效（含端口动态增删）。完整 schema 见 [docs/architecture.md](docs/architecture.md)
-- **`secrets.json`**（私密 key/token，gitignored，dashboard 可热编辑）：破解工具提取的 key/token 写入此文件。当前字段：`copilot_token, copilot_personal_token, codebuddy_token, codebuddy_refresh_token, codebuddy_uid, codebuddy_nickname, trae_work_token, trae_work_refresh_token, trae_work_user_id, trae_work_bound_device_id, qclaw_api_key, qclaw_login_key, qclaw_guid, qclaw_user_id, qclaw_nickname, qclaw_openclaw_token, qclaw_device_token`
+- **`secrets.json`**（私密 key/token，gitignored，dashboard 可热编辑）：**私密凭据唯一事实源**。破解工具提取的 key/token 写入此文件。当前字段：`copilot_token, copilot_personal_token, codebuddy_token, codebuddy_refresh_token, codebuddy_uid, codebuddy_nickname, trae_work_token, trae_work_refresh_token, trae_work_user_id, trae_work_bound_device_id, qclaw_api_key, qclaw_login_key, qclaw_guid, qclaw_user_id, qclaw_nickname, qclaw_openclaw_token, qclaw_device_token`。注：`copilot_token` 同时供 8082 企业 GHE target（secretRef）与 server.py 翻译层 `COPILOT_GHE_TOKEN`（同源 token，热重载同步）
 
 ---
 

@@ -841,6 +841,10 @@ else:
     print("⚠️  QClaw API Key not available (set QCLAW_API_KEY env or ensure QClaw client is logged in)")
 
 # ─── GitHub Copilot Enterprise 配置 ───
+# COPILOT_GHE_TOKEN：私密凭据，已收敛到 secrets.json copilot_token 字段（唯一事实源，
+# 与 8082 企业 GHE target 的 secretRef 同源）。模块加载时从 env 读一次作初始兜底；
+# _load_vendor_targets() / _reload_targets() / _refresh_secrets() 热重载时从 secrets.json
+# 覆盖（dashboard 可编辑、热生效）。其余 COPILOT_* 为纯配置，留在 .env。
 COPILOT_GHE_TOKEN = os.environ.get("COPILOT_GHE_TOKEN", "")
 COPILOT_GHE_HOST = os.environ.get("COPILOT_GHE_HOST", "copilot-api.bmw.ghe.com")
 COPILOT_INTEGRATION_ID = os.environ.get("COPILOT_INTEGRATION_ID", "copilot-developer-cli")
@@ -3329,7 +3333,7 @@ def _rewrite_upstream_path(handler: str, raw_path: str, route_prefix: str) -> st
 
 def _load_vendor_targets():
     """加载 targets.json + secrets.json，规范化并初始化统计。"""
-    global _TARGETS, _SECRETS, _MODELS_CFG
+    global _TARGETS, _SECRETS, _MODELS_CFG, COPILOT_GHE_TOKEN
     cfg = _cfg.load_targets()
     errors = _cfg.validate_targets(cfg)
     if errors:
@@ -3339,6 +3343,13 @@ def _load_vendor_targets():
     _MODELS_CFG["models"] = cfg.get("models", [])
     _MODELS_CFG["modelDefaults"] = cfg.get("modelDefaults", {"defaultPort": 8082})
     _SECRETS = _cfg.load_secrets()
+    # 私密凭据统一收敛：COPILOT_GHE_TOKEN 与 targets.json copilot-enterprise 的
+    # secretRef 同源（crack_copilot.py 提取的企业 GHE PAT 写 copilot_token），
+    # 统一从 secrets.json 读取，无则回落 env（兼容旧部署）。
+    # 纯配置 COPILOT_GHE_HOST 等仍走 .env。
+    _copilot_secret = _SECRETS.get("copilot_token")
+    if _copilot_secret:
+        COPILOT_GHE_TOKEN = _copilot_secret
     for t in _TARGETS:
         label = t["label"]
         if label not in _TARGET_STATS:
@@ -3354,8 +3365,12 @@ _load_vendor_targets()
 
 def _refresh_secrets():
     """重读 secrets.json 到内存（热生效）。"""
-    global _SECRETS
+    global _SECRETS, COPILOT_GHE_TOKEN
     _SECRETS = _cfg.load_secrets()
+    # 私密凭据热重载：dashboard 改 copilot_token 后无需重启即生效
+    _copilot_secret = _SECRETS.get("copilot_token")
+    if _copilot_secret:
+        COPILOT_GHE_TOKEN = _copilot_secret
     logger.info(f"🔑 secrets.json reloaded ({len(_SECRETS)} keys)")
 
 
@@ -3366,7 +3381,7 @@ _config_mtimes: Dict[str, float] = {}
 
 async def _reload_targets() -> list:
     """重载 targets.json / secrets.json，diff 端口并动态增删 server。"""
-    global _TARGETS, _SECRETS, _MODELS_CFG
+    global _TARGETS, _SECRETS, _MODELS_CFG, COPILOT_GHE_TOKEN
     changes = []
     cfg = _cfg.load_targets()
     errors = _cfg.validate_targets(cfg)
@@ -3377,6 +3392,10 @@ async def _reload_targets() -> list:
     _MODELS_CFG["models"] = cfg.get("models", [])
     _MODELS_CFG["modelDefaults"] = cfg.get("modelDefaults", {"defaultPort": 8082})
     _SECRETS = _cfg.load_secrets()
+    # 私密凭据热重载：COPILOT_GHE_TOKEN 同步 secrets.json copilot_token（dashboard 可编辑热生效）
+    _copilot_secret = _SECRETS.get("copilot_token")
+    if _copilot_secret:
+        COPILOT_GHE_TOKEN = _copilot_secret
 
     # ── 聚合网关单例：找到聚合 target 则按需初始化/reload，找不到则清空单例 ──
     global _AGGREGATOR_ENGINE, _AGGREGATOR_CONFIG_SIG
