@@ -1168,13 +1168,97 @@ async def _write_error_response(writer, status, message, *, content_type="applic
         pass
 
 
-async def _write_response(writer, resp, *, stats=None, write_state=None, log_sse=False, _label=""):
+class _SseLineBuffer:
+    """SSE 行缓冲：按 \\n 切完整行，处理跨 TCP chunk 粘包。
+
+    背景：SSE 帧可能被 TCP 任意切断（一个 data: {...} JSON 跨两个 chunk）。
+    纯字节透传时无所谓，但一旦要逐帧改写就必须先重组成完整行，否则会切坏 JSON。
+    """
+    __slots__ = ("_buf",)
+
+    def __init__(self):
+        self._buf = b""
+
+    def feed(self, chunk: bytes) -> list:
+        """喂入原始字节，返回本次能切出的完整行（每行含末尾 \\n）。不完整的尾部留在缓冲区。"""
+        self._buf += chunk
+        lines = []
+        while True:
+            idx = self._buf.find(b"\n")
+            if idx == -1:
+                break
+            lines.append(self._buf[:idx + 1])
+            self._buf = self._buf[idx + 1:]
+        return lines
+
+    def flush(self) -> bytes:
+        """流结束时吐出残留（无末尾 \\n 的最后一行）。正常 SSE 不应有残留，防御性处理。"""
+        rest, self._buf = self._buf, b""
+        return rest
+
+
+def _normalize_codebuddy_sse_line(line: bytes, *, finish_reason_to_null: bool = True) -> bytes:
+    """规范化 codebuddy 上游(copilot.tencent.com)不合规的 SSE 帧。
+
+    上游缺陷（2026-08-05 实测 kimi-k3-1，465/465 帧命中）：
+      思考帧 {"delta":{"content":"","reasoning_content":"The",...}}  ← 夹带空 content
+      正文帧 {"delta":{"content":"递归","reasoning_content":"",...}}  ← 夹带空 reasoning
+    标准 OpenAI 协议下思考阶段不应出现 content 键。客户端(opencode)见 content 键
+    即认为正文块开始 → 结束当前思考段 → 下一帧再开新段 → 思考链逐 token 换行。
+
+    保守策略（只改必要字段，不动 tool_calls/refusal/function_call/extra_fields——
+    清理它们对本 bug 零收益，却可能破坏依赖"键存在性"做类型推断的客户端）：
+      - reasoning_content 非空 且 content == ""  → 删 content 键
+      - content 非空 且 reasoning_content == ""  → 删 reasoning_content 键
+      - finish_reason == "" → null（上游用空串，标准应为 null；独立开关控制）
+
+    失败降级：非 data: 行 / [DONE] / JSON 解析失败一律原样返回，绝不吞帧、不中断流。
+    未发生改动时返回原始 line（避免无谓重序列化，保住大部分帧的零开销）。
+    """
+    if not line.startswith(b"data:"):
+        return line  # 空行分隔符、": keep-alive" 注释行、event: 头 → 原样透传
+    raw = line[5:].strip()
+    if not raw or raw == b"[DONE]":
+        return line
+    try:
+        obj = json.loads(raw)
+    except Exception:
+        return line  # 畸形帧/半截 JSON → 保守原样透传
+    if not isinstance(obj, dict):
+        return line
+
+    changed = False
+    for choice in obj.get("choices", []) or []:
+        if not isinstance(choice, dict):
+            continue
+        delta = choice.get("delta")
+        if isinstance(delta, dict):
+            if delta.get("reasoning_content") and delta.get("content") == "":
+                del delta["content"]
+                changed = True
+            if delta.get("content") and delta.get("reasoning_content") == "":
+                del delta["reasoning_content"]
+                changed = True
+        if finish_reason_to_null and choice.get("finish_reason") == "":
+            choice["finish_reason"] = None
+            changed = True
+
+    if not changed:
+        return line
+    return b"data: " + json.dumps(obj, ensure_ascii=False).encode("utf-8") + b"\n"
+
+
+async def _write_response(writer, resp, *, stats=None, write_state=None, log_sse=False, _label="", normalize_sse=False, normalize_finish_reason=True):
     """统一从 httpx 响应回写到 writer。
     自动区分流式/非流式，非 200 自动记录日志。
     返回 (status_code, body_bytes) — body_bytes=None 表示流式已写完。
     write_state: 可选的可变字典，用于跟踪 headers_sent 状态（流式场景下避免二次写状态行）
-    log_sse: 可选，流式透传时解析 SSE 记录 finish_reason 诊断日志（不改写行为，
-      仅用于排查上游 content_filter 拦截等"200 但内容异常"场景）。
+    log_sse: 可选，流式透传时解析 SSE 记录 finish_reason 诊断日志（用于排查上游
+      content_filter 拦截等"200 但内容异常"场景）。开启后走行缓冲逐帧处理。
+    normalize_sse: 可选，规范化上游不合规 SSE 帧（需 log_sse=True 才生效）。
+      由 targets.json 的 normalizeSse 驱动，当前用于 codebuddy——修复上游思考帧
+      夹带空 content 导致客户端思考链逐 token 换行的问题。
+    normalize_finish_reason: normalize_sse 的子选项，把 finish_reason:"" 归一成 null。
     """
     status, body_bytes, is_stream = None, None, False
     try:
@@ -1198,38 +1282,78 @@ async def _write_response(writer, resp, *, stats=None, write_state=None, log_sse
             if write_state is not None:
                 write_state["headers_sent"] = True
             if log_sse:
-                # codebuddy 透传 + SSE 诊断日志（2026-08-05）：仅解析记录，不改写行为。
-                # 用于定位上游 content_filter 拦截（透传下客户端收到 200 空 SSE 无法感知原因）。
+                # codebuddy SSE 诊断日志（2026-08-05）：定位上游 content_filter 拦截
+                # （透传下客户端收到 200 空 SSE 无法感知原因）。
+                # normalize_sse=True 时额外做帧规范化（修上游夹带空 content 导致的
+                # 思考链逐 token 换行，见 _normalize_codebuddy_sse_line）。
+                # 用行缓冲重组跨 chunk 的半截帧——改写模式下必须，否则会切坏 JSON。
                 saw_filter = False
                 saw_finish = set()
                 data_lines = 0
+                normalized_lines = 0
+                line_buf = _SseLineBuffer()
+
+                def _diagnose(text_line: str):
+                    """诊断统计——必须基于改写【前】的原始行，否则规范化自身的 bug
+                    会掩盖上游真实异常。返回是否为有效 data 行。"""
+                    nonlocal saw_filter, data_lines
+                    if not text_line.startswith("data:"):
+                        return
+                    data_str = text_line[5:].strip()
+                    if not data_str or data_str == "[DONE]":
+                        return
+                    data_lines += 1
+                    try:
+                        obj = json.loads(data_str)
+                        for choice in obj.get("choices", []) or []:
+                            fr = choice.get("finish_reason")
+                            if fr:
+                                saw_finish.add(fr)
+                                if fr == "content_filter":
+                                    saw_filter = True
+                    except (json.JSONDecodeError, AttributeError):
+                        pass
+
+                def _process(raw_line: bytes) -> bytes:
+                    """先诊断原始行，再按需规范化。任何异常都退回原样透传，绝不吞帧。"""
+                    nonlocal normalized_lines
+                    try:
+                        _diagnose(raw_line.decode("utf-8", errors="replace"))
+                    except Exception:
+                        pass
+                    if not normalize_sse:
+                        return raw_line
+                    try:
+                        out_line = _normalize_codebuddy_sse_line(
+                            raw_line, finish_reason_to_null=normalize_finish_reason
+                        )
+                        if out_line is not raw_line:
+                            normalized_lines += 1
+                        return out_line
+                    except Exception:
+                        return raw_line  # 双保险：规范化不应抛，再兜一层
+
                 async for chunk in resp.aiter_bytes():
-                    writer.write(chunk)
+                    out = bytearray()
+                    for raw_line in line_buf.feed(chunk):
+                        out += _process(raw_line)
+                    if out:
+                        writer.write(bytes(out))
+                        await writer.drain()
+                # 流结束：吐残留（无末尾 \n 的最后一行，正常 SSE 不应出现）
+                tail = line_buf.flush()
+                if tail:
+                    writer.write(_process(tail))
                     await writer.drain()
-                    for line in chunk.decode("utf-8", errors="replace").splitlines():
-                        if not line.startswith("data:"):
-                            continue
-                        data_str = line[5:].strip()
-                        if not data_str or data_str == "[DONE]":
-                            continue
-                        data_lines += 1
-                        try:
-                            obj = json.loads(data_str)
-                            for choice in obj.get("choices", []) or []:
-                                fr = choice.get("finish_reason")
-                                if fr:
-                                    saw_finish.add(fr)
-                                    if fr == "content_filter":
-                                        saw_filter = True
-                        except (json.JSONDecodeError, AttributeError):
-                            pass
+
                 _gw_logger = codebuddy_logger if _label == "codebuddy" else (traework_logger if _label == "trae-work" else logger)
+                _norm_note = f" normalized={normalized_lines}" if normalize_sse else ""
                 if saw_filter:
                     _gw_logger.warning(f"[{_label}] SSE content_filter 透传: "
-                                       f"data_lines={data_lines} finish_reasons={sorted(saw_finish)}")
+                                       f"data_lines={data_lines} finish_reasons={sorted(saw_finish)}{_norm_note}")
                 else:
                     _gw_logger.debug(f"[{_label}] SSE 透传完成: data_lines={data_lines} "
-                                     f"finish_reasons={sorted(saw_finish) or '无'}")
+                                     f"finish_reasons={sorted(saw_finish) or '无'}{_norm_note}")
             else:
                 async for chunk in resp.aiter_bytes():
                     writer.write(chunk)
@@ -4189,9 +4313,15 @@ async def _handle_target_request(reader, writer, target):
                         _bump_model_stats(label, _req_model, "ok")
                     writer.close()
                     return
+                # normalizeSse 为真时强制开启 log_sse——规范化依赖行缓冲逐帧处理，
+                # 二者共用同一条链路（配置驱动，不硬编码 label）。
+                _normalize_sse = bool(target.get("normalizeSse"))
                 status, _ = await _write_response(
                     writer, resp, stats=stats, write_state=write_state,
-                    log_sse=(target.get("label") == "codebuddy"), _label=label,
+                    log_sse=(target.get("label") == "codebuddy" or _normalize_sse),
+                    _label=label,
+                    normalize_sse=_normalize_sse,
+                    normalize_finish_reason=bool(target.get("normalizeFinishReason", True)),
                 )
                 if _req_model:
                     _bump_model_stats(label, _req_model, "ok" if (status or 0) < 400 else "err")
