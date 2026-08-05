@@ -3433,6 +3433,10 @@ def _handler_prepare_headers(target: dict, fwd_headers: dict, body_json: dict) -
         token = _cfg.resolve_secret(target, _SECRETS)
         if token:
             fwd_headers["authorization"] = f"Bearer {token}"
+        # crack 类凭据唯一事实源是 secrets.json 注入的 authorization；
+        # 客户端透传的 x-api-key 必须删除——否则上游（如 codebuddy copilot.tencent.com）
+        # 优先用 x-api-key 校验（dummy 值 → 401 invalid_format），无视已注入的 authorization。
+        fwd_headers.pop("x-api-key", None)
     elif "authorization" not in fwd_headers:
         # free/paid：客户端未带 token → 用自己维护的 secrets.json / apikeyEnv 兜底
         token = _cfg.resolve_secret(target, _SECRETS)
@@ -7739,6 +7743,47 @@ DASHBOARD_STYLE = """
   .cred-save { background: var(--brand-grad); color: #fff; border: none; border-radius: var(--radius-sm); padding: 7px 16px; cursor: pointer; font-weight: 600; box-shadow: 0 4px 14px rgba(59,130,246,0.35); transition: filter 0.2s, transform 0.15s; }
   .cred-save:hover { filter: brightness(1.1); transform: translateY(-1px); }
   .cred-pane textarea { width: 100%; height: 150px; background: var(--bg-inset); color: #d5dcea; border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 10px; font-family: monospace; font-size: 12px; box-sizing: border-box; resize: vertical; }
+
+  /* ── 编辑器统一层级：模型 / 凭据复用聚合配置的字段语言 ── */
+  .model-editor-summary { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 9px 12px; margin: 0 0 10px; background: linear-gradient(180deg, rgba(34,211,238,0.06), rgba(255,255,255,0.015)), var(--bg-inset); border: 1px solid var(--border); border-radius: var(--radius-sm); }
+  .model-editor-summary .mrow-all-hint { margin: 0; color: var(--text-secondary); }
+  .model-editor-list { border: 1px solid var(--border); border-radius: var(--radius-sm); background: var(--bg-inset); overflow: hidden; }
+  .model-editor-list .mrow { padding: 10px 12px; border-color: var(--border); transition: background 0.2s, border-color 0.2s; }
+  .model-editor-list .mrow:hover { background: rgba(34,211,238,0.055); }
+  .model-editor-list .mrow.mrow-master { margin: 0; background: rgba(34,211,238,0.045); border-bottom-style: solid; border-bottom-color: rgba(34,211,238,0.22); }
+  .model-editor-list .mrow-id { color: var(--text-primary); }
+  .model-editor-list .mrow-name { color: var(--text-secondary); }
+  .model-editor-add { padding-top: 2px; }
+  .mm-row { display: grid; grid-template-columns: minmax(140px, 1fr) minmax(150px, 1fr) 180px minmax(200px, 1.35fr) auto; gap: 8px; align-items: center; padding: 10px; margin-bottom: 8px; background: linear-gradient(180deg, rgba(255,255,255,0.02), rgba(255,255,255,0.004)), var(--bg-inset); border: 1px solid var(--border); border-radius: var(--radius-sm); transition: border-color 0.2s, background 0.2s; }
+  .mm-row:hover { border-color: rgba(34,211,238,0.3); background: rgba(34,211,238,0.035); }
+  .mm-row .agg-mem-port { width: 100%; }
+  .mm-row .agg-mem-model { min-width: 0; }
+  .mm-hint { font-size: 11.5px; line-height: 1.55; color: var(--text-tertiary); margin: 0 0 14px; padding: 9px 12px; border-left: 2px solid var(--brand-cyan); background: rgba(34,211,238,0.045); border-radius: 0 var(--radius-sm) var(--radius-sm) 0; }
+  .mm-del, .mm-add-btn { border-radius: var(--radius-sm); font-size: 12px; font-weight: 600; cursor: pointer; transition: background 0.2s, border-color 0.2s, transform 0.15s; }
+  .mm-del { border: 1px solid transparent; background: transparent; color: var(--text-tertiary); padding: 6px 8px; }
+  .mm-del:hover { color: var(--danger); border-color: rgba(248,113,113,0.3); background: rgba(248,113,113,0.1); }
+  .mm-add-btn { border: 1px solid rgba(34,211,238,0.28); background: rgba(34,211,238,0.06); color: var(--brand-cyan); padding: 7px 12px; }
+  .mm-add-btn:hover { border-color: rgba(34,211,238,0.5); background: rgba(34,211,238,0.12); transform: translateY(-1px); }
+  .cred-modal { padding: 20px; }
+  .cred-modal .modal { max-width: 560px; max-height: 82vh; }
+  .cred-modal .modal-body { padding-top: 14px; }
+  .cred-tabs { gap: 0; margin: -2px 0 14px; border-bottom-color: var(--border); }
+  .cred-tab { padding: 8px 14px; font-weight: 600; }
+  .cred-field { display: flex; flex-direction: column; gap: 4px; margin-bottom: 12px; }
+  .cred-field label { display: flex; align-items: center; gap: 4px; color: var(--text-secondary); font-size: 11px; margin: 0; }
+  .cred-field input, .cred-pane textarea { color: var(--text-primary); font-family: var(--font-mono); }
+  .cred-field input { padding: 7px 10px; }
+  .cred-field .cred-hint { margin: 0; line-height: 1.4; }
+  .cred-field .cred-field-err { min-height: 0; }
+  .cred-readonly { margin-top: 10px; border: 1px solid var(--border); }
+  .cred-pane textarea:focus { outline: none; border-color: var(--brand-cyan); box-shadow: 0 0 0 2px rgba(34,211,238,0.15); }
+  @media (max-width: 768px) {
+    .modal-overlay { padding: 12px; }
+    .modal-wide { max-width: 100%; }
+    .mm-row { grid-template-columns: 1fr; }
+    .mm-row .agg-mem-port, .mm-row .agg-mem-model { width: 100%; }
+    .mm-row .mm-del { justify-self: end; }
+  }
 """
 
 
@@ -7935,7 +7980,7 @@ def _model_details_html(models, model_stats=None, label=None, edit_mode=False, c
             '<button class="mrow-add-btn" onclick="addModelRow()">+ 添加模型</button>'
             '</div>'
         )
-        hint = f'<div class="mrow-all-hint">共 {len(norm)} 个模型，开启的 {enabled_count} 个将被展示</div>' if norm else ''
+        hint = f'<div class="mrow-all-hint">共 {len(norm)} 个模型，已开启 {enabled_count} 个</div>' if norm else ''
         # 总开关：全开/全关/部分开（indeterminate），联动所有子开关
         master = ""
         if norm:
@@ -7953,16 +7998,17 @@ def _model_details_html(models, model_stats=None, label=None, edit_mode=False, c
                 '  </label>'
                 '</div>'
             )
-        # 模型多时提供搜索框（下游真实列表可能上百个）
+        # 搜索始终置顶，保证较短列表也有一致的编辑入口。
         search = (
             '<div class="model-search-wrap">'
             '<input type="text" class="model-search" placeholder="搜索模型…" '
             'oninput="filterModels(this)" aria-label="搜索模型">'
             '</div>'
-        ) if len(norm) > 8 else ''
+        )
         return (
-            f'{search}{master}{hint}{rows_html}'
-            f'{add_row}'
+            f'{search}<div class="model-editor-summary">{master}{hint}</div>'
+            f'<div class="model-editor-list">{rows_html}</div>'
+            f'<div class="model-editor-add">{add_row}</div>'
             f'<div class="model-msg" data-label="{esc_label}"></div>'
         )
 
@@ -9008,7 +9054,7 @@ async def dashboard():
 
   <!-- 模型编辑 modal -->
   <div class="modal-overlay" id="model-modal" role="dialog" aria-modal="true" aria-label="编辑模型展示">
-    <div class="modal">
+    <div class="modal modal-wide">
       <div class="modal-head">
         <h3 id="model-modal-title">编辑模型</h3>
         <button class="modal-close" onclick="closeModelEditor()" aria-label="关闭">×</button>
@@ -9326,12 +9372,16 @@ async function openModelsEditor(btn) {{
   body.innerHTML = '<div class="no-models">加载中...</div>';
   overlay.classList.add('open');
   try {{
-    var resp = await fetch('/api/models');
+    var results = await Promise.all([fetch('/api/models'), fetch('/api/aggregate/config')]);
+    var resp = results[0];
+    var portsResp = results[1];
     var r = await resp.json();
+    var ports = await portsResp.json();
     if (!resp.ok) {{
       body.innerHTML = '<div class="no-models">加载失败: ' + (r.detail || JSON.stringify(r)) + '</div>';
       return;
     }}
+    _aggAvailablePorts = ports.availablePorts || {{}};
     body.innerHTML = buildModelsEditorHtml(r);
   }} catch (e) {{
     body.innerHTML = '<div class="no-models">加载异常: ' + e + '</div>';
@@ -9369,8 +9419,8 @@ function modelsRowHtml(name, aliases, port, model) {{
   return '<div class="mm-row">' +
     '<input type="text" class="agg-input md-name" value="' + n + '" placeholder="模型名（如 sonnet）" aria-label="模型名">' +
     '<input type="text" class="agg-input md-aliases" value="' + a + '" placeholder="别名，逗号分隔" aria-label="别名">' +
-    '<input type="number" class="agg-input md-port" value="' + p + '" placeholder="下游端口" aria-label="下游端口">' +
-    '<input type="text" class="agg-input md-model" value="' + m + '" placeholder="真实模型（可 agg:xxx）" aria-label="真实模型">' +
+    aggPortSelectHtml(p) +
+    aggModelSelectHtml(p, m) +
     '<button class="mm-del" onclick="removeModelsRow(this)" title="删除此行">×</button>' +
     '</div>';
 }}
@@ -9410,8 +9460,8 @@ async function saveModelsEditor(btn) {{
     if (bad) return;
     var nEl = row.querySelector('.md-name');
     var aEl = row.querySelector('.md-aliases');
-    var pEl = row.querySelector('.md-port');
-    var mEl = row.querySelector('.md-model');
+    var pEl = row.querySelector('.agg-mem-port');
+    var mEl = row.querySelector('.agg-mem-model');
     var n = (nEl ? nEl.value : '').trim();
     var a = (aEl ? aEl.value : '').trim();
     var p = (pEl ? pEl.value : '').trim();
@@ -9492,7 +9542,7 @@ function aggModelSelectHtml(selectedPort, selectedModel) {{
 }}
 
 function onAggPortChange(selEl) {{
-  var row = selEl.closest('.agg-pool-row');
+  var row = selEl.closest('.agg-pool-row, .mm-row');
   if (!row) return;
   var modelSel = row.querySelector('.agg-mem-model');
   if (!modelSel) return;
@@ -9886,28 +9936,28 @@ async function openCredentialModal(label, btn) {{
   credLabel = label;
   if (!credModal) {{
     var div = document.createElement('div');
-    div.className = 'cred-modal';
+    div.className = 'modal-overlay cred-modal';
     div.innerHTML =
-      '<div class="cred-box">' +
-      '  <div class="cred-head">' +
+      '<div class="modal cred-box">' +
+      '  <div class="modal-head cred-head">' +
       '    <h3 id="cred-title">凭据管理</h3>' +
-      '    <button class="cred-close" onclick="closeCredModal()">×</button>' +
+      '    <button class="modal-close cred-close" onclick="closeCredModal()" aria-label="关闭">×</button>' +
       '  </div>' +
-      '  <div class="cred-tabs">' +
-      '    <button class="cred-tab active" data-mode="form" onclick="switchCredTab(&quot;form&quot;)">表单</button>' +
-      '    <button class="cred-tab" data-mode="json" onclick="switchCredTab(&quot;json&quot;)">JSON</button>' +
-      '  </div>' +
-      '  <div class="cred-body">' +
+      '  <div class="modal-body cred-body">' +
+      '    <div class="cred-tabs">' +
+      '      <button class="cred-tab active" data-mode="form" onclick="switchCredTab(&quot;form&quot;)">表单</button>' +
+      '      <button class="cred-tab" data-mode="json" onclick="switchCredTab(&quot;json&quot;)">JSON</button>' +
+      '    </div>' +
       '    <div id="cred-form" class="cred-pane active"></div>' +
       '    <div id="cred-json" class="cred-pane" style="display:none">' +
       '      <p class="cred-hint" id="cred-json-hint"></p>' +
       '      <textarea id="cred-json-input" placeholder="粘贴 JSON 凭据..."></textarea>' +
       '    </div>' +
       '  </div>' +
-      '  <div class="cred-foot">' +
-      '    <div class="cred-msg" id="cred-msg"></div>' +
-      '    <button class="cred-cancel" onclick="closeCredModal()">取消</button>' +
-      '    <button class="cred-save" onclick="submitCredential()">保存</button>' +
+      '  <div class="modal-foot cred-foot">' +
+      '    <span class="modal-msg cred-msg" id="cred-msg"></span>' +
+      '    <button class="modal-btn cred-cancel" onclick="closeCredModal()">取消</button>' +
+      '    <button class="modal-btn modal-btn-primary cred-save" onclick="submitCredential()">保存</button>' +
       '  </div>' +
       '</div>';
     div.addEventListener('click', function(e) {{ if (e.target === div) closeCredModal(); }});
