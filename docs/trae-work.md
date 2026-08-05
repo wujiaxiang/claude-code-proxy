@@ -443,7 +443,8 @@ glm-5.2 **非流式**时上游把同一工具调用的 `arguments` 分片输出�
 ### 6.3 自动续期
 
 - `crack_traework.py --refresh` 用 secrets.json 中的 `refreshToken` 刷新 access token 并回写
-- cron 脚本 `trae_work_daily.sh`（`0 3 * * *`）每日执行：签到 + 当 token 剩余有效期 < 3 天才触发刷新
+- 每日任务由**统一调度器** `crack_daily.py` 的 `daily_traework()` 承接（唯一 cron 入口 `scripts/cron/crack_daily.sh`，`0 3 * * *`）：先查 `checkin_status()` 判断今日是否已签到再决定 claim（幂等），并在 access token 剩余 < 2 天时触发刷新。**勿新增独立 cron**——扩展方式见 `crack_daily.py` docstring
+  > 历史：旧脚本 `trae_work_daily.sh` 已于 2026-08-05 删除（功能被 `daily_traework()` 完全覆盖且更优，旧脚本无脑 claim 不做幂等检查）
 
 ### 6.4 额度结构示例（`ide_user_ent_usage` 返回）
 
@@ -583,7 +584,7 @@ setsid .venv/bin/python server.py > /tmp/proxy.log 2>&1 < /dev/null &
 | `server.py` | `_handle_traework` handler（OpenAI ↔ llm_utils_chat 转换）+ `_crack_env_check` trae 分支 + 状态/批量导入 API |
 | `config_store.py` | `VALID_HANDLERS` 含 `trae-work` |
 | `targets.json` | trae-work target definition（8086、19 个模型 enabled 白名单配置） |
-| `trae_work_daily.sh` | cron 每日签到 + token 剩 <3 天刷新 |
+| `crack_daily.py` | `daily_traework()` 每日签到（幂等）+ token 剩 <2 天刷新；统一调度入口 |
 
 ---
 

@@ -1,19 +1,52 @@
 #!/usr/bin/env python3
 """crack_daily.py — 破解网关统一每日任务调度器（单一 cron 入口）。
 
-每个网关插件化注册自己的每日任务（签到/领取奖励/刷新 token）：
-  - 只有该网关在 secrets.json 里配了 key 才执行（无 key 跳过）
-  - 不依赖本机客户端安装（token 已在 secrets.json）
-  - 结果统一写入日志（--log 指定，默认 /tmp/crack_daily.log）
+## 架构约定（改动前必读）
 
-注册表说明（label → 任务函数）：
+**这是所有 crack 网关每日任务的唯一调度入口，勿新增其他 cron。**
+每个网关插件化注册自己的每日任务（签到/领取奖励/刷新 token）：
+  - 只有该网关在 secrets.json 里配了 key 才执行（无 key 跳过，不算失败）
+  - 不依赖本机客户端安装（token 已在 secrets.json）
+  - 单网关失败不影响其他网关（各自 try/except + 重试一次）
+
+### 为什么是单一 cron 而非每网关一条
+
+新增网关只需在 DAILY_HANDLERS 加一行，不用碰 crontab（开闭原则）。
+每网关独立 cron 会导致：crontab 散落 N 条记录、新增网关容易漏加、
+失败告警要配 N 份。也不用 systemd timer / APScheduler——前者维护成本
+翻倍（.timer + .service 两个文件）且与 Windows 侧计划任务架构不对称，
+后者把调度耦合进代理进程（代理崩溃调度跟着死）。
+**升级触发条件**：确实需要"错过补跑"（容器常夜间关机）或任务依赖编排时，
+再考虑 systemd timer 的 Persistent=true。
+
+### 扩展方式（新增网关）
+
+1. 写 `daily_xxx(secrets, out, secrets_path=None) -> dict` 函数
+2. 在 DAILY_HANDLERS 加一行 `"label": daily_xxx`
+3. 完事——main() 无需改动（签名已统一，调用点无分支）
+
+**签名必须统一**为 `fn(secrets, out, secrets_path)`，不用该参数的也要接受并忽略。
+handler 内部吞异常时，把错误写进 result 的子 dict（如 `{"error": "..."}`），
+`_result_failed()` 会识别并触发重试 + 非零退出码。
+
+### 失败可观测性
+
+- 任一网关最终失败 → main() 返回 1，crontab 的 `||` 钩子写告警文件
+- 日志默认 `logs/crack_daily.log`（仓库内，非 /tmp——容器重启会清空 /tmp，
+  且代理进程 PrivateTmp=true 看不到系统 /tmp）
+- 时间戳 `.cache/crack_daily_last_run`（dashboard 展示"最后定时刷新"）
+
+## 注册表说明（label → 任务函数）
+
   trae-work  : 每日签到领积分 + access token 剩余<2天时刷新
   codebuddy  : 成长计划任务领取（claim 可领取奖励）+ token 到期前刷新
   qclaw      : 无签到（积分自动发放）；仅校验 jwt 有效期
   copilot    : 企业 seat 无限额度，无签到无刷新
 
-用法:
-  python crack_daily.py [--secrets secrets.json] [--log /tmp/crack_daily.log]
+## 用法
+
+  python crack_daily.py [--secrets secrets.json] [--log logs/crack_daily.log]
+                        [--only trae-work] [--retry-delay 0]
 由 crontab 每天调用（单一任务，勿新增其他 cron）：
   0 3 * * * /root/shared-workspace/claude-code-proxy/scripts/cron/crack_daily.sh
 """
@@ -51,7 +84,7 @@ def _load_secrets(path: Path) -> dict:
 def daily_traework(secrets: dict, out: list[str], secrets_path: Path | None = None) -> dict:
     """Trae Work：每日签到领积分 + access token 剩余 <2 天时刷新。"""
     import crack_traework
-    result = {"checkin": None, "refresh": None}
+    result: dict[str, object] = {"checkin": None, "refresh": None}
     token = secrets.get("trae_work_token", "")
     if not token:
         _log("  ⏭️  trae-work: 无 trae_work_token，跳过", out)
@@ -115,7 +148,7 @@ def daily_traework(secrets: dict, out: list[str], secrets_path: Path | None = No
 
 def daily_codebuddy(secrets: dict, out: list[str], secrets_path: Path | None = None) -> dict:
     """CodeBuddy：成长计划可领取任务奖励（每日活跃等效）+ token 到期前刷新。"""
-    result = {"claim": None, "refresh": None}
+    result: dict[str, object] = {"claim": None, "refresh": None}
     token = secrets.get("codebuddy_token", "")
     if not token:
         _log("  ⏭️  codebuddy: 无 codebuddy_token，跳过", out)
@@ -203,9 +236,9 @@ def _codebuddy_refresh(secrets: dict, out: list[str]) -> bool:
         return False
 
 
-def daily_qclaw(secrets: dict, out: list[str]) -> dict:
+def daily_qclaw(secrets: dict, out: list[str], secrets_path: Path | None = None) -> dict:
     """QClaw：无独立签到（积分自动发放）；校验 jwt 有效期。"""
-    result = {"status": None}
+    result: dict[str, object] = {"status": None}
     jwt = secrets.get("qclaw_openclaw_token", "")
     if not (secrets.get("qclaw_api_key") or jwt):
         _log("  ⏭️  qclaw: 无 qclaw 认证，跳过", out)
@@ -224,7 +257,7 @@ def daily_qclaw(secrets: dict, out: list[str]) -> dict:
 
 def daily_copilot(secrets: dict, out: list[str], personal: bool = False) -> dict:
     """Copilot：确认 token 有效（企业版或个人版，无签到无刷新）。"""
-    result = {"status": None}
+    result: dict[str, object] = {"status": None}
     key = "copilot_personal_token" if personal else "copilot_token"
     token = secrets.get(key, "")
     if not token:
@@ -243,21 +276,41 @@ def daily_copilot(secrets: dict, out: list[str], personal: bool = False) -> dict
     return result
 
 
-# ── 注册表：label → (daily 函数, 所需 secrets key 之一) ──
+# ── 注册表：label → daily 函数 ──
+# 统一签名 fn(secrets, out, secrets_path) —— 新增网关直接加一行，不需要改 main()。
+# 不用 secrets_path 的 handler 也要接受该参数（忽略即可），保持调用点无分支。
 DAILY_HANDLERS = {
     "trae-work": daily_traework,
     "codebuddy": daily_codebuddy,
     "qclaw":     daily_qclaw,
-    "copilot-enterprise": lambda s, o: daily_copilot(s, o, personal=False),
-    "copilot":   lambda s, o: daily_copilot(s, o, personal=True),
+    "copilot-enterprise": lambda s, o, p=None: daily_copilot(s, o, personal=False),
+    "copilot":   lambda s, o, p=None: daily_copilot(s, o, personal=True),
 }
+
+# 任务结果里出现这些 key 即视为失败（用于退出码与重试判定）
+_FAIL_KEYS = ("error",)
+
+
+def _result_failed(result: object) -> bool:
+    """判断单个 handler 结果是否含失败。handler 内部吞异常后把错误写进 result，
+    这里统一识别——不能只靠抛异常判断。"""
+    if not isinstance(result, dict):
+        return False
+    for v in result.values():
+        if isinstance(v, dict) and any(k in v for k in _FAIL_KEYS):
+            return True
+    return False
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="破解网关统一每日任务")
     parser.add_argument("--secrets", default=str(PROJECT_DIR / "secrets.json"))
-    parser.add_argument("--log", default="/tmp/crack_daily.log")
+    # 日志默认放仓库内 logs/：/tmp 在容器重启后清空，且代理进程 mount namespace
+    # 隔离（PrivateTmp=true）看不到系统 /tmp，dashboard 未来要读日志摘要也取不到。
+    parser.add_argument("--log", default=str(PROJECT_DIR / "logs" / "crack_daily.log"))
     parser.add_argument("--only", default="", help="只跑指定网关（逗号分隔，默认全部）")
+    parser.add_argument("--retry-delay", type=int, default=30,
+                        help="handler 失败后重试前的等待秒数（默认 30，设 0 可加速测试）")
     args = parser.parse_args()
 
     out: list[str] = []
@@ -266,19 +319,35 @@ def main() -> int:
     secrets = _load_secrets(secrets_path)
     only = [x.strip() for x in args.only.split(",") if x.strip()] if args.only else []
 
+    failed: list[str] = []
     for label, fn in DAILY_HANDLERS.items():
         if only and label not in only:
             continue
         _log(f"── {label} ──", out)
-        try:
-            if label in ("trae-work", "codebuddy"):
-                fn(secrets, out, secrets_path)
-            else:
-                fn(secrets, out)
-        except Exception as e:
-            _log(f"  ❌ {label}: 任务异常 {e}", out)
+        # 失败重试一次（签到类任务失败当天就错过，网络抖动值得重试）。
+        # 各 handler 均为幂等：trae-work/codebuddy 先查状态再领取，qclaw/copilot 只读校验。
+        for attempt in (1, 2):
+            try:
+                result = fn(secrets, out, secrets_path)
+                if not _result_failed(result):
+                    break
+                if attempt == 1:
+                    _log(f"  🔁 {label}: 结果含错误，{args.retry_delay}s 后重试", out)
+                    time.sleep(args.retry_delay)
+                else:
+                    failed.append(label)
+            except Exception as e:
+                if attempt == 1:
+                    _log(f"  🔁 {label}: 任务异常 {e}，{args.retry_delay}s 后重试", out)
+                    time.sleep(args.retry_delay)
+                else:
+                    _log(f"  ❌ {label}: 任务异常 {e}", out)
+                    failed.append(label)
 
-    _log("=== 破解网关每日任务完成 ===", out)
+    if failed:
+        _log(f"=== 破解网关每日任务完成（失败: {', '.join(failed)}）===", out)
+    else:
+        _log("=== 破解网关每日任务完成 ===", out)
     # 写最后运行时间戳（dashboard 状态区展示"最后定时刷新"）。
     # 放仓库内 .cache/（不用 /tmp：代理进程 mount namespace 隔离，读不到系统 /tmp）。
     try:
@@ -292,7 +361,9 @@ def main() -> int:
         Path(args.log).write_text("\n".join(out) + "\n", encoding="utf-8")
     except Exception as e:
         print(f"⚠️  写日志失败: {e}", file=sys.stderr)
-    return 0
+    # 非零退出码让 cron 能感知失败（配合 crontab 的 || 告警钩子）。
+    # 无 key 跳过不算失败——只有真正执行且出错的网关才计入。
+    return 1 if failed else 0
 
 
 if __name__ == "__main__":

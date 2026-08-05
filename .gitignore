@@ -72,6 +72,7 @@ secrets.json
 .superpowers/
 
 # 运行时缓存（crack_daily 时间戳等）
+logs/
 .cache/
 
 # playwright 截图与缓存噪音

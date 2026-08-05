@@ -45,9 +45,15 @@
 - README 精简为多端口架构视角，Windows 部署坑拆至 docs/windows-deployment.md
 - **配置架构收敛（2026-08-05）**：私密凭据唯一事实源 = `secrets.json`（dashboard 热编辑 + mtime 热重载 2s 生效）。`.env` 只留非私密运行配置（`DEBUG`/`LOG_*`/`COPILOT_GHE_HOST`/`COPILOT_INTEGRATION_ID`/`COPILOT_*_MODEL`/`PREFERRED_PROVIDER`）。`COPILOT_GHE_TOKEN` 并入 secrets.json `copilot_token`（同源，server.py 翻译层 `_load_vendor_targets`/`_reload_targets`/`_refresh_secrets` 热重载同步）；`.env` 冗余 `CODEBUDDY_TOKEN` 已删（target 走 secretRef）
 - `test_qclaw_429.py` → `test_error_code_mapping.py`：覆盖面早已超出 qclaw（多网关多格式错误码映射 + LiteLLM 限流路径），原名有误导性；同步更新 `docs/error-code-mapping.md`
+- **每日任务 handler 签名统一**（`crack_daily.py`）：全部改为 `fn(secrets, out, secrets_path=None)`，删除 `main()` 里 `if label in ("trae-work","codebuddy")` 的硬编码分流。此前两类签名并存，新增网关需同步改 `main()` 分支（易漏）；现调用点无分支，扩展只需在 `DAILY_HANDLERS` 加一行
+- 调度约定收敛为单一事实源：完整扩展方式与设计理由写入 `crack_daily.py` docstring（含"为什么是单一 cron 而非 systemd timer / APScheduler"及升级触发条件），`AGENTS.md` §5.3 与 `docs/crack-tools.md` 只保留速查与指针，避免同一段约定在多处重复导致改动不同步
+
+### Removed
+- **`scripts/cron/trae_work_daily.sh`**（死代码）：功能早已被 `crack_daily.py` 的 `daily_traework()` 完全覆盖且实现更优（旧脚本无脑调 `--claim`，新实现先 `checkin_status()` 判断今日是否已签到，幂等）。crontab / systemd / 代码均无引用，唯一作用是让人误以为 trae 签到归它管。同步清理 `docs/trae-work.md` 两处过时引用（§6.3 自动续期、代码位置表）
 - `_write_response` 的 `log_sse` 分支从"按 chunk 边界 splitlines 只读诊断"改为"行缓冲逐帧处理"，为规范化提供正确的分帧基础；诊断日志新增 `normalized=N` 计数
 
 ### Fixed
+- **每日任务调度健壮性缺口（2026-08-05）**：架构评审后修复四处隐患——① **失败完全静默**：`main()` 恒返回 0 且 handler 结果被丢弃，任务挂了无人知晓（可能连续多天错过签到才发现）。现按 handler result 里的 `error` 判定失败并返回退出码 1，crontab 的 `||` 钩子追写 `logs/crack_daily.alert`；② **日志放 `/tmp`**：容器重启即清空，且违反项目自己定的"跨进程状态勿用 /tmp"约定（代理 `PrivateTmp=true` 根本读不到），迁至仓库内 `logs/crack_daily.log`；③ **无超时上限**：某网关上游卡死会拖垮整个 daily，外层加 `timeout 300`（超时码 124 同样触发告警）；④ **无重试**：网络抖动导致当天签到失败即错过，现失败自动重试一次（`--retry-delay` 可调，各 handler 均幂等——签到类先查状态再领取）
 - **codebuddy 思考链逐 token 换行（2026-08-05，kimi-k3-1 等 reasoning 模型）**：客户端渲染思考链时每个 token 被切成独立段落。根因**不在拼接逻辑，而在帧结构透传**——上游 `copilot.tencent.com` 返回的 SSE 帧不符合 OpenAI 协议：思考阶段每帧夹带 `"content":""`（实测 465/465 帧命中），正文阶段反过来夹带 `"reasoning_content":""`，且 `finish_reason` 用空串而非 `null`。8084 是 `passthrough` 纯字节转发（`aiter_bytes()`），畸形帧原样透传给客户端；客户端见 `content` 键即认为正文块开始 → 结束当前思考段 → 下一帧再开新段 → 逐字换行。**定位关键佐证**：正文阶段同样逐词发送却无此现象，两者唯一结构差异就是思考帧多了空 `content`，据此排除了"客户端把每个 SSE 帧当一行渲染"的可能。修复见 Added 的 SSE 帧规范化层。实测思考帧空 content 465→0、正文帧空 reasoning 67→0、finish_reason 空串 586→0，思考链与正文内容完整无损
 - openrouter 免费池限流文案未被识别 —— `_VENDOR_ERROR_MAPS` 新增 `rate-limited` 关键词（上游返回 `temporarily rate-limited upstream`，2026-08-05 实测 `gemma-4-31b-it:free` 命中），原映射表未覆盖导致该类限流未翻译成 429
 - 【模型映射】按钮误扩散到所有 target 卡片 —— 改为仅 8081 转发网关专属

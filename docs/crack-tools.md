@@ -48,13 +48,20 @@ dashboard 通过 `GET /api/crack/{label}/status` 统一展示额度/签到，由
 0 3 * * * /root/shared-workspace/claude-code-proxy/scripts/cron/crack_daily.sh
 ```
 
-- `DAILY_HANDLERS` 注册表，每网关注册 `daily(secrets, out)`：trae-work 签到+刷新、codebuddy 成长任务领取、qclaw/copilot 仅校验 token
-- **无 key 的网关自动跳过**（按 secrets.json 判断）；**勿新增其他 cron**——这是唯一每日调度入口
-- 日志 `/tmp/crack_daily.log`；执行完写 `.cache/crack_daily_last_run` 时间戳（dashboard 展示"最后定时刷新"）
+- `DAILY_HANDLERS` 注册表，每网关注册 `daily(secrets, out, secrets_path)`：trae-work 签到+刷新、codebuddy 成长任务领取、qclaw/copilot 仅校验 token
+- **无 key 的网关自动跳过**（按 secrets.json 判断，不算失败）；**勿新增其他 cron**——这是唯一每日调度入口
+- 日志 `logs/crack_daily.log`（仓库内，非 `/tmp`——容器重启清空且代理 `PrivateTmp=true` 读不到）；执行完写 `.cache/crack_daily_last_run` 时间戳（dashboard 展示"最后定时刷新"）
+
+**失败可观测性**：任一网关最终失败 → 退出码 1 → crontab 的 `||` 钩子追写 `logs/crack_daily.alert`。单网关失败自动重试一次（各 handler 均幂等：签到类先查状态再领取）。外层 `timeout 300` 防上游卡死拖垮整个任务（超时退出码 124，同样触发告警）。
+
+**扩展新网关**：写 `daily_xxx(secrets, out, secrets_path=None) -> dict` → 在 `DAILY_HANDLERS` 加一行 → 完事（签名已统一，`main()` 无分支无需改动）。handler 内部吞异常时把错误写进 result 子 dict（如 `{"error": "..."}`），调度器据此触发重试与非零退出码。
+
+> 完整约定见 `crack_daily.py` docstring（单一事实源）。
 
 ```bash
 .venv/bin/python crack_daily.py --secrets secrets.json        # 全部
 .venv/bin/python crack_daily.py --only trae-work,codebuddy    # 只跑指定网关
+.venv/bin/python crack_daily.py --only copilot --retry-delay 0  # 调试：跳过重试等待
 ```
 
 ## 环境检测（crackEnv）

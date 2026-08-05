@@ -139,7 +139,11 @@ tail -f codebuddy.log                 # 查
 0 3 * * * /root/shared-workspace/claude-code-proxy/scripts/cron/crack_daily.sh
 ```
 
-各网关注册 `daily()`（trae-work 签到+刷新 / codebuddy 成长任务+刷新 / qclaw、copilot 仅校验）；无 key 自动跳过；时间戳写 `.cache/crack_daily_last_run`（dashboard 展示"最后定时刷新"）；日志 `/tmp/crack_daily.log`；`--only <网关>` 单跑。**勿新增其他 cron**——这是唯一每日调度入口。
+各网关注册 `daily()`（trae-work 签到+刷新 / codebuddy 成长任务+刷新 / qclaw、copilot 仅校验）；无 key 自动跳过（不算失败）；时间戳写 `.cache/crack_daily_last_run`（dashboard 展示"最后定时刷新"）；日志 `logs/crack_daily.log`；`--only <网关>` 单跑、`--retry-delay 0` 加速调试。**勿新增其他 cron**——这是唯一每日调度入口。
+
+**健壮性设计**（2026-08-05）：handler 签名统一为 `fn(secrets, out, secrets_path)`（调用点无分支，新增网关只加一行注册表）；失败自动重试一次（各 handler 均幂等：签到类先查状态再领取）；任一网关最终失败 → 退出码 1 → crontab 的 `||` 钩子写 `logs/crack_daily.alert`；`timeout 300` 防上游卡死拖垮整个任务。
+
+> **完整约定与扩展方式见 `crack_daily.py` docstring**（离代码最近的单一事实源，勿在多处重复同一段约定）。
 
 ### 5.4 凭据管理（dashboard 凭据弹窗）
 
