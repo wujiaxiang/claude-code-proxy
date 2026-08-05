@@ -4214,6 +4214,28 @@ async def _handle_target_request(reader, writer, target):
 
         stats["totalRequests"] += 1
 
+        # ── qclaw /v1/models：上游（mmgrcalltoken.3g.qq.com）不提供 /models 接口，
+        #    转发会得到 404，导致 opencode 等客户端拉不到模型列表。这里直接返回
+        #    targets.json 中 qclaw target 声明的 enabled=true 模型（OpenAI 格式），
+        #    作为 qclaw 的"官方模型列表"单一事实源（与 _handle_traework 的 models 处理一致）。
+        #    放在 crack 401 检查之前：模型列表是元数据，缺 token 也应可列出。
+        if target.get("label") == "qclaw" and path == "/v1/models" and method == "GET":
+            _qclaw_models = [
+                {"id": m["id"], "object": "model", "created": 1700000000, "owned_by": "qclaw"}
+                for m in (target.get("models") or [])
+                if isinstance(m, dict) and m.get("enabled", False)
+            ]
+            _qclaw_payload = json.dumps(
+                {"data": _qclaw_models, "object": "list", "has_more": False}
+            ).encode()
+            writer.write(
+                b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: %d\r\n\r\n%s"
+                % (len(_qclaw_payload), _qclaw_payload)
+            )
+            await writer.drain()
+            writer.close()
+            return
+
         # ── crack 类缺 token → 401（不转发上游）──
         if target.get("category") == "crack" and not _cfg.resolve_secret(target, _SECRETS):
             err_payload = json.dumps({
