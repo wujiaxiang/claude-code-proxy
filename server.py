@@ -2308,6 +2308,10 @@ _SEED_CALL_PARAM_OPEN_RE = re.compile(r'<parameter\s+name="([^"]*)"[^>]*>', re.I
 _TOOLCALL_NAME_RE = re.compile(r"<tool_name\b[^>]*>([\s\S]*?)</tool_name\s*>", re.I)
 _TOOLCALL_PARAM_RE = re.compile(
     r'<parameter\s+name="([^"]*)"[^>]*>([\s\S]*?)</parameter\s*>', re.I)
+# 变体 7（2026-08-05 实测）：<tool_call> 内 <tool_name> 标签 + <arguments>{"..": ".."}</arguments>
+# JSON 包裹形式（opencode 客户端历史工具调用格式的同源形态，模型从上下文学到）。与
+# 变体 6 的 <parameter name=".."> 子标签并列，解析时优先取 <arguments> 整块 JSON。
+_TOOLCALL_ARGS_RE = re.compile(r"<arguments\b[^>]*>([\s\S]*?)</arguments\s*>", re.I)
 # ── 官方 seed-oss / Qwen3 XML 语法（vLLM 官方 parser，2026-08-04 补全）──
 # Qwen3/seed-oss 模型原生工具调用格式（vllm/parser/qwen3.py + seed_oss.py）：
 #   <think>...</think>（seed-oss 用 <seed:think>）推理
@@ -2628,14 +2632,36 @@ def _parse_toolcall_subtags(block: str) -> list:
       </parameters>
       </tool_call>
 
-    解析 <tool_name> 为工具名，所有 <parameter name=".."> 收集为 arguments 的
-    {param_name: value}。JSON 值仍走 _extract_balanced_json（防嵌套花括号截断），
-    普通字符串值按标签位置切片。无 tool_name 或参数异常返回 []（交由上层兜底）。
+    变体 7（2026-08-05 实测）：同外层 <tool_name> 标签，但参数不是 <parameter>
+    而是 <arguments>{"command": ".."}</arguments> JSON 包裹形式：
+      <tool_call>
+      <tool_name>bash</tool_name>
+      <arguments>{"command": "cd /x && git status"}</arguments>
+      </tool_call>
+    曾因只认 <parameter> 子标签，<arguments> 块被跳过 → subtags 返回 [] → 整段
+    <tool_call> 落入兜底剥离路径，工具调用意图丢失（2026-08-05 实测）。
+
+    解析 <tool_name> 为工具名；<arguments> 整块 JSON 直接作为 arguments 字符串；
+    <parameter name=".."> 收集为 arguments 的 {param_name: value}。JSON 值仍走
+    _extract_balanced_json（防嵌套花括号截断），普通字符串值按标签位置切片。
+    无 tool_name 或参数异常返回 []（交由上层兜底）。
     """
     tcs = []
     for name_match in _TOOLCALL_NAME_RE.finditer(block):
         tool_name = name_match.group(1).strip()
         if not tool_name:
+            continue
+        # 变体 7 优先：<arguments> JSON 包裹整块参数
+        args_match = _TOOLCALL_ARGS_RE.search(block)
+        if args_match:
+            args_raw = args_match.group(1).strip()
+            json_start = args_raw.find("{")
+            if json_start >= 0:
+                balanced = _extract_balanced_json(args_raw, json_start)
+                if balanced is not None and not args_raw[:json_start].strip():
+                    args_raw = balanced
+            item = {"type": "function", "function": {"name": tool_name, "arguments": args_raw}}
+            tcs.append(item)
             continue
         params = {}
         for pm in _TOOLCALL_PARAM_RE.finditer(block):
@@ -2716,16 +2742,20 @@ def _parse_dsml_tool_calls(text: str) -> list:
         # 反复踩坑的同一类错误（DSML 配对正则、reasoning 多段提取也是类似教训）。
         for block in _TOOLCALL_XML_RE.findall(text):
             block = block.strip()
-            obj_start = block.find("{")
-            if obj_start < 0:
-                # 变体 6（2026-08-04 实测）：<tool_call> 块内不是 JSON 而是
-                # XML 子标签（<tool_name>...</tool_name><parameters><parameter
-                # name=".." string="true">..</parameter></parameters>）。
-                # 按子标签解析：tool_name → 工具名，parameter → arguments。
+            # 变体 6/7（2026-08-04/05 实测）：块内含 <tool_name> XML 子标签时，
+            # 优先走子标签解析（<parameter name=".."> 与 <arguments>{"..":".."} 两形态）。
+            # 注意：变体 7 的 <arguments> 里含 {（JSON），若按下方平衡括号扫描会把
+            # {"command":...} 当"块内完整 JSON"提取，但该 JSON 无 name 字段 →
+            # json.loads 后 name 为空被 continue 跳过 → 整段逃逸（2026-08-05 实测）。
+            # 故必须先用 _TOOLCALL_NAME_RE 判断 XML 子标签形态，再决定走哪条解析。
+            if _TOOLCALL_NAME_RE.search(block):
                 subtags = _parse_toolcall_subtags(block)
                 if subtags:
                     tcs.extend(subtags)
                 continue
+            obj_start = block.find("{")
+            if obj_start < 0:
+                continue  # 无 tool_name 也无 JSON，非工具调用块，跳过
             obj_str = _extract_balanced_json(block, obj_start)
             if obj_str is None:
                 continue  # 未闭合（半截标记），交由上层判定是否继续等待

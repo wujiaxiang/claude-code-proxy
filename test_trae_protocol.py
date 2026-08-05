@@ -471,6 +471,62 @@ check("未闭合 tool_call 不崩溃且剥离标记",
       "<tool_call>" not in w3u_c and "开始执行" in w3u_c,
       f"content={w3u_c!r}")
 
+# ─── 8.2 Wave 8.2：<tool_call> + <tool_name> + <arguments> JSON 变体（2026-08-05 实测）───
+# 形态：opencode 客户端工具调用历史格式，模型从上下文学到输出。
+# 变体7（2026-08-05 实测，proxy.log 23475 行）：<tool_name> 标签 + <arguments>
+# {"..":".."} JSON 包裹参数（而非 <parameter name=".."> 子标签）。此前 _parse_dsml_tool_calls
+# 优先检测块内第一个 { → 识别为 JSON 块提取 name → name 为空被 continue 跳过 → subtags
+# 返回 [] → 整段 <tool_call> 落入兜底剥离，工具调用意图丢失。
+# 修复：_parse_dsml_tool_calls 先检测 <tool_name> 标签，有则走 _parse_toolcall_subtags
+#（增强支持 <arguments> JSON 格式）；_parse_toolcall_subtags 新增 <arguments> 分支优先。
+print("[8.2] Wave 8.2: <tool_name> + <arguments> JSON 参数")
+
+# 8.2.1 真实泄漏样本（proxy.log 23475 行）
+wave82_tc = '''<tool_call>
+<tool_name>bash</tool_name>
+<arguments>{"command": "cd /root/shared-workspace/claude-code-proxy && grep -i 'content_filter' proxy.log | tail -30"}</arguments>
+</tool_call>'''
+w82_tcs, w82_r, w82_c = server._resolve_trae_text(wave82_tc)
+check("Wave8.2 <arguments> 解析出 1 个", len(w82_tcs) == 1)
+check("Wave8.2 name=bash", w82_tcs and w82_tcs[0]["function"]["name"] == "bash")
+check("Wave8.2 arguments 含 command key",
+      w82_tcs and "command" in json.loads(w82_tcs[0]["function"]["arguments"]))
+check("Wave8.2 正文已清洗（无 XML 泄漏）",
+      "<tool_call>" not in w82_c and "<tool_name>" not in w82_c and "<arguments>" not in w82_c,
+      f"content={w82_c!r}")
+
+# 8.2.2 多参数 JSON（嵌套花括号）
+wave82_multi = '''<tool_call>
+<tool_name>edit</tool_name>
+<arguments>{"filePath": "/a/b.py", "oldString": "if (x) { return 1; }", "newString": "if (y) { return 2; }"}</arguments>
+</tool_call>'''
+w82m_tcs, w82m_r, w82m_c = server._resolve_trae_text(wave82_multi)
+check("Wave8.2 多参数解析出 1 个", len(w82m_tcs) == 1)
+w82m_args = json.loads(w82m_tcs[0]["function"]["arguments"]) if w82m_tcs else {}
+check("Wave8.2 嵌套花括号未截断", w82m_args.get("oldString") == "if (x) { return 1; }")
+check("Wave8.2 多参数正文已清洗", "<tool_call>" not in w82m_c, f"content={w82m_c!r}")
+
+# 8.2.3 连续多个 <tool_name>+<arguments>（proxy.log 23475 行真实形态）
+wave82_chain = '''<tool_call>
+<tool_name>bash</tool_name>
+<arguments>{"command": "git status"}</arguments>
+</tool_call>
+<tool_call>
+<tool_name>grep</tool_name>
+<arguments>{"pattern": "_clean_codebuddy_body", "path": "/x/server.py"}</arguments>
+</tool_call>
+<tool_call>
+<tool_name>bash</tool_name>
+<arguments>{"command": "systemctl status claude-code-proxy"}</arguments>
+</tool_call>'''
+w82c_tcs, w82c_r, w82c_c = server._resolve_trae_text(wave82_chain)
+check("Wave8.2 连续调用解析出 3 个", len(w82c_tcs) == 3)
+check("Wave8.2 3 个 name 正确",
+      w82c_tcs and [tc["function"]["name"] for tc in w82c_tcs] == ["bash", "grep", "bash"])
+check("Wave8.2 连续调用正文已清洗",
+      "<tool_call>" not in w82c_c and "<arguments>" not in w82c_c,
+      f"content={w82c_c!r}")
+
 # ─── 9. Wave 4：官方 seed-oss / Qwen3 XML 语法（vllm qwen3.py + seed_oss.py）───
 # 官方原生格式：<seed:tool_call><function=bash><parameter=command>ls</parameter></function></seed:tool_call>
 # 关键差异：function/parameter 用"无空格无引号"的 <tag=name> 属性形式；
