@@ -217,33 +217,40 @@ _GATEWAY_LOG_SUFFIX = {
 
 
 def _setup_gateway_logger(name: str) -> logging.Logger:
-    """为指定网关建独立文件 logger（同 root 的轮转+清理策略）。"""
+    """为指定网关建独立文件 logger（始终创建，路径固定 <server.py 同目录>/<name>.log）。
+
+    不依赖 LOG_FILE/.env 配置；与 proxy.log 轮转策略同步。"""
     gw = logging.getLogger(f"gateway.{name}")
     gw.setLevel(logging.DEBUG if DEBUG else logging.INFO)
     gw.propagate = False  # 不冒泡到 root，避免重复写 proxy.log
-    if LOG_FILE:
-        try:
-            suffix = _GATEWAY_LOG_SUFFIX.get(name, name)
+    try:
+        # 始终创建文件（与 LOG_FILE 是否设置无关）
+        # 路径：proxy.log 同目录/<name>.log，如 /root/.../codebuddy.log
+        suffix = _GATEWAY_LOG_SUFFIX.get(name, name)
+        if LOG_FILE:
             _base = Path(LOG_FILE).expanduser()
             _gw_path = _base.with_name(f"{_base.stem}-{suffix}.log")
-            _gh = TimedRotatingFileHandler(
-                filename=str(_gw_path),
-                when=LOG_ROTATE_WHEN,
-                interval=max(1, LOG_ROTATE_INTERVAL),
-                backupCount=max(0, LOG_RETENTION_DAYS),
-                encoding="utf-8",
-            )
-            _gh.setLevel(logging.DEBUG if DEBUG else logging.INFO)
-            _gh.setFormatter(logging.Formatter(_log_fmt))
-            gw.addHandler(_gh)
-            _cleanup_old_log_files(str(_gw_path), LOG_RETENTION_DAYS)
-            logger.warning(f"📄 Gateway log enabled: {name} → {_gw_path}")
-        except Exception as _e:
-            logger.warning(f"⚠️  Gateway log setup failed for {name}: {_e}")
-    else:
-        # 无 LOG_FILE 时退回 console（跟随 root 配置）
+        else:
+            # 无 LOG_FILE 时：基于 server.py 同目录
+            import __main__
+            _server_dir = Path(__file__).parent.resolve()
+            _gw_path = _server_dir / f"{suffix}.log"
+        _gh = TimedRotatingFileHandler(
+            filename=str(_gw_path),
+            when=LOG_ROTATE_WHEN,
+            interval=max(1, LOG_ROTATE_INTERVAL),
+            backupCount=max(0, LOG_RETENTION_DAYS),
+            encoding="utf-8",
+        )
+        _gh.setLevel(logging.DEBUG if DEBUG else logging.INFO)
+        _gh.setFormatter(logging.Formatter(_log_fmt))
+        gw.addHandler(_gh)
+        _cleanup_old_log_files(str(_gw_path), LOG_RETENTION_DAYS)
+        logger.warning(f"📄 Gateway log enabled: {name} → {_gw_path}")
+    except Exception as _e:
+        logger.warning(f"⚠️  Gateway log setup failed for {name}: {_e}")
         gw.addHandler(logging.StreamHandler())
-        gw.handlers[0].setFormatter(logging.Formatter(_log_fmt))
+        gw.handlers[-1].setFormatter(logging.Formatter(_log_fmt))
     return gw
 
 
