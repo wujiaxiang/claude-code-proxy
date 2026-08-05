@@ -55,6 +55,7 @@ from __future__ import annotations
 import argparse
 import datetime
 import json
+import os
 import sys
 import time
 from pathlib import Path
@@ -121,19 +122,28 @@ def daily_traework(secrets: dict, out: list[str], secrets_path: Path | None = No
             if remain_days < 2:
                 import tempfile
                 # 复用 crack_traework.cmd_refresh（CLI 命令，签名: cmd_refresh(secrets_path, auth)）
+                # 中转文件含明文 token：必须唯一文件名（避免并发互踩）+ 0600 权限
+                # + finally 清理，不能用 /tmp 下的固定路径（曾是 crack_daily_tmp_secrets.json，
+                # 权限 644 全局可读且用完不删）。
                 if hasattr(crack_traework, "cmd_refresh"):
-                    tmp = Path(tempfile.gettempdir()) / "crack_daily_tmp_secrets.json"
-                    tmp.write_text(json.dumps(secrets, ensure_ascii=False), encoding="utf-8")
-                    rc = crack_traework.cmd_refresh(tmp, auth)
-                    _log(f"  🔄 trae-work: token 剩 {remain_days:.1f} 天，执行刷新 rc={rc}", out)
-                    result["refresh"] = {"done": True, "rc": rc}
-                    if rc == 0:
-                        refreshed = json.loads(tmp.read_text(encoding="utf-8"))
-                        if refreshed.get("trae_work_token") != token:
-                            _log("  ✅ trae-work: 刷新成功，token 已更新", out)
-                            target = Path(secrets_path) if secrets_path else PROJECT_DIR / "secrets.json"
-                            with open(target, "w", encoding="utf-8") as f:
-                                json.dump(refreshed, f, ensure_ascii=False, indent=2)
+                    fd, _tmp_name = tempfile.mkstemp(prefix="crack_daily_", suffix=".json")
+                    os.close(fd)
+                    tmp = Path(_tmp_name)
+                    try:
+                        os.chmod(tmp, 0o600)
+                        tmp.write_text(json.dumps(secrets, ensure_ascii=False), encoding="utf-8")
+                        rc = crack_traework.cmd_refresh(tmp, auth)
+                        _log(f"  🔄 trae-work: token 剩 {remain_days:.1f} 天，执行刷新 rc={rc}", out)
+                        result["refresh"] = {"done": True, "rc": rc}
+                        if rc == 0:
+                            refreshed = json.loads(tmp.read_text(encoding="utf-8"))
+                            if refreshed.get("trae_work_token") != token:
+                                _log("  ✅ trae-work: 刷新成功，token 已更新", out)
+                                target = Path(secrets_path) if secrets_path else PROJECT_DIR / "secrets.json"
+                                with open(target, "w", encoding="utf-8") as f:
+                                    json.dump(refreshed, f, ensure_ascii=False, indent=2)
+                    finally:
+                        tmp.unlink(missing_ok=True)  # 明文凭据不留盘
                 else:
                     _log("  ⚠️  trae-work: 无 cmd_refresh 函数，跳过刷新", out)
             else:
