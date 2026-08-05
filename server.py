@@ -8283,10 +8283,18 @@ async def api_get_aggregate_config():
     # 聚合可用端口列表（用于前端下拉选择 + 联动模型过滤）
     available_ports = {}
     for t in _TARGETS:
-        if t.get("handler") == "aggregator":
-            continue
         port_num = t.get("listenPort")
         if port_num is None:
+            continue
+        if t.get("handler") == "aggregator":
+            # 聚合网关：模型 = virtualModels 的 key（agg:xxx 虚拟模型 id），
+            # 供模型定义/聚合配置编辑里"选 8080 → 联动列出虚拟模型"使用。
+            vm_models = list((t.get("virtualModels") or {}).keys())
+            available_ports[str(port_num)] = {
+                "label": t.get("name") or t.get("label") or str(port_num),
+                "handler": "aggregator",
+                "models": vm_models,
+            }
             continue
         models = []
         for m in (t.get("models") or []):
