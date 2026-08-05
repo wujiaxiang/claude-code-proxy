@@ -956,6 +956,7 @@ _VENDOR_ERROR_MAPS = [
     ("rate_limit_exceeded", 429, "rate_limit_error", "OpenAI 标准限流码"),
     ("too_many_requests", 429, "rate_limit_error", "OpenAI 标准限流码"),
     ("RateLimitError", 429, "rate_limit_error", "litellm 限流异常类名"),
+    ("rate-limited", 429, "rate_limit_error", "openrouter 免费池上游限流（temporarily rate-limited upstream）"),
 ]
 
 

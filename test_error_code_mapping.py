@@ -1,8 +1,11 @@
 """验证上游限流错误被正确转成 429 / SSE error 事件，覆盖多网关多格式 + 配置表驱动。
 
+对应文档：docs/error-code-mapping.md
+
 覆盖：
 1. 错误码映射表 _VENDOR_ERROR_MAPS / _map_upstream_error：
-   - openrouter: {"code":502,"message":"...ResourceExhausted..."}  (无 "error": 字段)
+   - openrouter (ResourceExhausted 裸格式): {"code":502,"message":"...ResourceExhausted..."}  (无 "error": 字段)
+   - openrouter (免费池 rate-limited 文案): {"error":{"message":"...temporarily rate-limited upstream...","code":429}}
    - nvidia:     裸字符串 "ResourceExhausted: Worker local total request limit reached (32/32)"
    - 标准 OAI:   {"error":{"type":"rate_limit_error",...}}
    - 配置表驱动：新增一行 keyword（如 "quota_exceeded"）即可被识别
@@ -27,6 +30,13 @@ OPENROUTER_BODY = (
     'ResourceExhausted: Worker local total request limit reached (33/32)",'
     '"metadata":{"error_type":"provider_unavailable"}}'
 )
+# openrouter 免费池限流文案（temporarily rate-limited upstream），2026-08-05 实测 gemma-4-31b-it:free 命中
+OPENROUTER_RATE_LIMITED_BODY = (
+    '{"error":{"message":"Provider returned error","code":429,'
+    '"metadata":{"raw":"google/gemma-4-31b-it:free is temporarily rate-limited upstream. '
+    'Please retry shortly","provider_name":"Google AI Studio","is_byok":false,'
+    '"provider_error_code":"429","limit_source":"upstream_provider_shared_pool"}}'
+)
 NVIDIA_BODY = "ResourceExhausted: Worker local total request limit reached (32/32)"
 STANDARD_OAI_BODY = (
     '{"error":{"message":"ResourceExhausted: Worker local total request limit reached (32/32)",'
@@ -44,8 +54,9 @@ def _make_rate_limit_error():
 
 
 def test_error_map_table_driven():
-    """配置表驱动：三种限流格式 + 新增 keyword 都能识别，非限流不误判。"""
+    """配置表驱动：多网关限流格式 + 新增 keyword 都能识别，非限流不误判。"""
     assert server._map_upstream_error(OPENROUTER_BODY) == (429, "rate_limit_error")
+    assert server._map_upstream_error(OPENROUTER_RATE_LIMITED_BODY) == (429, "rate_limit_error")
     assert server._map_upstream_error(NVIDIA_BODY) == (429, "rate_limit_error")
     assert server._map_upstream_error(STANDARD_OAI_BODY) == (429, "rate_limit_error")
     # 配置表驱动：临时追加一行 keyword 即被识别（验证"加表项即可扩展"）
@@ -57,7 +68,8 @@ def test_error_map_table_driven():
     assert server._map_upstream_error(NON_RATE_BODY) is None, "非限流被误判"
     assert server._map_upstream_error("") is None
     assert server._vendor_body_retryable(OPENROUTER_BODY) is True
-    print("[PASS] 配置表驱动：openrouter/nvidia/标准OAI + 扩展keyword 均识别，非限流不误判")
+    assert server._vendor_body_retryable(OPENROUTER_RATE_LIMITED_BODY) is True
+    print("[PASS] 配置表驱动：openrouter(ResourceExhausted/rate-limited)/nvidia/标准OAI + 扩展keyword 均识别，非限流不误判")
 
 
 def test_litellm_rate_limit_returns_429():

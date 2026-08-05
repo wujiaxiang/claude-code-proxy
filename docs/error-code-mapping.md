@@ -98,11 +98,11 @@ _VENDOR_ERROR_MAPS = [
 
 ## 5. 测试
 
-`test_qclaw_429.py` 覆盖：
-- `_vendor_body_retryable` / `_map_upstream_error` 识别 openrouter / nvidia / 标准 OAI 三种限流格式；
+`test_error_code_mapping.py` 覆盖：
+- `_vendor_body_retryable` / `_map_upstream_error` 识别 openrouter（ResourceExhausted / 免费池 rate-limited 文案）/ nvidia / 标准 OAI 等限流格式；
 - LiteLLM 路径限流 → 429 + `Retry-After`；非限流 → 500 不变。
 
-运行：`.venv/bin/python test_qclaw_429.py`
+运行：`.venv/bin/python test_error_code_mapping.py`
 
 ---
 
