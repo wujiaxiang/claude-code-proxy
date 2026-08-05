@@ -69,21 +69,33 @@ python crack_codebuddy.py [--secrets secrets.json] [--force]
 
 ## 3.5 上游 SSE 帧不合规与规范化（normalizeSse）
 
-**现象**：客户端渲染 reasoning 模型（kimi-k3-1 等）的思考链时，**每个 token 被切成独立段落**（逐字换行）。
+**现象**：客户端（opencode）渲染 reasoning 模型（kimi-k3-1 等）的思考链时，**思考链被拆成几百个独立思考块**，而不是一个连续的思考过程。
 
-**根因**：上游返回的 SSE 帧不符合 OpenAI 协议——**不是拼接问题，是帧结构问题**。
+**根因**：上游每帧 delta 都塞满"存在但为空"的字段，不符合 OpenAI 协议——**不是文本拼接问题，是帧结构问题**。
 
-实测 kimi-k3-1（2026-08-05）：
+实测 kimi-k3-1（2026-08-05）上游实际返回：
 
-| 阶段 | 上游实际返回 | 标准 OpenAI 应为 |
-|------|-------------|-----------------|
-| 思考帧（465/465 全中） | `{"delta":{"content":"","reasoning_content":"The",...}}` | `{"delta":{"reasoning_content":"The"}}`（不带 content 键） |
-| 正文帧（67/67 全中） | `{"delta":{"content":"递归","reasoning_content":"",...}}` | `{"delta":{"content":"递归"}}` |
-| finish_reason（每帧） | `""`（空串） | `null`（仅末帧为 `stop` 等） |
+```json
+{"delta":{"content":"","reasoning_content":"The","function_call":null,
+          "refusal":"","tool_calls":[],"extra_fields":null},"finish_reason":""}
+```
 
-8084 是 `passthrough` 纯字节转发（`aiter_bytes()`），畸形帧原样透传。客户端见 `content` 键即认为正文块开始 → 结束当前思考段 → 下一帧再开新段 → 逐字换行。
+标准 OpenAI 协议下思考阶段应只有 `{"reasoning_content":"The"}`。
 
-> **定位关键佐证**：正文阶段同样是逐词发送，却从未出现换行问题。两者唯一的结构差异就是思考帧多了空 `content`——据此排除"客户端把每个 SSE 帧当一行渲染"的解释。
+**客户端为何切段**：opencode 用 Vercel AI SDK（`@ai-sdk/openai-compatible`），它按**"键是否出现"**判断段落边界——
+
+| 见到的键 | SDK 行为 |
+|---------|---------|
+| `content` | 认为正文块开始 → 结束当前 reasoning part |
+| `tool_calls` | 认为工具调用段开始 → 结束当前 reasoning part |
+
+下一帧又见 `reasoning_content` → 开新 part。**597/599 帧命中**，思考链被切成数百块。
+
+8084 是 `passthrough` 纯字节转发（`aiter_bytes()`），畸形帧原样透传，所以问题直达客户端。
+
+> **⚠️ 排查教训**：首次修复只删了空 `content`，采用"保守策略"特意保留 `tool_calls`/`refusal`/`function_call`/`extra_fields`，理由是"对本 bug 零收益，却可能破坏依赖键存在性做类型推断的客户端"。**这个判断错了**——恰恰是"依赖键存在性"这个特性导致切段，`tool_calls:[]` 正是元凶。教训：**面对未知客户端解析逻辑时，"保守保留"不必然安全**，要先确认客户端用的是哪个 SDK、它按什么规则分段。
+>
+> 另一个教训：现象描述的精确度决定排查方向。最初被描述为"思考链换行"，导致长时间在"文本换行符"方向验证（实测思考文本里的 `\n` 是模型自己生成的正常分段，473 帧中仅 20 帧含换行）；直到明确是"拆成多个思考块"才锁定真因。
 
 **修复**（targets.json 开 `normalizeSse: true`）：
 
@@ -92,15 +104,17 @@ python crack_codebuddy.py [--secrets secrets.json] [--force]
 ```
 
 - `_SseLineBuffer`：按 `\n` 切行，处理跨 TCP chunk 粘包。**改写模式下必须**——纯透传时帧被切断无所谓，但要逐帧改写就必须先重组，否则会切坏 JSON
-- `_normalize_codebuddy_sse_line`：保守清洗
+- `_normalize_codebuddy_sse_line`：清洗**空值**字段（有内容的绝不动）
   - `reasoning_content` 非空且 `content == ""` → 删 `content` 键
   - `content` 非空且 `reasoning_content == ""` → 删 `reasoning_content` 键
+  - `tool_calls == []` / `function_call is None` / `refusal == ""` / `extra_fields is None` → 删该键
+  - `function_call == {"name":"","arguments":""}` → 删（**首帧是空内容 dict 而非 null**，`== None` 匹配不到，需单独判断）
   - `finish_reason == ""` → `null`（子开关 `normalizeFinishReason`，默认 `true`）
-  - **不动** `tool_calls`/`refusal`/`function_call`/`extra_fields`：对本问题零收益，却可能破坏依赖"键存在性"做类型推断的客户端
+- **回归红线**：`tool_calls`/`function_call` 有内容时必须完整保留（工具调用是结构化数据，删了会断链）。用 `type()` 校验避免 `0`/`False` 这类假空值被误删
 - 降级：非 `data:` 行 / `[DONE]` / keep-alive 注释 / 畸形 JSON 一律原样透传，**绝不吞帧或中断流**
 - 性能：未命中规则的帧返回原对象，不重新序列化
 
-**修复效果**：思考帧空 content 465→0，正文帧空 reasoning 67→0，finish_reason 空串 586→0，思考链与正文内容完整无损（中文/emoji/换行符均正确）。
+**修复效果**：带 `tool_calls` 键的帧 597→0，最终 589 帧为纯净的 `('reasoning_content',)`；`finish_reason` 空串 586→0；思考链合并为连续块，思考与正文内容完整无损（中文/emoji/换行符均正确）。
 
 **诊断**：`DEBUG=true` 时 `codebuddy.log` 输出 `SSE 透传完成: data_lines=N finish_reasons=[...] normalized=M`，`normalized` 即本次改写的帧数。**注意 DEBUG 默认关闭**（日志级别 INFO），此行不会出现——需临时开 DEBUG 才能看到，查完记得恢复。
 

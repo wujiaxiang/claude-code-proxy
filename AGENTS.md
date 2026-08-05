@@ -250,7 +250,8 @@ $env:Path = "C:\Program Files\QClaw\v0.2.33.617\resources\git\cmd;C:\Windows\Sys
 4. **代理 mount namespace 隔离**：跨进程共享状态放仓库 `.cache/`，勿用 `/tmp`（代理读不到）。
 5. **LXC 跑 Docker AppArmor 冲突**：手动 `docker run` 要加 `--security-opt apparmor=unconfined`（部署环境约束，见全局 CLAUDE.md）。
 6. **聚合网关（8080）**：熔断配额模式（`quotaErrorPatterns`，额度/积分不足 → 摘除端口）与 429 限流模式（`_VENDOR_ERROR_PATTERNS`，只翻译不熔断）必须严格区分，新增错误特征时先判断归哪一类；聚合层**不透传 secretRef/apikeyEnv**，只透传客户端 `Authorization`（凭据归各下游端口自己处理）；会话粘性 key = `(虚拟模型id, session_id)`，改粘性逻辑勿动这个隔离约定。
-7. **上游 SSE 帧不可假设合规**：codebuddy 上游思考帧夹带空 `content`、正文帧夹带空 `reasoning_content`、`finish_reason` 用空串而非 `null`（已由 `normalizeSse` 修正，见 docs/codebuddy.md §3.5）。**改写 SSE 的三条硬约束**：① 必须先用 `_SseLineBuffer` 重组跨 chunk 的半截帧再改写（纯透传时帧被切断无所谓，改写时不重组会切坏 JSON）；② 诊断统计必须基于改写**前**的原始行，否则规范化自身的 bug 会掩盖上游真实异常；③ 解析失败一律原样透传，绝不吞帧或中断流（流断了比渲染难看严重得多）。清洗字段遵循保守原则——只删空 `content`/`reasoning_content`，不动 `tool_calls` 等结构字段。
+7. **上游 SSE 帧不可假设合规**：codebuddy 上游思考帧夹带空 `content`、正文帧夹带空 `reasoning_content`、`finish_reason` 用空串而非 `null`（已由 `normalizeSse` 修正，见 docs/codebuddy.md §3.5）。**改写 SSE 的三条硬约束**：① 必须先用 `_SseLineBuffer` 重组跨 chunk 的半截帧再改写（纯透传时帧被切断无所谓，改写时不重组会切坏 JSON）；② 诊断统计必须基于改写**前**的原始行，否则规范化自身的 bug 会掩盖上游真实异常；③ 解析失败一律原样透传，绝不吞帧或中断流（流断了比渲染难看严重得多）。清洗范围以**值是否为空**为准（`content`/`reasoning_content`/`tool_calls`/`function_call`/`refusal`/`extra_fields` 的空值都要删），有内容的结构字段绝不动。
+   > **别想当然"保留字段更安全"**：首版修复特意保留 `tool_calls:[]` 等空字段（怕破坏依赖键存在性的客户端），结果恰恰是它导致 opencode（Vercel AI SDK）把思考链切成数百块——SDK 见 `tool_calls` 键即认为工具调用段开始。改 SSE 前先确认客户端用哪个 SDK、按什么规则分段。
 8. **排查协议类问题先抓原始字节**：本次思考链换行 bug 曾误判为"流式追加拼接错误"，实际是帧结构问题。有效方法是 `iter_bytes()` 打印原始 SSE 的 `repr()` 逐字段对比标准协议，并用**同一响应内正常阶段作对照**（正文同样逐词发送却无问题 → 锁定唯一结构差异）。
 
 **网关级陷阱（详见各网关文档）**：

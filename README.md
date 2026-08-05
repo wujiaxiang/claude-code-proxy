@@ -73,7 +73,7 @@ Add to `~/.claude/settings.json` (any provider — only `targets.json` decides r
 - **base_url 规范**：crack 类与 gemini-native 统一 `/v1`（代理内部映射下游）；free/paid 透传用 `routePrefix`
 - **客户端接入**：`base_url = http://<host>:<port>/v1`（或 `/api/v1`），`api_key = "dummy"`（free/paid 用真实 key）
 - **codebuddy 非流式兼容**：上游只接受流式（11101），代理自动把非流式请求转流式聚合为完整 JSON，非流式客户端也可用
-- **SSE 帧规范化（`normalizeSse`）**：部分上游返回的 SSE 帧不合规（如 codebuddy 思考帧夹带空 `content`，导致客户端把思考链切成逐 token 换行）。开启后代理逐帧清洗为标准 OpenAI 格式，保守策略只删空字段、不动 `tool_calls` 等结构；解析失败一律原样透传不吞帧
+- **SSE 帧规范化（`normalizeSse`）**：部分上游返回的 SSE 帧不合规（如 codebuddy 每帧都塞满 `content:""` / `tool_calls:[]` 等空字段，导致客户端 SDK 按"键是否出现"分段，把思考链切成数百个独立块）。开启后代理逐帧剔除空值字段还原标准 OpenAI 格式，有内容的 `tool_calls` 等严格保留；解析失败一律原样透传不吞帧
 - **聚合网关（8080）**：客户端用虚拟模型 id（如 `agg:sonnet`）请求，按配置加权路由到多个真实下游端口，支持会话粘性 / 重试降级 / 配额熔断（详见 [docs/architecture.md](docs/architecture.md)「聚合网关」小节）
 
 📖 完整架构、targets.json schema、gemini-native 协议转换、路径重写规则 → [docs/architecture.md](docs/architecture.md)

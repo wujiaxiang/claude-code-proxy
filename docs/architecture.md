@@ -90,14 +90,16 @@ Anthropic 协议：base_url = http://192.168.2.128:8081，api_key = "dummy"
 上游 chunk → _SseLineBuffer 重组完整行 → 诊断统计(基于原始行) → _normalize_codebuddy_sse_line → 写出
 ```
 
-**清洗规则**（保守策略）：
+**清洗规则**（判据是**值是否为空**，不是字段名）：
 
 | 条件 | 动作 |
 |------|------|
 | `reasoning_content` 非空且 `content == ""` | 删 `content` 键 |
 | `content` 非空且 `reasoning_content == ""` | 删 `reasoning_content` 键 |
+| `tool_calls == []` / `function_call is None` / `refusal == ""` / `extra_fields is None` | 删该键 |
+| `function_call == {"name":"","arguments":""}` | 删（首帧是空内容 dict 而非 null，需单独判断） |
 | `finish_reason == ""` | 归一为 `null`（受 `normalizeFinishReason` 控制） |
-| `tool_calls`/`refusal`/`function_call`/`extra_fields` | **不动**（避免破坏依赖键存在性做类型推断的客户端） |
+| 上述字段**有内容**时 | **一律保留**（`tool_calls`/`function_call` 删了会断工具调用链） |
 
 **设计约束**（新增同类逻辑时必须遵守）：
 
@@ -105,6 +107,9 @@ Anthropic 协议：base_url = http://192.168.2.128:8081，api_key = "dummy"
 2. **诊断统计基于改写前的原始行**——否则规范化自身的 bug 会掩盖上游真实异常
 3. **失败一律原样透传**——解析失败/畸形帧/`[DONE]`/keep-alive 都不改写，绝不吞帧或中断流
 4. **未改动的帧返回原对象**——不重新序列化，保住零开销
+5. **空值判定要带类型校验**——用 `type()` 比对避免 `0`/`False` 被当成空值误删
+
+> **为什么不能"保守保留"空字段**：曾误以为保留 `tool_calls:[]` 等空字段更安全（怕破坏依赖键存在性的客户端），实际恰恰相反——Vercel AI SDK 正是按"键是否出现"分段，见 `tool_calls` 键就结束当前 reasoning part，导致 opencode 把思考链切成数百块。改 SSE 前先确认目标客户端用哪个 SDK、按什么规则分段。
 
 > `normalizeSse` 为真时会自动启用逐帧处理链路（与 SSE 诊断日志共用）。诊断日志附带 `normalized=N` 表示本次改写的帧数。
 

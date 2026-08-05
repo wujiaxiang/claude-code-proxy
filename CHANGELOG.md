@@ -5,7 +5,8 @@
 ### Added
 - **SSE 帧规范化层（`normalizeSse`，2026-08-05）**：passthrough 端口新增可选的上游 SSE 帧清洗能力，用于修正不合规上游。配置驱动（targets.json `normalizeSse` / `normalizeFinishReason`），不硬编码 label；当前对 codebuddy 启用
   - `_SseLineBuffer`：按 `\n` 切行的缓冲器，重组跨 TCP chunk 的半截 SSE 帧。**纯字节透传时无需要，但一旦要逐帧改写就必须先重组**，否则会切坏 JSON（原诊断逻辑按 chunk 边界 `splitlines()` 只影响日志准确性，改写模式下则会污染数据流）
-  - `_normalize_codebuddy_sse_line`：逐帧规范化，保守策略——只删空 `content`/`reasoning_content`、`finish_reason:""` 归一为 `null`；**不动** `tool_calls`/`refusal`/`function_call`/`extra_fields`（对目标问题零收益，却可能破坏依赖"键存在性"做类型推断的客户端）
+  - `_normalize_codebuddy_sse_line`：逐帧规范化，清洗**所有空值字段**（`content`/`reasoning_content`/`tool_calls`/`function_call`/`refusal`/`extra_fields`）+ `finish_reason:""` 归一为 `null`；有内容的结构字段严格保留
+    > 首版曾采用"保守策略"保留 `tool_calls` 等空字段，后经实测推翻——见下方 Fixed 的续修条目
   - 三条工程红线：① 诊断统计基于**改写前**的原始行（否则规范化自身的 bug 会掩盖上游真实异常）；② 解析失败/畸形帧/`[DONE]`/keep-alive 一律原样透传，绝不吞帧或中断流（流断了比渲染难看严重得多）；③ 未改动的帧返回原对象，保住大部分帧的零序列化开销
 - **聚合网关 8080 端口**（`aggregator.py` + `config_store.py` aggregate/aggregator 支持）：
   - 虚拟模型 id（agg:xxx）→ 默认池（权重/平等）+ 降级池（可为空）路由，可配置重试次数
@@ -53,8 +54,10 @@
 - `_write_response` 的 `log_sse` 分支从"按 chunk 边界 splitlines 只读诊断"改为"行缓冲逐帧处理"，为规范化提供正确的分帧基础；诊断日志新增 `normalized=N` 计数
 
 ### Fixed
+- **codebuddy 思考链被切成数百个独立思考块（2026-08-05，续修）**：前次只删空 `content` 解决了一半。真实现象**不是文本换行，而是思考链被拆成几百个独立块**——上游每帧 delta 都塞满"存在但为空"的结构字段（`tool_calls:[]` / `function_call:null` / `refusal:""` / `extra_fields:null`），而 opencode 用的 Vercel AI SDK（`@ai-sdk/openai-compatible`）按**"键是否出现"**判断段落边界：见 `tool_calls` 键即认为工具调用段开始 → 结束当前 reasoning part → 下一帧再开新 part（实测 597/599 帧命中）。现改为清洗全部空值字段（含首帧 `function_call:{"name":"","arguments":""}` 这种空内容 dict，`== None` 匹配不到需单独判断），带内容的 `tool_calls`/`function_call` 严格保留。实测带 `tool_calls` 键的帧 597→0，最终 589 帧为纯 `('reasoning_content',)`
+  > **判断失误复盘**：首版特意保留这些字段，理由是"对本 bug 零收益，却可能破坏依赖键存在性做类型推断的客户端"——恰恰相反，正是"依赖键存在性"这一特性导致切段。教训：面对未知客户端解析逻辑，"保守保留"不必然安全，应先确认客户端 SDK 的分段规则。另一教训：现象描述精确度决定排查方向，"换行"与"拆成多块"是两个完全不同的问题
 - **每日任务调度健壮性缺口（2026-08-05）**：架构评审后修复四处隐患——① **失败完全静默**：`main()` 恒返回 0 且 handler 结果被丢弃，任务挂了无人知晓（可能连续多天错过签到才发现）。现按 handler result 里的 `error` 判定失败并返回退出码 1，crontab 的 `||` 钩子追写 `logs/crack_daily.alert`；② **日志放 `/tmp`**：容器重启即清空，且违反项目自己定的"跨进程状态勿用 /tmp"约定（代理 `PrivateTmp=true` 根本读不到），迁至仓库内 `logs/crack_daily.log`；③ **无超时上限**：某网关上游卡死会拖垮整个 daily，外层加 `timeout 300`（超时码 124 同样触发告警）；④ **无重试**：网络抖动导致当天签到失败即错过，现失败自动重试一次（`--retry-delay` 可调，各 handler 均幂等——签到类先查状态再领取）
-- **codebuddy 思考链逐 token 换行（2026-08-05，kimi-k3-1 等 reasoning 模型）**：客户端渲染思考链时每个 token 被切成独立段落。根因**不在拼接逻辑，而在帧结构透传**——上游 `copilot.tencent.com` 返回的 SSE 帧不符合 OpenAI 协议：思考阶段每帧夹带 `"content":""`（实测 465/465 帧命中），正文阶段反过来夹带 `"reasoning_content":""`，且 `finish_reason` 用空串而非 `null`。8084 是 `passthrough` 纯字节转发（`aiter_bytes()`），畸形帧原样透传给客户端；客户端见 `content` 键即认为正文块开始 → 结束当前思考段 → 下一帧再开新段 → 逐字换行。**定位关键佐证**：正文阶段同样逐词发送却无此现象，两者唯一结构差异就是思考帧多了空 `content`，据此排除了"客户端把每个 SSE 帧当一行渲染"的可能。修复见 Added 的 SSE 帧规范化层。实测思考帧空 content 465→0、正文帧空 reasoning 67→0、finish_reason 空串 586→0，思考链与正文内容完整无损
+- **codebuddy 思考帧夹带空 `content`（2026-08-05，kimi-k3-1 等 reasoning 模型）**〔首版修复，仅解决一半，完整修复见上方续修条目〕：根因**不在拼接逻辑，而在帧结构透传**——上游 `copilot.tencent.com` 返回的 SSE 帧不符合 OpenAI 协议：思考阶段每帧夹带 `"content":""`（实测 465/465 帧命中），正文阶段反过来夹带 `"reasoning_content":""`，且 `finish_reason` 用空串而非 `null`。8084 是 `passthrough` 纯字节转发（`aiter_bytes()`），畸形帧原样透传给客户端；客户端见 `content` 键即认为正文块开始 → 结束当前思考段 → 下一帧再开新段 → 逐字换行。**定位关键佐证**：正文阶段同样逐词发送却无此现象，两者唯一结构差异就是思考帧多了空 `content`，据此排除了"客户端把每个 SSE 帧当一行渲染"的可能。修复见 Added 的 SSE 帧规范化层。实测思考帧空 content 465→0、正文帧空 reasoning 67→0、finish_reason 空串 586→0，思考链与正文内容完整无损
 - openrouter 免费池限流文案未被识别 —— `_VENDOR_ERROR_MAPS` 新增 `rate-limited` 关键词（上游返回 `temporarily rate-limited upstream`，2026-08-05 实测 `gemma-4-31b-it:free` 命中），原映射表未覆盖导致该类限流未翻译成 429
 - 【模型映射】按钮误扩散到所有 target 卡片 —— 改为仅 8081 转发网关专属
 - `config_store.load_targets` 丢弃顶层 `anthropicForward` 字段 —— 保留并校验
