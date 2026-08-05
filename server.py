@@ -9286,11 +9286,16 @@ function mmInsertRow(section, rowHtml, anchorSel) {{
 
 // node 是否"属于"section 本层：node 与 section 之间不得夹着另一个同类锚点容器。
 // 用于 agg-modal 这类嵌套结构（虚拟模型块内还有成员添加行）。
+// 注意：嵌套容器类名清单（.agg-vm/.agg-pool）若新增须同步登记，否则会误判归属（Bug 1 复发）。
 function mmOwnsNode(section, node, anchorSel) {{
   var p = node.parentNode;
   while (p && p !== section) {{
     if (p.matches && p.matches(".agg-vm, .agg-pool")) return false;
     p = p.parentNode;
+  }}
+  if (p !== section && anchorSel) {{
+    // 找不到本层归属：降级到末尾插入会悄悄插错位置，告警以便排查（不抛错，保持主流程可用）
+    console.warn('[mmOwnsNode] 锚点未命中本层归属，已降级插入末尾:', anchorSel);
   }}
   return p === section;
 }}
@@ -9327,16 +9332,16 @@ async function loadDanglingBar() {{
 
 // ── 保存后局部刷新（§2.4.3）：重拉 dashboard HTML，只替换目标卡片 DOM ──
 // 不整页刷新：保留手风琴展开状态与滚动位置，用户能立刻看到"我改的生效了"。
-async function refreshCardDom(port) {{
+async function refreshCardDom(port, msgEl) {{
   try {{
     var resp = await fetch(location.pathname, {{headers: {{'Cache-Control': 'no-cache'}}}});
-    if (!resp.ok) return false;
+    if (!resp.ok) throw new Error('http_' + resp.status);
     var html = await resp.text();
     var doc = new DOMParser().parseFromString(html, 'text/html');
     var sel = '.card[data-port="' + port + '"]';
     var fresh = doc.querySelector(sel);
     var cur = document.querySelector(sel);
-    if (!fresh || !cur) return false;
+    if (!fresh || !cur) throw new Error('card_not_found');
     // 保留当前展开态：新 DOM 是服务端默认（收起）状态
     var wasOpen = !!cur.querySelector('.card-detail.open');
     cur.replaceWith(fresh);
@@ -9350,7 +9355,11 @@ async function refreshCardDom(port) {{
     }}
     bindCardAccordion(fresh);
     return true;
-  }} catch (e) {{ return false; }}
+  }} catch (e) {{
+    // 刷新失败：不能让用户以为"卡片已更新"——明确提示手动刷新（§2.4.3 防误导）
+    if (msgEl) mmMsg(msgEl, 'warn', '⚠️ 卡片局部刷新失败，请手动刷新页面查看最新状态');
+    return false;
+  }}
 }}
 
 // ── 手风琴交互（互斥，任一时刻只展开一个）──
@@ -9484,7 +9493,7 @@ async function saveModelEditor(btn) {{
       var _onN = models.filter(function(m) {{ return m.enabled; }}).length;
       mmMsg(msg, 'ok', '✅ 已保存 ' + models.length + ' 个模型（开启 ' + _onN + ' 个）→ ' + label + ' 卡片已更新');
       var _port = (document.querySelector('.card[data-label="' + label + '"]') || {{}}).dataset;
-      if (_port && _port.port) await refreshCardDom(_port.port);
+      if (_port && _port.port) await refreshCardDom(_port.port, msg);
       setTimeout(function() {{
         closeModelEditor();
         btn.disabled = false; btn.textContent = '保存';
@@ -9740,7 +9749,7 @@ async function saveModelsEditor(btn) {{
   // 生效位置提示（docs §2.4.2）：显示实际保存条目数 + 改动出现在哪
   mmMsg(msg, 'ok', '✅ 已保存 ' + models.length + ' 个模型定义 → 已在 8081 卡片显示');
   // 局部刷新 8081 卡片（§2.4.3）：不整页刷新，用户立刻能对上数字
-  await refreshCardDom(8081);
+  await refreshCardDom(8081, msg);
   loadDanglingBar();
   setTimeout(function() {{ closeModelsEditor(); }}, 1200);
 }}
@@ -10053,7 +10062,7 @@ async function saveAggConfig(btn) {{
       var _vmN = Object.keys(virtualModels).length;
       mmMsg(msg, 'ok', '✅ 已保存 ' + _vmN + ' 个虚拟模型 → 聚合路由已热重载（8080 卡片已更新）');
       btn.textContent = '✅ 已保存'; btn.style.background = '#4ade80';
-      await refreshCardDom(8080);
+      await refreshCardDom(8080, msg);
       loadDanglingBar();
       setTimeout(function() {{
         closeAggConfigEditor();
