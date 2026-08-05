@@ -9695,7 +9695,7 @@ function buildAggConfigHtml(r) {{
   }} else {{
     keys.forEach(function(k) {{ html += aggVmBlock(k, vms[k]); }});
   }}
-  html += '<button class="mm-add-btn" onclick="addAggVm()">+ 新增虚拟模型</button></div>';
+  html += '<button class="mm-add-btn agg-vm-add" onclick="addAggVm()">+ 新增虚拟模型</button></div>';
   return html;
 }}
 
@@ -9704,7 +9704,9 @@ function addAggVm() {{
   var section = document.getElementById('agg-vm-section');
   if (!body || !section) return;
   var html = aggVmBlock('', {{defaultPool: [], fallbackPool: []}});
-  var addBtn = section.querySelector('.mm-add-btn');
+  // 锚点必须用专属类名 agg-vm-add：section 内每个虚拟模型块还含「+ 添加成员」
+  // 等同类 .mm-add-btn 按钮，querySelector('.mm-add-btn') 会取到第一个（嵌套插错位置）。
+  var addBtn = section.querySelector('.agg-vm-add');
   if (addBtn) {{ addBtn.insertAdjacentHTML('beforebegin', html); }}
   else {{ section.insertAdjacentHTML('beforeend', html); }}
   var ids = body.querySelectorAll('.agg-vm-id');
