@@ -8488,9 +8488,11 @@ async def api_update_secret(label: str, update: SecretUpdate):
     target = next((t for t in cfg["targets"] if t["label"] == label), None)
     if target is None:
         raise HTTPException(status_code=404, detail=f"target '{label}' 不存在")
-    ref = target.get("secretRef")
+    # 无 secretRef 的直连网关（free/paid）统一落到约定 key f"{label}_token"，
+    # 与 config_store.resolve_secret 的读取约定一致（存得进也读得出）
+    ref = _cfg.secret_key_for(target)
     if not ref:
-        raise HTTPException(status_code=422, detail=f"target '{label}' 未配置 secretRef")
+        raise HTTPException(status_code=422, detail=f"target '{label}' 无法确定 secrets key")
     secrets = _cfg.load_secrets()
     if update.value:
         secrets[ref] = update.value
@@ -8942,7 +8944,9 @@ async def dashboard():
             kv.append(("状态", "预留（未监听）"))
 
         # ── 卡片内联 token 编辑块 ──
-        sec_ref = t.get("secretRef", "")
+        # 直连网关（free/paid）无 secretRef 时退回约定 key f"{label}_token"，
+        # 与 config_store.secret_key_for / PUT /api/secrets/{label} 保持一致
+        sec_ref = _cfg.secret_key_for(t)
         esc_label = t["label"].replace("'", "\\'")
         # 破解环境检测：不可用则置灰 + title 提示
         recrack_btn = ""
@@ -9012,7 +9016,8 @@ async def dashboard():
             label=t["label"],
             port=port,
             meta_badges=meta_badges,
-            can_prune=(t.get("handler") == "copilot"),
+            # 上游是否支持 /models：配置驱动（targets.json hasModels）+ handler 兜底（copilot 系天然支持）
+            can_prune=(t.get("hasModels") is True or t.get("handler") == "copilot"),
         )
         if category == "crack":
             crack_cards.append(card)
@@ -9885,12 +9890,9 @@ async function recrackCard(label, btn) {{
 async function saveCardToken(label, btn) {{
   var row = btn.closest('.token-edit');
   var input = row.querySelector('.te-input');
-  var ref = input.dataset.ref;
+  // 无 secretRef 的直连网关：后端按约定落到 secrets.json 的 "<label>_token"，无需前端拦截
+  var ref = input.dataset.ref || (label + '_token');
   var val = input.value;
-  if (!ref) {{
-    showTeStatus(row, '❌ 该 target 未配置 secretRef', 'danger');
-    return;
-  }}
   if (!val || val === '******') {{
     showTeStatus(row, '⚠️ 请输入新的 token 值', 'warning');
     return;
@@ -9905,7 +9907,8 @@ async function saveCardToken(label, btn) {{
     if (resp.ok) {{
       btn.textContent = '✅ 已保存'; btn.style.background = '#4ade80';
       input.value = '******'; input.placeholder = '已配置，输入新值覆盖';
-      showTeStatus(row, '✅ 已保存，热生效', 'success');
+      var savedRef = (r && r.secretRef) ? r.secretRef : ref;
+      showTeStatus(row, '✅ 已保存到 secrets.json (' + savedRef + ')，热生效；未带 key 的客户端将用它兜底', 'success');
       setTimeout(function() {{ btn.disabled = false; btn.textContent = '保存'; btn.style.background = ''; }}, 2000);
     }} else {{
       btn.disabled = false; btn.textContent = '保存';

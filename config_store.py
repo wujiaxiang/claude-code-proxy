@@ -286,11 +286,27 @@ def mask_secret(value: str) -> str:
     return f"{value[:5]}...{value[-3:]}"
 
 
-def resolve_secret(target: dict, secrets: dict) -> str:
-    """解析 target 的私密 token：secretRef → secrets.json → apikeyEnv 环境变量。"""
+def secret_key_for(target: dict) -> str:
+    """
+    target 在 secrets.json 中的存储 key。
+
+    有 secretRef 用之；无 secretRef（直连网关 free/paid）统一约定 f"{label}_token"，
+    使 dashboard 保存的兜底 token 也能被 resolve_secret 读回（历史上这类 target
+    只能读 apikeyEnv 环境变量，存了读不出）。
+    """
     ref = target.get("secretRef")
-    if ref and secrets.get(ref):
-        return secrets[ref]
+    if ref:
+        return ref
+    label = target.get("label") or ""
+    return f"{label}_token" if label else ""
+
+
+def resolve_secret(target: dict, secrets: dict) -> str:
+    """解析 target 的私密 token：secretRef（或直连网关 f"{label}_token" 约定）
+    → secrets.json → apikeyEnv 环境变量。"""
+    key = secret_key_for(target)
+    if key and secrets.get(key):
+        return secrets[key]
     env_key = target.get("apikeyEnv")
     if env_key:
         return os.environ.get(env_key, "")
