@@ -24,7 +24,8 @@
 | Linux LXC（本机） | `/root/shared-workspace/claude-code-proxy/` | 开发/测试主环境 |
 | Windows Server | `C:\Users\Administrator\claude-code-proxy-main\` | 生产部署（计划任务 `\ClaudeCodeProxy` 登录时触发 VBS） |
 | `.env` / `secrets.json` | 项目根 | 全局配置 / 私密 token（**gitignored**，dashboard 可热编辑） |
-| `proxy.log` | 项目根 | 运行日志 |
+| `proxy.log` | 项目根 | 主运行日志（不含 codebuddy / trae-work 的网关细节，见 §2.1） |
+| `codebuddy.log` / `traework.log` | 项目根 | 网关独立日志（`propagate=False`，**不进 proxy.log**） |
 
 ### 启动 / 重启（Linux 用 systemd）
 
@@ -48,6 +49,38 @@ tail -f /root/shared-workspace/claude-code-proxy/proxy.log
 > systemd 细节：`ExecStart=.venv/bin/python3 server.py`，`Restart=always`（kill -9 也会被自动拉起）、`RestartSec=10`，日志追加到 `proxy.log`。**DEBUG 默认关闭**（无 `debug.conf`、`.env` 不设 `DEBUG`），日志级别为 INFO，`logger.debug()` 不输出——网关独立日志（`codebuddy.log` / `traework.log`）的逐请求诊断也随之静默，仅 INFO 及以上（如热重写命中）仍记录。需要排查时临时开：`systemctl edit claude-code-proxy` 加 `Environment=DEBUG=true` → `systemctl restart` → **查完记得恢复**（DEBUG 会把每个请求体/SSE 统计写盘，长期开启徒增磁盘与噪音）。
 
 > **注意**：代理进程跑在独立 mount namespace，`/tmp` 与 shell 隔离——跨进程共享状态（如 crack_daily 时间戳）放仓库内 `.cache/`，勿用 `/tmp`。
+
+### 2.1 日志分流架构（排查前必读）
+
+日志**不是单一文件**。codebuddy / trae-work 两个网关有独立日志，且 `propagate=False`（不冒泡到 root），**内容不会出现在 proxy.log 里**。查错日志文件是最常见的时间浪费。
+
+| 文件 | 写入方 | 内容 |
+|------|--------|------|
+| `proxy.log` | root logger | 启动诊断、配置热重载、路由、错误码翻译、LiteLLM 翻译层、其他所有端口 |
+| `codebuddy.log` | `codebuddy_logger` | 8084 逐请求 model/stream/system 预览/body 摘要、SSE 帧统计、content_filter 拦截、聚合失败 |
+| `traework.log` | `traework_logger` | 8086 同类细节 |
+
+代码位置：`_setup_gateway_logger()`（server.py ~219）、`_GATEWAY_LOG_SUFFIX` 映射表。新增网关独立日志只需往该表加一行。
+
+**关键：DEBUG 开关决定能看到什么**（`DEBUG` 默认关闭，级别 INFO）：
+
+| 级别 | codebuddy.log 实际内容 |
+|------|----------------------|
+| INFO（默认） | 仅 `warning` 以上——content_filter 拦截、聚合失败。**逐请求日志与 SSE 统计全部静默** |
+| DEBUG | 追加逐请求入站摘要（`model=... stream=... sys[:200]=... body[:300]=...`）、`SSE 透传完成: data_lines=N finish_reasons=[...] normalized=M` |
+
+> **踩过的坑**：默认 INFO 下 `codebuddy.log` 可能长时间零增长（甚至文件 mtime 停在几小时前），这是**预期行为，不是日志链路坏了**。曾据此误判。想看逐请求细节必须先开 DEBUG。
+
+**临时开 DEBUG**（查完务必恢复，否则每个请求体/SSE 统计都写盘）：
+
+```bash
+systemctl edit claude-code-proxy      # 加 Environment=DEBUG=true
+systemctl restart claude-code-proxy
+tail -f codebuddy.log                 # 查
+# 查完：删掉该行 → systemctl restart（或 rm .service.d/override.conf）
+```
+
+轮转：三个文件共用 `LOG_ROTATE_WHEN` / `LOG_ROTATE_INTERVAL` / `LOG_RETENTION_DAYS` 策略（`TimedRotatingFileHandler`）。设了 `LOG_FILE` 时网关日志命名随主日志（`proxy.log` → `proxy-codebuddy.log`），未设时落在 server.py 同目录。
 
 ---
 
@@ -197,6 +230,7 @@ $env:Path = "C:\Program Files\QClaw\v0.2.33.617\resources\git\cmd;C:\Windows\Sys
 
 - **排查 403/9002 错误**（QClaw）：登录态/解密 Key/UA/19000 寄生四步 → [docs/qclaw.md](docs/qclaw.md) §7 排查指南
 - **排查代理不通**：`ss -tlnp | grep :8081` 主端口是否监听 → `tail -20 proxy.log` 查最近日志 → 日志中 `startup diag: QClaw upstream = 200` 表示上游连通
+- **排查 codebuddy / trae-work 网关行为**（请求被拦、SSE 异常、工具调用不识别）：**先看对应的独立日志**（`codebuddy.log` / `traework.log`），不是 proxy.log——两者 `propagate=False` 不互通（见 §2.1）。默认 INFO 下逐请求细节不写盘，需临时开 DEBUG
 - **查看网关额度/签到状态**：dashboard（8081/dashboard）→ 各 crack 卡片状态区；`GET /api/crack/{label}/status` 返回额度/签到/token 到期/最后定时刷新
 - **清理过期模型**：dashboard → 模型区 → "🧹 清理过期模型"按钮（仅 copilot 系显示）；或 `POST /api/targets/{label}/prune-models`
 
