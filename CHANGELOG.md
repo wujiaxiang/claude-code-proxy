@@ -54,6 +54,7 @@
 - `_write_response` 的 `log_sse` 分支从"按 chunk 边界 splitlines 只读诊断"改为"行缓冲逐帧处理"，为规范化提供正确的分帧基础；诊断日志新增 `normalized=N` 计数
 
 ### Changed
+- **8081 模型列表统一数据源（2026-08-05）**：移除硬编码 `_ANTHROPIC_PORT_MODELS`（曾含 `claude-opus-4-20250514` / `claude-sonnet-4-20250514` / `claude-haiku-4-20250514` 三个带日期死名单——无法被 `_resolve_model_alias` 命中，展示但不可用，误导客户端与监控视图）。新增 `_anthropic_port_models()` 动态来自 targets.json 顶层 `models[]`（与 dashboard「模型定义」编辑视图同一数据源），替换 `__proxy_info__` / socket `/v1/models` / FastAPI `list_models()` / dashboard 8081 卡片共 5 处引用；`_build_models_list` 的 `_claude_aliases` 硬编码分支同步改为动态生成（name + aliases 均可命中）。**监控视图新增「别名」列**（`_model_details_html` 正常态表格，数据源含 aliases 字段即渲染，空别名显示 —），监控展示什么 = 编辑视图改什么，彻底消除歧义
 - **dashboard 三个编辑 modal 统一升级到 agg-* 视觉体系（2026-08-05）**：借鉴 8080 聚合配置编辑器（agg-modal）的样式风格与选项便捷性——
   - **模型定义 modal（models-modal）**：窄 modal → `modal-wide`；端口/模型从纯手输改为**联动下拉**（端口下拉带供应商名「8082 · copilot-enterprise」→ 选端口后重建模型下拉只显示该端口真实模型 → 下拉外值自动补「(自定义)」选项）；`openModelsEditor` 并行 fetch `/api/aggregate/config` 注入 `_aggAvailablePorts` 数据源；`onAggPortChange` 选择器兼容 `.mm-row`（聚合编辑器与模型定义联动共用同一套函数）
   - **模型编辑 modal（model-modal）**：搜索框始终置顶、总开关+「共 N 个/已开启 M 个」统计条并入 summary 条、模型列表带边框容器 + hover 态、添加区独立分层；兼容类名（`mrow`/`model-show`/`model-master`/`model-search` 等）全部保留，test_dashboard 契约不变
