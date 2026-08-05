@@ -3,6 +3,13 @@
 ## [Unreleased]
 
 ### Added
+- **配置能力统一 P1**（依据 `docs/config-capability-unification.md` §4）：三个编辑 modal 共享基础设施 + 用户可感知的"改动=生效"反馈
+  - **作用域提示**：每个 modal 顶部新增 `mm-scope` 条，明示「本页改什么、不改什么」——models-modal 影响 8081、agg-modal 影响 8080 聚合、model-modal 仅影响该端口白名单
+  - **保存成功反馈升级**：三个 save 函数统一 `mmMsg()` 提示，并追加「已保存 N 个 X → Y 卡片已更新」
+  - **保存后局部刷新**：新增 `refreshCardDom(port)` 重拉 dashboard HTML、替换目标卡片 DOM、保留手风琴展开态。**不再 `location.reload()`**（仅 prune/recrack/doReload/credentials 仍用全页，符合各自职责）
+  - **悬空引用警示条**：后端新增只读 `GET /api/config/dangling` 扫描 `models[].target` 与 `virtualModels.{vm}.{defaultPool|fallbackPool}[]` 的端口存在性 + 模型白名单匹配；dashboard 顶部 `<div id="dangling-bar">` 由 `loadDanglingBar()` 在初始化与每次保存后拉取渲染，命中项显示 `<code>path</code>` + 原因
+  - **共享 JS 函数**（`mmMsg` / `mmInsertRow` / `mmOwnsNode` / `mmScope`）：四个 add 函数全部走 `mmInsertRow`，三个 save 全部走 `mmMsg`；`mmOwnsNode` 是 Bug 1（嵌套锚点撞名）的双重保险
+  - **顺手重构**：手风琴 IIFE → 具名 `bindCardAccordion`（可重绑，支撑局部刷新）；卡片增加 `data-port` 属性供 `refreshCardDom` 锚点
 - **SSE 帧规范化层（`normalizeSse`，2026-08-05）**：passthrough 端口新增可选的上游 SSE 帧清洗能力，用于修正不合规上游。配置驱动（targets.json `normalizeSse` / `normalizeFinishReason`），不硬编码 label；当前对 codebuddy 启用
   - `_SseLineBuffer`：按 `\n` 切行的缓冲器，重组跨 TCP chunk 的半截 SSE 帧。**纯字节透传时无需要，但一旦要逐帧改写就必须先重组**，否则会切坏 JSON（原诊断逻辑按 chunk 边界 `splitlines()` 只影响日志准确性，改写模式下则会污染数据流）
   - `_normalize_codebuddy_sse_line`：逐帧规范化，清洗**所有空值字段**（`content`/`reasoning_content`/`tool_calls`/`function_call`/`refusal`/`extra_fields`）+ `finish_reason:""` 归一为 `null`；有内容的结构字段严格保留

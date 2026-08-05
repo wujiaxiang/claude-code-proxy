@@ -4027,6 +4027,8 @@ async def _handle_aggregate_request(reader, writer, target, method, path, raw_pa
 
     仅做路由/熔断编排，不解析任何 secretRef/apikeyEnv（聚合层不持有凭据，
     转发目标是本地其他 target 端口，鉴权由那些端口自身处理）。
+    聚合层不透传客户端凭据（authorization/x-api-key）——凭据统一由各下游
+    端口从 secrets.json 解析注入。
     """
     import aggregator as _agg
 
@@ -4066,17 +4068,20 @@ async def _handle_aggregate_request(reader, writer, target, method, path, raw_pa
         or (body_json.get("user") if isinstance(body_json, dict) else None)
     )
 
-    client_auth = headers.get("authorization")
-
     async def send_fn(member, info):
         member_body = dict(body_json)
         member_body["model"] = member.model
         member_body_bytes = json.dumps(member_body, ensure_ascii=False).encode("utf-8")
 
-        fwd_headers = {k: v for k, v in headers.items() if k.lower() not in ("host", "connection", "content-length", "transfer-encoding")}
+        # 聚合层不透传客户端凭据（authorization / x-api-key）：
+        # 转发目标是本地 target 端口，凭据由各下游端口自己从 secrets.json 解析注入
+        # （crack 注入 secretRef、free/paid 客户端未带 key 时用 secrets.json 兜底）。
+        # 客户端连 8080 时带的 key（如 dummy）对聚合层无意义，透传只会覆盖下游
+        # 的真实凭据导致 401。
+        fwd_headers = {k: v for k, v in headers.items()
+                       if k.lower() not in ("host", "connection", "content-length", "transfer-encoding",
+                                            "authorization", "x-api-key")}
         fwd_headers["host"] = f"127.0.0.1:{member.port}"
-        if client_auth:
-            fwd_headers["authorization"] = client_auth
 
         client = await get_http_client()
         req = client.build_request(method, f"http://127.0.0.1:{member.port}{raw_path}", headers=fwd_headers, content=member_body_bytes)
@@ -7647,6 +7652,21 @@ DASHBOARD_STYLE = """
   .agg-vm-retries { display: flex; gap: 12px; flex-wrap: wrap; margin-top: 8px; padding-top: 8px; border-top: 1px dashed var(--border); }
   .agg-vm-retries .agg-field { flex: 1; min-width: 140px; }
 
+  /* ── 三个编辑 modal 共享：作用域提示条（明示"这里改什么、不改什么"）── */
+  .mm-scope { display: flex; align-items: flex-start; gap: 8px; font-size: 11.5px; line-height: 1.55; color: var(--text-secondary); background: rgba(34,211,238,0.06); border: 1px solid rgba(34,211,238,0.20); border-left: 3px solid var(--brand-cyan); border-radius: var(--radius-sm); padding: 8px 12px; margin: 0 0 12px; }
+  .mm-scope .mm-scope-icon { flex-shrink: 0; opacity: 0.85; }
+  .mm-scope b { color: var(--text-primary); font-weight: 600; }
+  .mm-scope .mm-scope-neg { color: var(--text-tertiary); }
+
+  /* ── 悬空引用全局警示条（dashboard 顶部）── */
+  .dangling-bar { display: none; background: rgba(251,191,36,0.08); border: 1px solid rgba(251,191,36,0.30); border-left: 3px solid var(--warning); border-radius: var(--radius-md); padding: 12px 16px; margin-bottom: 18px; }
+  .dangling-bar.show { display: block; }
+  .dangling-bar .dg-head { display: flex; align-items: center; gap: 8px; font-size: 13px; font-weight: 600; color: var(--warning); margin-bottom: 6px; }
+  .dangling-bar .dg-count { font-size: 11px; font-weight: 500; color: var(--text-tertiary); margin-left: auto; }
+  .dangling-bar ul { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 4px; }
+  .dangling-bar li { font-size: 12px; color: var(--text-secondary); line-height: 1.5; }
+  .dangling-bar li code { font-family: var(--font-mono); font-size: 11.5px; color: var(--text-primary); background: rgba(148,163,184,0.12); border-radius: 4px; padding: 1px 5px; margin-right: 6px; }
+
   /* ── 卡片内联 token 编辑 ── */
   .token-edit { margin-top: 8px; padding-top: 8px; border-top: 1px dashed rgba(148,163,184,0.16); }
   .te-status { font-size: 12px; color: var(--text-secondary); margin-bottom: 6px; }
@@ -8025,8 +8045,15 @@ def _model_details_html(models, model_stats=None, label=None, edit_mode=False, c
             'oninput="filterModels(this)" aria-label="搜索模型">'
             '</div>'
         )
+        # 作用域提示（docs §2.4.1）：明示本页只是该端口的透传白名单
+        scope = (
+            '<div class="mm-scope"><span class="mm-scope-icon">i</span><span>'
+            f'<b>本页仅控制 {_html_escape(label or "")} 端口的透传白名单（开关=是否对外暴露）。</b>'
+            ' <span class="mm-scope-neg">不影响其他端口，也不改变 8081 模型定义与 8080 聚合路由。</span>'
+            '</span></div>'
+        )
         return (
-            f'{search}<div class="model-editor-summary">{master}{hint}</div>'
+            f'{scope}{search}<div class="model-editor-summary">{master}{hint}</div>'
             f'<div class="model-editor-list">{rows_html}</div>'
             f'<div class="model-editor-add">{add_row}</div>'
             f'<div class="model-msg" data-label="{esc_label}"></div>'
@@ -8207,7 +8234,7 @@ def _build_card_html(name, note, kind_badge, status_badge, status_badge_class,
     model_html = _model_details_html(models, model_stats, label, edit_mode=False, can_prune=can_prune, col_429=col_429) if models is not None else ""
     card_class = f'card {accent_class}'.strip()
 
-    return f"""<div class="{card_class}" data-label="{_html_escape(label or '')}">
+    return f"""<div class="{card_class}" data-label="{_html_escape(label or '')}" data-port="{port or ''}">
   {header_html}
   <div class="card-detail">
   <div class="kv">{kv}</div>
@@ -8272,6 +8299,94 @@ async def api_update_models(update: ModelsUpdate):
     _cfg.save_targets(cfg)
     await _reload_targets()
     return {"ok": True}
+
+
+def _scan_dangling_refs() -> List[dict]:
+    """扫描配置中的悬空引用（引用了不存在的端口 / 虚拟模型 / 模型名）。
+
+    只读诊断，不修改任何配置。改名后引用方不联动是有意设计（见
+    docs/config-capability-unification.md §5「明确不做的事」第 4 条：不做自动改名
+    联动），本函数负责把"引用断了"这件事显式暴露到 dashboard 顶部警示条，
+    而不是让用户在请求失败时才发现。
+
+    检查两类引用：
+      1. 顶层 models[].target → {port, model}：端口是否存在、该端口是否提供此模型
+      2. aggregator.virtualModels[vm].defaultPool/fallbackPool[] → {port, model}：同上
+
+    端口集合含所有 enabled target 的 listenPort；聚合网关（8080）的"模型"为其
+    virtualModels 的 key（agg:xxx），故链式聚合引用也能正确校验。
+
+    模型名校验采取保守策略：仅当该端口**显式配置了非空白名单**时才判定模型悬空
+    （空 models[] 表示不限制透传，任何模型名都合法，不应误报）。
+
+    返回 [{"path": ..., "msg": ...}]，path 形如 models[2].target 便于前端定位。
+    """
+    items: List[dict] = []
+    # 端口 → 该端口可被请求的模型名集合（None 表示不限制，不做模型级校验）
+    port_models: Dict[int, Optional[set]] = {}
+    port_labels: Dict[int, str] = {}
+    for t in _TARGETS:
+        port_num = t.get("listenPort")
+        if port_num is None:
+            continue
+        port_labels[port_num] = t.get("label") or t.get("name") or str(port_num)
+        if t.get("handler") == "aggregator":
+            port_models[port_num] = set((t.get("virtualModels") or {}).keys())
+            continue
+        names = set()
+        for m in (t.get("models") or []):
+            if isinstance(m, dict):
+                mid = m.get("id") or m.get("name")
+                if mid:
+                    names.add(mid)
+            elif isinstance(m, str):
+                names.add(m)
+        # 空白名单 = 不限制透传，模型级校验跳过（None 而非空集合，避免全量误报）
+        port_models[port_num] = names or None
+
+    def _check(path: str, ref: dict, what: str) -> None:
+        port = ref.get("port")
+        model = ref.get("model")
+        if port is None:
+            return
+        try:
+            port_i = int(port)
+        except (TypeError, ValueError):
+            items.append({"path": path, "msg": f"{what} 的端口 {port!r} 不是合法端口号"})
+            return
+        if port_i not in port_models:
+            items.append({"path": path, "msg": f"{what} 指向端口 {port_i}，但该端口未在 targets.json 中定义（或已禁用）"})
+            return
+        known = port_models[port_i]
+        if model and known is not None and model not in known:
+            plabel = port_labels.get(port_i, str(port_i))
+            items.append({"path": path, "msg": f"{what} 指向 {port_i}（{plabel}）的模型 {model}，但该端口未提供此模型"})
+
+    for idx, m in enumerate(_MODELS_CFG.get("models", []) or []):
+        if not isinstance(m, dict):
+            continue
+        ref = m.get("target")
+        if isinstance(ref, dict):
+            _check(f"models[{idx}].target", ref, f"模型定义 {m.get('name') or idx}")
+
+    for t in _TARGETS:
+        if t.get("handler") != "aggregator":
+            continue
+        for vmid, vm in (t.get("virtualModels") or {}).items():
+            if not isinstance(vm, dict):
+                continue
+            for pool_key in ("defaultPool", "fallbackPool"):
+                for i, mem in enumerate(vm.get(pool_key) or []):
+                    if isinstance(mem, dict):
+                        _check(f"virtualModels.{vmid}.{pool_key}[{i}]", mem, f"虚拟模型 {vmid} 的{'默认池' if pool_key == 'defaultPool' else '降级池'}成员")
+
+    return items
+
+
+@app.get("/api/config/dangling")
+async def api_get_dangling():
+    """只读：返回配置中的悬空引用列表，供 dashboard 顶部警示条展示。"""
+    return {"items": _scan_dangling_refs()}
 
 
 @app.get("/api/aggregate/config")
@@ -9091,6 +9206,7 @@ async def dashboard():
     </div>
     <span id="ov-msg" class="ov-msg" role="status"></span>
   </div>
+  <div class="dangling-bar" id="dangling-bar" role="status" aria-live="polite"></div>
   {cards_html}
 
   <!-- 模型编辑 modal -->
@@ -9143,19 +9259,112 @@ async def dashboard():
 
 
 <script>
+// ═══ 三个编辑 modal 共享基础设施（mm* 前缀，docs §2.2）═══
+// 统一消息提示：kind ∈ ok | warn | err | info
+function mmMsg(el, kind, text) {{
+  if (!el) return;
+  var K = {{ok: "success", warn: "danger", err: "danger", info: ""}};
+  el.textContent = text || "";
+  el.className = "modal-msg " + (K[kind] !== undefined ? K[kind] : "");
+}}
+
+// 统一行插入：永远插在 section 末尾的添加按钮行之前。
+// anchorSel 必须是该 section 专属类名，避免嵌套同类按钮撞名（Bug 1 根因）。
+function mmInsertRow(section, rowHtml, anchorSel) {{
+  if (!section || !rowHtml) return null;
+  var anchor = null;
+  if (anchorSel) {{
+    var cands = section.querySelectorAll(anchorSel);
+    for (var i = 0; i < cands.length; i++) {{
+      if (mmOwnsNode(section, cands[i], anchorSel)) {{ anchor = cands[i]; break; }}
+    }}
+  }}
+  if (anchor) {{ anchor.insertAdjacentHTML("beforebegin", rowHtml); return anchor.previousElementSibling; }}
+  section.insertAdjacentHTML("beforeend", rowHtml);
+  return section.lastElementChild;
+}}
+
+// node 是否"属于"section 本层：node 与 section 之间不得夹着另一个同类锚点容器。
+// 用于 agg-modal 这类嵌套结构（虚拟模型块内还有成员添加行）。
+function mmOwnsNode(section, node, anchorSel) {{
+  var p = node.parentNode;
+  while (p && p !== section) {{
+    if (p.matches && p.matches(".agg-vm, .agg-pool")) return false;
+    p = p.parentNode;
+  }}
+  return p === section;
+}}
+
+// 作用域提示条：明示本 modal 改什么、不改什么（§2.4.1）。
+function mmScope(doesText, notText) {{
+  var h = '<div class="mm-scope"><span class="mm-scope-icon">i</span><span><b>';
+  h += escHtml(doesText) + '</b>';
+  if (notText) h += ' <span class="mm-scope-neg">' + escHtml(notText) + '</span>';
+  h += '</span></div>';
+  return h;
+}}
+
+// ── 悬空引用警示条（§2.4.4）：只读诊断，改名后引用断了要看得见 ──
+async function loadDanglingBar() {{
+  var bar = document.getElementById('dangling-bar');
+  if (!bar) return;
+  try {{
+    var resp = await fetch('/api/config/dangling');
+    if (!resp.ok) return;
+    var r = await resp.json();
+    var items = (r && r.items) || [];
+    if (!items.length) {{ bar.classList.remove('show'); bar.innerHTML = ''; return; }}
+    var h = '<div class="dg-head"><span>配置存在悬空引用</span>';
+    h += '<span class="dg-count">' + items.length + ' 处</span></div><ul>';
+    items.forEach(function(it) {{
+      h += '<li><code>' + escHtml(it.path || '') + '</code>' + escHtml(it.msg || '') + '</li>';
+    }});
+    h += '</ul>';
+    bar.innerHTML = h;
+    bar.classList.add('show');
+  }} catch (e) {{ /* 诊断性功能，失败静默不打扰主流程 */ }}
+}}
+
+// ── 保存后局部刷新（§2.4.3）：重拉 dashboard HTML，只替换目标卡片 DOM ──
+// 不整页刷新：保留手风琴展开状态与滚动位置，用户能立刻看到"我改的生效了"。
+async function refreshCardDom(port) {{
+  try {{
+    var resp = await fetch(location.pathname, {{headers: {{'Cache-Control': 'no-cache'}}}});
+    if (!resp.ok) return false;
+    var html = await resp.text();
+    var doc = new DOMParser().parseFromString(html, 'text/html');
+    var sel = '.card[data-port="' + port + '"]';
+    var fresh = doc.querySelector(sel);
+    var cur = document.querySelector(sel);
+    if (!fresh || !cur) return false;
+    // 保留当前展开态：新 DOM 是服务端默认（收起）状态
+    var wasOpen = !!cur.querySelector('.card-detail.open');
+    cur.replaceWith(fresh);
+    if (wasOpen) {{
+      var d = fresh.querySelector('.card-detail');
+      var a = fresh.querySelector('.ct-arrow');
+      var t = fresh.querySelector('.card-toggle');
+      if (d) d.classList.add('open');
+      if (a) a.classList.add('open');
+      if (t) t.setAttribute('aria-expanded', 'true');
+    }}
+    bindCardAccordion(fresh);
+    return true;
+  }} catch (e) {{ return false; }}
+}}
+
 // ── 手风琴交互（互斥，任一时刻只展开一个）──
-(function() {{
-  var cards = document.querySelectorAll('.card');
-  cards.forEach(function(card) {{
+// 具名函数而非 IIFE：局部刷新替换卡片 DOM 后要能重新绑定。
+function bindCardAccordion(scope) {{
+  var list = scope ? [scope] : Array.prototype.slice.call(document.querySelectorAll('.card'));
+  list.forEach(function(card) {{
     var toggle = card.querySelector('.card-toggle');
     var detail = card.querySelector('.card-detail');
-    var arrow = toggle ? toggle.querySelector('.ct-arrow') : null;
-    if (!toggle || !detail) return;
-
+    if (!toggle || !detail || toggle._accBound) return;
+    toggle._accBound = true;
     toggle.addEventListener('click', function() {{
       var isOpen = detail.classList.contains('open');
-      // 关闭所有卡片
-      cards.forEach(function(c) {{
+      document.querySelectorAll('.card').forEach(function(c) {{
         var d = c.querySelector('.card-detail');
         var a = c.querySelector('.ct-arrow');
         var t = c.querySelector('.card-toggle');
@@ -9163,15 +9372,16 @@ async def dashboard():
         if (a) a.classList.remove('open');
         if (t) t.setAttribute('aria-expanded', 'false');
       }});
-      // 打开当前卡片（如果之前是关闭的）
       if (!isOpen) {{
         detail.classList.add('open');
+        var arrow = toggle.querySelector('.ct-arrow');
         if (arrow) arrow.classList.add('open');
         toggle.setAttribute('aria-expanded', 'true');
       }}
     }});
   }});
-}})();
+}}
+bindCardAccordion();
 
 // ── 模型编辑 modal：打开（fetch 编辑态 HTML 填入 modal）──
 async function openModelEditor(btn) {{
@@ -9271,17 +9481,20 @@ async function saveModelEditor(btn) {{
     }});
     var r = await resp.json();
     if (resp.ok) {{
-      msg.textContent = '✅ 已保存，热生效';
-      msg.className = 'modal-msg success';
-      setTimeout(function() {{ location.reload(); }}, 800);
+      var _onN = models.filter(function(m) {{ return m.enabled; }}).length;
+      mmMsg(msg, 'ok', '✅ 已保存 ' + models.length + ' 个模型（开启 ' + _onN + ' 个）→ ' + label + ' 卡片已更新');
+      var _port = (document.querySelector('.card[data-label="' + label + '"]') || {{}}).dataset;
+      if (_port && _port.port) await refreshCardDom(_port.port);
+      setTimeout(function() {{
+        closeModelEditor();
+        btn.disabled = false; btn.textContent = '保存';
+      }}, 1200);
     }} else {{
-      msg.textContent = '❌ 保存失败: ' + JSON.stringify(r.detail || r);
-      msg.className = 'modal-msg danger';
+      mmMsg(msg, 'err', '❌ 保存失败: ' + JSON.stringify(r.detail || r));
       btn.disabled = false; btn.textContent = '保存';
     }}
   }} catch (e) {{
-    msg.textContent = '❌ 保存异常: ' + e;
-    msg.className = 'modal-msg danger';
+    mmMsg(msg, 'err', '❌ 保存异常: ' + e);
     btn.disabled = false; btn.textContent = '保存';
   }}
 }}
@@ -9389,12 +9602,9 @@ function addModelRow() {{
     '</label>' +
     '<button class="mrow-del" onclick="removeModelRow(this)" title="删除此模型">×</button>' +
     '</div>';
-  var addRow = body.querySelector('.mrow-add');
-  if (addRow) {{
-    addRow.insertAdjacentHTML('beforebegin', html);
-  }} else {{
-    body.insertAdjacentHTML('beforeend', html);
-  }}
+  // 列表容器优先：.mrow-add 在 .model-editor-add 内，与行列表不同层
+  var list = body.querySelector('.model-editor-list') || body;
+  mmInsertRow(list, html, '.mrow-add');
   var nm = body.querySelector('.no-models');
   if (nm) nm.remove();
   if (input) input.value = '';
@@ -9431,7 +9641,9 @@ async function openModelsEditor(btn) {{
 
 function buildModelsEditorHtml(r) {{
   var models = r.models || [];
-  var html = '<div class="mm-hint">模型定义：name 为主模型名（请求可直接用它），aliases 为额外别名（逗号分隔），target 指定最终下游端口与真实模型（可填聚合虚拟模型 agg:xxx）。未匹配任何定义的模型名将走 modelDefaults.defaultPort 原样透传。</div>';
+  var html = mmScope('本页定义 8081 的模型别名 → 下游端口+真实模型，保存后立即出现在 8081 卡片。',
+    '不影响各 target 端口自身的透传白名单，也不改变 8080 聚合路由。');
+  html += '<div class="mm-hint">模型定义：name 为主模型名（请求可直接用它），aliases 为额外别名（逗号分隔），target 指定最终下游端口与真实模型（可填聚合虚拟模型 agg:xxx）。未匹配任何定义的模型名将走 modelDefaults.defaultPort 原样透传。</div>';
   html += '<div class="agg-section"><div class="agg-section-title">默认转发端口</div><div class="agg-fields">' +
     '<label class="agg-field">' +
     '  <span class="agg-label">modelDefaults.defaultPort（未命中定义的兜底端口）</span>' +
@@ -9469,10 +9681,7 @@ function modelsRowHtml(name, aliases, port, model) {{
 function addModelsRow() {{
   var body = document.getElementById('models-modal-body');
   if (!body) return;
-  var addRow = body.querySelector('.agg-add-row');
-  var html = modelsRowHtml('', '', '', '');
-  if (addRow) {{ addRow.insertAdjacentHTML('beforebegin', html); }}
-  else {{ body.insertAdjacentHTML('beforeend', html); }}
+  mmInsertRow(body, modelsRowHtml('', '', '', ''), '.agg-add-row');
 }}
 
 function removeModelsRow(btn) {{
@@ -9492,7 +9701,7 @@ async function saveModelsEditor(btn) {{
   var defaultPortEl = body.querySelector('.md-default-port');
   var defaultPort = defaultPortEl ? defaultPortEl.value.trim() : '';
   if (defaultPort === '' || isNaN(Number(defaultPort)) || Number(defaultPort) < 0 || Number(defaultPort) % 1 !== 0) {{
-    msg.textContent = '⚠️ defaultPort 必须为非负整数'; msg.className = 'modal-msg danger';
+    mmMsg(msg, 'err', '⚠️ defaultPort 必须为非负整数');
     return;
   }}
   var models = [];
@@ -9508,11 +9717,11 @@ async function saveModelsEditor(btn) {{
     var p = (pEl ? pEl.value : '').trim();
     var m = (mEl ? mEl.value : '').trim();
     if (!n && !a && !p && !m) return;
-    if (!n) {{ msg.textContent = '⚠️ 模型名不能为空'; msg.className = 'modal-msg danger'; bad = true; return; }}
+    if (!n) {{ mmMsg(msg, 'err', '⚠️ 模型名不能为空'); bad = true; return; }}
     if (p === '' || isNaN(Number(p)) || Number(p) < 0 || Number(p) % 1 !== 0) {{
-      msg.textContent = '⚠️ 模型 ' + n + ' 的下游端口必须为非负整数'; msg.className = 'modal-msg danger'; bad = true; return;
+      mmMsg(msg, 'err', '⚠️ 模型 ' + n + ' 的下游端口必须为非负整数'); bad = true; return;
     }}
-    if (!m) {{ msg.textContent = '⚠️ 模型 ' + n + ' 的真实模型不能为空'; msg.className = 'modal-msg danger'; bad = true; return; }}
+    if (!m) {{ mmMsg(msg, 'err', '⚠️ 模型 ' + n + ' 的真实模型不能为空'); bad = true; return; }}
     var aliases = a ? a.split(',').map(function(x) {{ return x.trim(); }}).filter(function(x) {{ return x; }}) : [];
     models.push({{name: n, aliases: aliases, target: {{port: Number(p), model: m}}}});
   }});
@@ -9525,11 +9734,15 @@ async function saveModelsEditor(btn) {{
   }});
   var r = await resp.json();
   if (!resp.ok) {{
-    msg.textContent = '⚠️ 保存失败: ' + (r.detail || JSON.stringify(r)); msg.className = 'modal-msg danger';
+    mmMsg(msg, 'err', '⚠️ 保存失败: ' + (r.detail || JSON.stringify(r)));
     return;
   }}
-  msg.textContent = '✅ 已保存'; msg.className = 'modal-msg success';
-  setTimeout(function() {{ closeModelsEditor(); }}, 800);
+  // 生效位置提示（docs §2.4.2）：显示实际保存条目数 + 改动出现在哪
+  mmMsg(msg, 'ok', '✅ 已保存 ' + models.length + ' 个模型定义 → 已在 8081 卡片显示');
+  // 局部刷新 8081 卡片（§2.4.3）：不整页刷新，用户立刻能对上数字
+  await refreshCardDom(8081);
+  loadDanglingBar();
+  setTimeout(function() {{ closeModelsEditor(); }}, 1200);
 }}
 
 // ── 聚合网关（8080）配置编辑 modal ──
@@ -9678,7 +9891,9 @@ function buildAggConfigHtml(r) {{
   // 注入全局缓存，供 aggPortSelectHtml / aggModelSelectHtml 使用
   _aggAvailablePorts = r.availablePorts || {{}};
   var pd = r.poolDefaults || {{}};
-  var html = '<div class="agg-hint">虚拟模型池配置：成员端口指向本地真实网关端口，模型为上游模型名（可填 agg:xxx 链式聚合）。' +
+  var html = mmScope('本页配置仅影响 8080 聚合网关的虚拟模型路由，保存后引擎热重载。',
+    '不改变 8081 模型列表，也不改变各下游端口自身的模型白名单。');
+  html += '<div class="agg-hint">虚拟模型池配置：成员端口指向本地真实网关端口，模型为上游模型名（可填 agg:xxx 链式聚合）。' +
     '权重与重试留空 = 继承池默认值；保存后热生效。</div>';
   html += '<div class="agg-section"><div class="agg-section-title">池默认值 poolDefaults</div><div class="agg-fields">' +
     aggNumField('defaultRetries', 'defaultRetries', pd.defaultRetries, '如 2') +
@@ -9706,9 +9921,8 @@ function addAggVm() {{
   var html = aggVmBlock('', {{defaultPool: [], fallbackPool: []}});
   // 锚点必须用专属类名 agg-vm-add：section 内每个虚拟模型块还含「+ 添加成员」
   // 等同类 .mm-add-btn 按钮，querySelector('.mm-add-btn') 会取到第一个（嵌套插错位置）。
-  var addBtn = section.querySelector('.agg-vm-add');
-  if (addBtn) {{ addBtn.insertAdjacentHTML('beforebegin', html); }}
-  else {{ section.insertAdjacentHTML('beforeend', html); }}
+  // mmInsertRow 额外做本层归属校验（mmOwnsNode），双重保险。
+  mmInsertRow(section, html, '.agg-vm-add');
   var ids = body.querySelectorAll('.agg-vm-id');
   if (ids.length) ids[ids.length - 1].focus();
 }}
@@ -9722,9 +9936,7 @@ function addAggPoolMember(btn, poolKey) {{
   var pool = btn.closest('.agg-pool');
   if (!pool) return;
   var html = aggPoolMemberRow('', '', '', poolKey || (pool.dataset ? pool.dataset.pool : ''));
-  var addRow = pool.querySelector('.agg-add-row');
-  if (addRow) {{ addRow.insertAdjacentHTML('beforebegin', html); }}
-  else {{ pool.insertAdjacentHTML('beforeend', html); }}
+  mmInsertRow(pool, html, '.agg-add-row');
 }}
 
 function removeAggPoolMember(btn) {{
@@ -9745,7 +9957,7 @@ async function saveAggConfig(btn) {{
     if (v === '') return;
     var n = Number(v);
     if (isNaN(n) || n < 0) {{
-      msg.textContent = '⚠️ poolDefaults.' + key + ' 必须为非负数字'; msg.className = 'modal-msg danger';
+      mmMsg(msg, 'err', '⚠️ poolDefaults.' + key + ' 必须为非负数字');
       bad = true; return;
     }}
     poolDefaults[key] = n;
@@ -9758,7 +9970,7 @@ async function saveAggConfig(btn) {{
       var vid = (idEl ? idEl.value : '').trim();
       if (!vid) return;  // 空 id 块忽略
       if (virtualModels[vid]) {{
-        msg.textContent = '⚠️ 虚拟模型 id 重复: ' + vid; msg.className = 'modal-msg danger';
+        mmMsg(msg, 'err', '⚠️ 虚拟模型 id 重复: ' + vid);
         bad = true; return;
       }}
       var entry = {{}};
@@ -9777,11 +9989,11 @@ async function saveAggConfig(btn) {{
             var w = (wEl ? wEl.value : '').trim();
             if (!port && !model && !w) return;  // 空行忽略
             if (port === '' || isNaN(Number(port)) || Number(port) < 0) {{
-              msg.textContent = '⚠️ 虚拟模型 ' + vid + ' 的成员端口必须为非负整数'; msg.className = 'modal-msg danger';
+              mmMsg(msg, 'err', '⚠️ 虚拟模型 ' + vid + ' 的成员端口必须为非负整数');
               bad = true; return;
             }}
             if (!model) {{
-              msg.textContent = '⚠️ 虚拟模型 ' + vid + ' 的成员模型名不能为空'; msg.className = 'modal-msg danger';
+              mmMsg(msg, 'err', '⚠️ 虚拟模型 ' + vid + ' 的成员模型名不能为空');
               bad = true; return;
             }}
             var mem = {{port: Number(port), model: model}};
@@ -9789,7 +10001,7 @@ async function saveAggConfig(btn) {{
             if (w !== '') {{
               var wn = Number(w);
               if (isNaN(wn) || wn < 0) {{
-                msg.textContent = '⚠️ 虚拟模型 ' + vid + ' 的成员权重必须为非负数字'; msg.className = 'modal-msg danger';
+                mmMsg(msg, 'err', '⚠️ 虚拟模型 ' + vid + ' 的成员权重必须为非负数字');
                 bad = true; return;
               }}
               mem.weight = wn;
@@ -9807,7 +10019,7 @@ async function saveAggConfig(btn) {{
       if (dr !== '') {{
         var drn = Number(dr);
         if (isNaN(drn) || drn < 0 || drn % 1 !== 0) {{
-          msg.textContent = '⚠️ 虚拟模型 ' + vid + ' 的 defaultRetries 必须为非负整数'; msg.className = 'modal-msg danger';
+          mmMsg(msg, 'err', '⚠️ 虚拟模型 ' + vid + ' 的 defaultRetries 必须为非负整数');
           bad = true; return;
         }}
         entry.defaultRetries = drn;
@@ -9815,7 +10027,7 @@ async function saveAggConfig(btn) {{
       if (fr !== '') {{
         var frn = Number(fr);
         if (isNaN(frn) || frn < 0 || frn % 1 !== 0) {{
-          msg.textContent = '⚠️ 虚拟模型 ' + vid + ' 的 fallbackRetries 必须为非负整数'; msg.className = 'modal-msg danger';
+          mmMsg(msg, 'err', '⚠️ 虚拟模型 ' + vid + ' 的 fallbackRetries 必须为非负整数');
           bad = true; return;
         }}
         entry.fallbackRetries = frn;
@@ -9825,7 +10037,7 @@ async function saveAggConfig(btn) {{
   }}
   if (bad) return;
   if (Object.keys(virtualModels).length === 0) {{
-    msg.textContent = '⚠️ 至少需要一个虚拟模型'; msg.className = 'modal-msg danger';
+    mmMsg(msg, 'err', '⚠️ 至少需要一个虚拟模型');
     return;
   }}
   var payload = {{virtualModels: virtualModels}};
@@ -9838,16 +10050,22 @@ async function saveAggConfig(btn) {{
     }});
     var r = await resp.json();
     if (resp.ok) {{
-      msg.textContent = '✅ 已保存，聚合引擎热重载'; msg.className = 'modal-msg success';
+      var _vmN = Object.keys(virtualModels).length;
+      mmMsg(msg, 'ok', '✅ 已保存 ' + _vmN + ' 个虚拟模型 → 聚合路由已热重载（8080 卡片已更新）');
       btn.textContent = '✅ 已保存'; btn.style.background = '#4ade80';
-      setTimeout(function() {{ location.reload(); }}, 2000);
+      await refreshCardDom(8080);
+      loadDanglingBar();
+      setTimeout(function() {{
+        closeAggConfigEditor();
+        btn.disabled = false; btn.textContent = '保存'; btn.style.background = '';
+      }}, 1200);
     }} else {{
       var errs = Array.isArray(r.detail) ? r.detail.join('；') : JSON.stringify(r.detail || r);
-      msg.textContent = '❌ 保存失败: ' + errs; msg.className = 'modal-msg danger';
+      mmMsg(msg, 'err', '❌ 保存失败: ' + errs);
       btn.disabled = false; btn.textContent = '保存'; btn.style.background = '';
     }}
   }} catch (e) {{
-    msg.textContent = '❌ 保存异常: ' + e; msg.className = 'modal-msg danger';
+    mmMsg(msg, 'err', '❌ 保存异常: ' + e);
     btn.disabled = false; btn.textContent = '保存'; btn.style.background = '';
   }}
 }}
@@ -9967,6 +10185,7 @@ async function doReload() {{
 
 // ── 初始化 ──
 bindModelEvents();
+loadDanglingBar();
 
 // ── 破解网关：凭据管理弹窗（schema 驱动，表单/JSON 双模式）──
 var credModal = null;

@@ -1,6 +1,6 @@
 # 配置能力统一架构设计（P1/P2 待实施）
 
-> **状态**：已设计、未实施。P0（Bug 1 修复）已完成于 commit 588e83b。
+> **状态**：P0 ✅ (588e83b) · **P1 ✅ 已实施**（见下方实施记录）· P2 待实施。
 > **日期**：2026-08-05 · **设计**：Oracle 架构评审 · **记录**：主会话
 > 本文档是 P1/P2 阶段的实施蓝图，接手的会话以此为准。
 
@@ -127,16 +127,27 @@ async def _get_target_models(label) -> { models, source, error }
 ### P0 ✅ 已完成（commit 588e83b）
 Bug 1 修复：`agg-vm-add` 专属类名 + 锚点。核查 addAggPoolMember/addModelsRow/addModelRow 无同类隐患。
 
-### P1：能力统一（Short，1-4h）
+### P1：能力统一（Short，1-4h）✅ 已实施
 **目标**：减混淆 + "改动=生效"可感知，不动数据结构。
-1. 三个 modal 顶部作用域提示文案（纯 HTML）
-2. 保存成功 msg 追加生效位置 + 条目数
-3. 保存成功后局部刷新对应卡片 DOM（不整页刷新）
-4. dashboard 顶部悬空引用警示条（后端新增只读 `/api/config/dangling`，扫描 models[].target 与 virtualModels 引用）
-5. 共享 `mmMsg` / `mmInsertRow` 两个 JS 函数，三个 modal 替换调用（不统一 mmRow/mmValidate，那是 P2）
+
+实际交付：
+1. 三个 modal 顶部作用域提示文案：`buildModelsEditorHtml` / `buildAggConfigHtml` / `_model_details_html(edit_mode)` 各加 `mm-scope` 条
+2. 保存成功 msg 追加条目数 + 生效位置：三个 save 函数统一改 `mmMsg(msg, 'ok', ...)` 并写明「已保存 N 个 X → Y 卡片已更新」
+3. 保存成功后局部刷新：新 `refreshCardDom(port)` 重拉 dashboard HTML、替换目标卡片 DOM、保留展开态，**不再 `location.reload()`**（仅 prune/recrack/doReload/credentials 仍用全页）
+4. 悬空引用警示条：后端 `GET /api/config/dangling` 只读扫描 `models[].target` 与 `virtualModels.{vm}.{defaultPool|fallbackPool}[]` 的端口存在性与模型白名单匹配；dashboard 顶部 `<div id="dangling-bar">` 由 `loadDanglingBar()` 在初始化与每次保存后拉取渲染
+5. 共享 `mmMsg` / `mmInsertRow`（+ 嵌套归属守卫 `mmOwnsNode` / `mmScope`）四个 JS 函数：`addModelsRow` / `addAggPoolMember` / `addAggVm` / `addModelRow` 全部走 `mmInsertRow`，三个 save 全部走 `mmMsg`
+6. 顺手重构：手风琴 IIFE → 具名 `bindCardAccordion`（可重绑，支撑局部刷新）、卡片 `data-port` 属性（refreshCardDom 锚点）
+
+**实测验证**（Playwright）：
+- 打开三个 modal → 顶部均显示作用域文案（包含 + 不影响双段）
+- `addModelsRow` / `addAggPoolMember` / `addAggVm` / `addModelRow` 各自行均插入到正确锚点之前，**Bug 1 嵌套撞名不再发生**（`mmOwnsNode` 双重保险）
+- 在 `models[]` 新增 `__p1_probe` 并保存 → msg 显示「✅ 已保存 4 个模型定义 → 已在 8081 卡片显示」、卡片 KV「模型数量 3 → 4」、表格 4 行、`body.dataset.p1probe` 标记存活（**证明无整页刷新**）
+- 改 `__p1_probe.target.port = 9999` 后 `loadDanglingBar()` 立即渲染黄色警示条，`<code>` 标签内显示路径 `models[3].target`
+- 还原配置后警示条自动隐藏
+
+**测试**：`test_targets_schema.py` 30/30 ✅；`test_dashboard.py` 27/30 ✅（3 项失败 `test_edit_modal_fallback_no_key` / `test_gemini_native_badge` / `test_model_whitelist_editor` 为 main 基线预存在，与 P1 无关）
 
 **风险**：低。改动集中 dashboard 渲染与 JS，不改配置读写路径。
-**验证**：`pytest test_dashboard.py test_targets_schema.py` 全绿；手动保存 models[] 后 8081 卡片数字立即更新；改名 vm 后顶部警示条出现。
 
 ### P2：架构收敛（Medium，1-2d）
 **目标**：校验与模型来源的单一事实源。**做之前先确认 P1 已稳定**。
@@ -184,3 +195,4 @@ Bug 1 修复：`agg-vm-add` 专属类名 + 锚点。核查 addAggPoolMember/addM
 - `5441ddc` fix(dashboard): 聚合网关 8080 纳入 availablePorts
 - `fd2c0bd` refactor(dashboard): 移除 8081 硬编码模型死名单
 - `cd1c9f4` feat(dashboard): 三个编辑 modal 统一升级 agg-* 视觉体系 + crack x-api-key 修复
+- **P1（本次）** feat(dashboard): 配置能力统一 P1 — 作用域提示 / mmMsg+mmInsertRow 共享函数 / 保存后局部刷新(无整页刷新) / 悬空引用警示条(/api/config/dangling)
