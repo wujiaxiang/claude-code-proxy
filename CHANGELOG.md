@@ -53,7 +53,14 @@
 - **`scripts/cron/trae_work_daily.sh`**（死代码）：功能早已被 `crack_daily.py` 的 `daily_traework()` 完全覆盖且实现更优（旧脚本无脑调 `--claim`，新实现先 `checkin_status()` 判断今日是否已签到，幂等）。crontab / systemd / 代码均无引用，唯一作用是让人误以为 trae 签到归它管。同步清理 `docs/trae-work.md` 两处过时引用（§6.3 自动续期、代码位置表）
 - `_write_response` 的 `log_sse` 分支从"按 chunk 边界 splitlines 只读诊断"改为"行缓冲逐帧处理"，为规范化提供正确的分帧基础；诊断日志新增 `normalized=N` 计数
 
+### Changed
+- **dashboard 三个编辑 modal 统一升级到 agg-* 视觉体系（2026-08-05）**：借鉴 8080 聚合配置编辑器（agg-modal）的样式风格与选项便捷性——
+  - **模型定义 modal（models-modal）**：窄 modal → `modal-wide`；端口/模型从纯手输改为**联动下拉**（端口下拉带供应商名「8082 · copilot-enterprise」→ 选端口后重建模型下拉只显示该端口真实模型 → 下拉外值自动补「(自定义)」选项）；`openModelsEditor` 并行 fetch `/api/aggregate/config` 注入 `_aggAvailablePorts` 数据源；`onAggPortChange` 选择器兼容 `.mm-row`（聚合编辑器与模型定义联动共用同一套函数）
+  - **模型编辑 modal（model-modal）**：搜索框始终置顶、总开关+「共 N 个/已开启 M 个」统计条并入 summary 条、模型列表带边框容器 + hover 态、添加区独立分层；兼容类名（`mrow`/`model-show`/`model-master`/`model-search` 等）全部保留，test_dashboard 契约不变
+  - **凭据 modal（cred-modal）**：独立 `cred-*` 旧体系（圆角 14px 与 modal 16px 不一致、固定 560px 宽）并入标准 `modal-overlay > modal` 体系；`cred-field` 对齐 `agg-field` 纵向字段风格；表单/JSON 双 tab 与 schema 驱动渲染保留
+
 ### Fixed
+- **crack 类透传客户端 `x-api-key` 导致上游 401 invalid_format（2026-08-05）**：`_handler_prepare_headers` 对 crack 类只注入 `authorization`（secrets.json 真 token），未删除客户端透传的 `x-api-key`。8081 翻译转发链路（Anthropic 客户端带 `x-api-key: dummy` → 8084 codebuddy）上游 `copilot.tencent.com` **优先用 x-api-key 校验**，无视已注入的 authorization → 401 `{"message":"invalid_format"}`（直连 8084 带 `Authorization` 正常，带 `x-api-key` 必现）。修复：crack 类注入 authorization 后 `fwd_headers.pop("x-api-key", None)`——凭据唯一事实源 secrets.json 不受影响（与「私密凭据收敛约定」一致）。**由 dashboard 重构后的全链路功能测试暴露**：配置编辑 → Anthropic→OpenAI 翻译 → 转发聚合/破解/直连网关逐段验证时发现
 - **codebuddy 思考链被切成数百个独立思考块（2026-08-05，续修）**：前次只删空 `content` 解决了一半。真实现象**不是文本换行，而是思考链被拆成几百个独立块**——上游每帧 delta 都塞满"存在但为空"的结构字段（`tool_calls:[]` / `function_call:null` / `refusal:""` / `extra_fields:null`），而 opencode 用的 Vercel AI SDK（`@ai-sdk/openai-compatible`）按**"键是否出现"**判断段落边界：见 `tool_calls` 键即认为工具调用段开始 → 结束当前 reasoning part → 下一帧再开新 part（实测 597/599 帧命中）。现改为清洗全部空值字段（含首帧 `function_call:{"name":"","arguments":""}` 这种空内容 dict，`== None` 匹配不到需单独判断），带内容的 `tool_calls`/`function_call` 严格保留。实测带 `tool_calls` 键的帧 597→0，最终 589 帧为纯 `('reasoning_content',)`
   > **判断失误复盘**：首版特意保留这些字段，理由是"对本 bug 零收益，却可能破坏依赖键存在性做类型推断的客户端"——恰恰相反，正是"依赖键存在性"这一特性导致切段。教训：面对未知客户端解析逻辑，"保守保留"不必然安全，应先确认客户端 SDK 的分段规则。另一教训：现象描述精确度决定排查方向，"换行"与"拆成多块"是两个完全不同的问题
 - **每日任务调度健壮性缺口（2026-08-05）**：架构评审后修复四处隐患——① **失败完全静默**：`main()` 恒返回 0 且 handler 结果被丢弃，任务挂了无人知晓（可能连续多天错过签到才发现）。现按 handler result 里的 `error` 判定失败并返回退出码 1，crontab 的 `||` 钩子追写 `logs/crack_daily.alert`；② **日志放 `/tmp`**：容器重启即清空，且违反项目自己定的"跨进程状态勿用 /tmp"约定（代理 `PrivateTmp=true` 根本读不到），迁至仓库内 `logs/crack_daily.log`；③ **无超时上限**：某网关上游卡死会拖垮整个 daily，外层加 `timeout 300`（超时码 124 同样触发告警）；④ **无重试**：网络抖动导致当天签到失败即错过，现失败自动重试一次（`--retry-delay` 可调，各 handler 均幂等——签到类先查状态再领取）
