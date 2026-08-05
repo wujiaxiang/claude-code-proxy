@@ -1201,16 +1201,22 @@ class _SseLineBuffer:
 def _normalize_codebuddy_sse_line(line: bytes, *, finish_reason_to_null: bool = True) -> bytes:
     """规范化 codebuddy 上游(copilot.tencent.com)不合规的 SSE 帧。
 
-    上游缺陷（2026-08-05 实测 kimi-k3-1，465/465 帧命中）：
-      思考帧 {"delta":{"content":"","reasoning_content":"The",...}}  ← 夹带空 content
+    上游缺陷（2026-08-05 实测 kimi-k3-1）：每帧 delta 都塞满"存在但为空"的字段——
+      思考帧 {"delta":{"content":"","reasoning_content":"The","function_call":null,
+                       "refusal":"","tool_calls":[],"extra_fields":null}}
       正文帧 {"delta":{"content":"递归","reasoning_content":"",...}}  ← 夹带空 reasoning
-    标准 OpenAI 协议下思考阶段不应出现 content 键。客户端(opencode)见 content 键
-    即认为正文块开始 → 结束当前思考段 → 下一帧再开新段 → 思考链逐 token 换行。
+    标准 OpenAI 协议下这些字段不该出现。客户端（opencode 用 Vercel AI SDK 的
+    @ai-sdk/openai-compatible）按"键是否出现"判断段落边界：
+      - 见 content 键 → 认为正文块开始
+      - 见 tool_calls 键 → 认为工具调用段开始
+    两者都会结束当前 reasoning part，下一帧再开新 part —— 思考链被切成几百个
+    独立思考块（597/599 帧命中）。
 
-    保守策略（只改必要字段，不动 tool_calls/refusal/function_call/extra_fields——
-    清理它们对本 bug 零收益，却可能破坏依赖"键存在性"做类型推断的客户端）：
+    清洗规则（严格只删"空值"，有内容的字段绝不动）：
       - reasoning_content 非空 且 content == ""  → 删 content 键
       - content 非空 且 reasoning_content == ""  → 删 reasoning_content 键
+      - tool_calls == [] / function_call is None / refusal == "" / extra_fields is None
+        → 删该键（tool_calls 有内容时保留，否则工具调用会断）
       - finish_reason == "" → null（上游用空串，标准应为 null；独立开关控制）
 
     失败降级：非 data: 行 / [DONE] / JSON 解析失败一律原样返回，绝不吞帧、不中断流。
@@ -1239,6 +1245,23 @@ def _normalize_codebuddy_sse_line(line: bytes, *, finish_reason_to_null: bool = 
                 changed = True
             if delta.get("content") and delta.get("reasoning_content") == "":
                 del delta["reasoning_content"]
+                changed = True
+            # 剔除"存在但为空"的结构字段：上游每帧都塞 tool_calls:[] / function_call:null
+            # / refusal:"" / extra_fields:null。Vercel AI SDK（@ai-sdk/openai-compatible，
+            # opencode 用的就是它）按"键是否出现"判断段落边界——见到 tool_calls 键即认为
+            # 工具调用段开始，结束当前 reasoning part，下一帧再开新 part，导致思考链被
+            # 切成几百个独立思考块（2026-08-05 实测 597/599 帧命中）。
+            # 严格只删空值：tool_calls 有内容时绝不动（工具调用是结构化数据，删了会断）。
+            for _k, _empty in (("tool_calls", []), ("function_call", None),
+                               ("refusal", ""), ("extra_fields", None)):
+                if _k in delta and delta[_k] == _empty and type(delta[_k]) is type(_empty):
+                    del delta[_k]
+                    changed = True
+            # 首帧的 function_call 是 {"name":"","arguments":""} 而非 null（空内容 dict），
+            # 上面的 == None 匹配不到。只在所有值都为空时删，有 name/arguments 就保留。
+            _fc = delta.get("function_call")
+            if isinstance(_fc, dict) and not any(_fc.values()):
+                del delta["function_call"]
                 changed = True
         if finish_reason_to_null and choice.get("finish_reason") == "":
             choice["finish_reason"] = None
