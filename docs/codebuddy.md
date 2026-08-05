@@ -102,7 +102,7 @@ python crack_codebuddy.py [--secrets secrets.json] [--force]
 
 **修复效果**：思考帧空 content 465→0，正文帧空 reasoning 67→0，finish_reason 空串 586→0，思考链与正文内容完整无损（中文/emoji/换行符均正确）。
 
-**诊断**：`DEBUG=true` 时 `codebuddy.log` 输出 `SSE 透传完成: data_lines=N finish_reasons=[...] normalized=M`，`normalized` 即本次改写的帧数。
+**诊断**：`DEBUG=true` 时 `codebuddy.log` 输出 `SSE 透传完成: data_lines=N finish_reasons=[...] normalized=M`，`normalized` 即本次改写的帧数。**注意 DEBUG 默认关闭**（日志级别 INFO），此行不会出现——需临时开 DEBUG 才能看到，查完记得恢复。
 
 ---
 
