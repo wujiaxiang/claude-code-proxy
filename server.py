@@ -3733,14 +3733,32 @@ def _crack_env_check(target: dict) -> dict:
 
 _ANTHROPIC_PORT = int(os.environ.get("ANTHROPIC_PORT", "8081"))
 
-_ANTHROPIC_PORT_MODELS = [
-    "claude-opus-4-20250514",
-    "claude-sonnet-4-20250514",
-    "claude-haiku-4-20250514",
-    "opus",
-    "sonnet",
-    "haiku",
-]
+
+def _anthropic_port_models() -> List[dict]:
+    """8081 Anthropic 端口模型列表——动态来自 targets.json 顶层 models[]。
+
+    与 dashboard「模型定义」编辑视图同一数据源（_MODELS_CFG["models"]）：
+    监控视图展示什么，编辑视图就改什么，杜绝"展示但不可用"的歧义。
+    取代硬编码常量（曾含 claude-opus-4-20250514 等不可用死名单——那些模型
+    名无法被 _resolve_model_alias 命中，只会在客户端模型列表里误导用户）。
+
+    返回 [{id, display_name, aliases, target}]：id=name 主模型名，aliases 为其
+    别名（均可被 _resolve_model_alias 命中），target 为下游端口+真实模型。
+    """
+    out: List[dict] = []
+    for m in _MODELS_CFG.get("models", []):
+        if not isinstance(m, dict) or not m.get("name"):
+            continue
+        name = str(m["name"])
+        aliases = [str(a) for a in (m.get("aliases") or []) if isinstance(a, str)]
+        tgt = m.get("target")
+        out.append({
+            "id": name,
+            "display_name": _humanize_model_name(name),
+            "aliases": aliases,
+            "target": {"port": tgt.get("port"), "model": tgt.get("model")} if isinstance(tgt, dict) else {},
+        })
+    return out
 
 _ANTHROPIC_STATS: Dict[str, int] = {"totalRequests": 0, "passthroughOk": 0, "passthroughError": 0, "startedAt": datetime.now().isoformat()}
 
@@ -3860,7 +3878,7 @@ async def _handle_anthropic_proxy_request(reader, writer):
             payload = _json.dumps({
                 "label": "claude-code-anthropic", "listenPort": _ANTHROPIC_PORT,
                 "targetHost": "127.0.0.1", "targetPort": 8082, "targetProtocol": "http",
-                "models": _ANTHROPIC_PORT_MODELS,
+                "models": [m["id"] for m in _anthropic_port_models()],
                 "retryAfterSeconds": 0, "errorPatterns": [],
                 "startedAt": _ANTHROPIC_STATS["startedAt"],
             })
@@ -3873,12 +3891,15 @@ async def _handle_anthropic_proxy_request(reader, writer):
             writer.write(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: %d\r\n\r\n%s" % (len(payload.encode()), payload.encode()))
             await writer.drain(); writer.close(); return
 
-        # ── /v1/models 拦截：只返回 Anthropic 模型 ──
+        # ── /v1/models 拦截：只返回 Anthropic 模型（动态来自 targets.json models[]）──
         if path == "/v1/models" and method == "GET":
             import json as _json
-            full_list = _build_models_list()
-            anthropic_ids = set(_ANTHROPIC_PORT_MODELS)
-            filtered = [m for m in full_list if m["id"] in anthropic_ids]
+            filtered = _anthropic_port_models()
+            for m in filtered:
+                m.setdefault("object", "model")
+                m.setdefault("type", "model")
+                m.setdefault("created", 1700000000)
+                m.setdefault("owned_by", "anthropic")
             payload = _json.dumps({"data": filtered, "object": "list", "has_more": False})
             writer.write(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: %d\r\n\r\n%s" % (len(payload.encode()), payload.encode()))
             await writer.drain(); writer.close(); return
@@ -7229,26 +7250,22 @@ def _build_models_list(include_aliases: bool = True) -> List[dict]:
     models: List[dict] = []
 
     # ── 翻译链路别名（仅 8081 Anthropic 端口需要）──
+    # 动态来自 targets.json 顶层 models[]（name + aliases 均可被 _resolve_model_alias 命中），
+    # 与 dashboard「模型定义」编辑视图同源；不再硬编码（曾含 claude-*-4-20250514 死名单）。
     if include_aliases:
-        _claude_aliases = [
-        ("claude-sonnet-4-20250514", "Claude Sonnet 4"),
-        ("claude-haiku-4-20250514", "Claude Haiku 4"),
-            ("claude-opus-4-20250514", "Claude Opus 4"),
-        ("sonnet", "Claude Sonnet"),
-        ("haiku", "Claude Haiku"),
-        ("opus", "Claude Opus"),
-    ]
-
-        # ── 先加别名（同步可用的）──
-        for mid, display in _claude_aliases:
-            models.append({
-                "id": mid,
-                "object": "model",
-                "type": "model",
-                "created": 1700000000,
-                "owned_by": "anthropic",
-                "display_name": display,
-            })
+        for _m in _MODELS_CFG.get("models", []):
+            if not isinstance(_m, dict) or not _m.get("name"):
+                continue
+            _names = [str(_m["name"])] + [str(a) for a in (_m.get("aliases") or []) if isinstance(a, str)]
+            for _mid in _names:
+                models.append({
+                    "id": _mid,
+                    "object": "model",
+                    "type": "model",
+                    "created": 1700000000,
+                    "owned_by": "anthropic",
+                    "display_name": _humanize_model_name(_m["name"]),
+                })
 
     # ── 能用下游 /models 的 provider：直接用缓存的列表（异步预拉取在 startup 完成）──
     _downstream = _DOWNSTREAM_MODELS_CACHE or []
@@ -7297,10 +7314,10 @@ def _build_models_list(include_aliases: bool = True) -> List[dict]:
 @app.get("/api/v1/models")
 @app.get("/openai/v1/models")
 async def list_models():
-    """8081 Anthropic /v1/models — 硬编码 6 个模型"""
+    """8081 Anthropic /v1/models — 动态来自 targets.json models[]（与 dashboard 编辑视图同源）"""
     models = [
-        {"id": m, "object": "model", "type": "model", "created": 1700000000, "owned_by": "anthropic", "display_name": m}
-        for m in _ANTHROPIC_PORT_MODELS
+        {**m, "object": "model", "type": "model", "created": 1700000000, "owned_by": "anthropic"}
+        for m in _anthropic_port_models()
     ]
     return {"data": models, "object": "list", "has_more": False}
 
@@ -7934,19 +7951,22 @@ def _model_details_html(models, model_stats=None, label=None, edit_mode=False, c
                不显示"清理过期模型"按钮，避免点击报"上游不可达"）。
     """
     editable = label is not None
-    # 规范化：统一为 [{id, display, enabled}]
+    # 规范化：统一为 [{id, display, enabled, aliases}]
     norm = []
     for m in models or []:
         if isinstance(m, dict):
             mid = m.get('id', '')
             display = m.get('display_name', '') or _humanize_model_name(mid)
             enabled = m.get('enabled', True)
+            aliases = m.get('aliases') or []
         else:
             mid = str(m)
             display = _humanize_model_name(mid)
             enabled = True
+            aliases = []
         if mid:
-            norm.append({"id": mid, "display": display, "enabled": enabled})
+            norm.append({"id": mid, "display": display, "enabled": enabled,
+                         "aliases": [str(a) for a in aliases]})
 
     visible = [n for n in norm if n.get("enabled", True)]
 
@@ -8025,6 +8045,9 @@ def _model_details_html(models, model_stats=None, label=None, edit_mode=False, c
 
     has_stats = model_stats is not None
     esc_label = _html_escape(label or "")
+    # 别名列：数据源含 aliases 字段即渲染（8081 卡片 models[] 定义始终显示，与编辑视图一致；
+    # 空别名显示 —。其他 target 卡片无 aliases 字段则不显示，避免无谓加宽）
+    has_alias_col = any("aliases" in n for n in visible)
 
     rows = []
     for i, n in enumerate(visible, 1):
@@ -8035,6 +8058,9 @@ def _model_details_html(models, model_stats=None, label=None, edit_mode=False, c
             f'<td class="mid"><code>{_html_escape(mid)}</code></td>'
             f'<td class="name">{_html_escape(n["display"])}</td>'
         )
+        if has_alias_col:
+            alias_txt = ", ".join(_html_escape(a) for a in n.get("aliases") or [])
+            row += f'<td class="alias">{alias_txt or "—"}</td>'
         if has_stats:
             ms = model_stats.get(mid) if mid else None
             if ms:
@@ -8054,10 +8080,11 @@ def _model_details_html(models, model_stats=None, label=None, edit_mode=False, c
         row += '</tr>'
         rows.append(row)
 
+    alias_th = '<th>别名</th>' if has_alias_col else ''
     header_extra = f'<th>请求</th><th>成功率</th><th>错误</th><th>{_html_escape(str(col_429))}</th>' if has_stats else ''
     table_html = (
         f'<table class="model-table">'
-        f'<thead><tr><th>#</th><th>模型 ID</th><th>名称</th>{header_extra}</tr></thead>'
+        f'<thead><tr><th>#</th><th>模型 ID</th><th>名称</th>{alias_th}{header_extra}</tr></thead>'
         f'<tbody>{"".join(rows)}</tbody>'
         f'</table>'
     )
@@ -8824,6 +8851,7 @@ async def dashboard():
     # 8081 卡片关联的 target：modelDefaults.defaultPort 对应端口（dashboard 映射按钮定位用）
     _forward_target = next((t for t in _TARGETS if t.get("listenPort") == _MODELS_CFG["modelDefaults"].get("defaultPort", 8082)), None)
     _forward_label = _forward_target["label"] if _forward_target else None
+    _ap_models = _anthropic_port_models()
     agg_cards.append(_build_card_html(
         name="anthropic-compatible",
         note="FastAPI · Anthropic 协议入口 · /v1/messages 翻译为 OpenAI 后内部请求 8082",
@@ -8835,10 +8863,10 @@ async def dashboard():
             ("监听地址", "http://0.0.0.0:8081"),
             ("内部回调", "http://127.0.0.1:8082/v1/chat/completions"),
             ("协议", "Anthropic /v1/messages → OpenAI 翻译"),
-            ("模型数量", f"{len(_ANTHROPIC_PORT_MODELS)} 个（仅 Anthropic）"),
+            ("模型数量", f"{len(_ap_models)} 个（models[] 定义）"),
             ("systemd 服务", "anthropic-compatible"),
         ],
-        models=_ANTHROPIC_PORT_MODELS,
+        models=_ap_models,
         model_stats=_MODEL_STATS.get("anthropic", {}),
         stats_detail={
             "total": _8081_total, "ok": _8081_ok, "err": _8081_err,
