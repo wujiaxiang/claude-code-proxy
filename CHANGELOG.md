@@ -3,6 +3,10 @@
 ## [Unreleased]
 
 ### Added
+- **SSE 帧规范化层（`normalizeSse`，2026-08-05）**：passthrough 端口新增可选的上游 SSE 帧清洗能力，用于修正不合规上游。配置驱动（targets.json `normalizeSse` / `normalizeFinishReason`），不硬编码 label；当前对 codebuddy 启用
+  - `_SseLineBuffer`：按 `\n` 切行的缓冲器，重组跨 TCP chunk 的半截 SSE 帧。**纯字节透传时无需要，但一旦要逐帧改写就必须先重组**，否则会切坏 JSON（原诊断逻辑按 chunk 边界 `splitlines()` 只影响日志准确性，改写模式下则会污染数据流）
+  - `_normalize_codebuddy_sse_line`：逐帧规范化，保守策略——只删空 `content`/`reasoning_content`、`finish_reason:""` 归一为 `null`；**不动** `tool_calls`/`refusal`/`function_call`/`extra_fields`（对目标问题零收益，却可能破坏依赖"键存在性"做类型推断的客户端）
+  - 三条工程红线：① 诊断统计基于**改写前**的原始行（否则规范化自身的 bug 会掩盖上游真实异常）；② 解析失败/畸形帧/`[DONE]`/keep-alive 一律原样透传，绝不吞帧或中断流（流断了比渲染难看严重得多）；③ 未改动的帧返回原对象，保住大部分帧的零序列化开销
 - **聚合网关 8080 端口**（`aggregator.py` + `config_store.py` aggregate/aggregator 支持）：
   - 虚拟模型 id（agg:xxx）→ 默认池（权重/平等）+ 降级池（可为空）路由，可配置重试次数
   - 会话保持（`(虚拟模型id, session_id)` → 成员，本地缓存 + TTL），防止同会话漂移丢缓存
@@ -40,8 +44,12 @@
 - 8092 gemini-openai → gemini（handler=gemini-native）
 - README 精简为多端口架构视角，Windows 部署坑拆至 docs/windows-deployment.md
 - **配置架构收敛（2026-08-05）**：私密凭据唯一事实源 = `secrets.json`（dashboard 热编辑 + mtime 热重载 2s 生效）。`.env` 只留非私密运行配置（`DEBUG`/`LOG_*`/`COPILOT_GHE_HOST`/`COPILOT_INTEGRATION_ID`/`COPILOT_*_MODEL`/`PREFERRED_PROVIDER`）。`COPILOT_GHE_TOKEN` 并入 secrets.json `copilot_token`（同源，server.py 翻译层 `_load_vendor_targets`/`_reload_targets`/`_refresh_secrets` 热重载同步）；`.env` 冗余 `CODEBUDDY_TOKEN` 已删（target 走 secretRef）
+- `test_qclaw_429.py` → `test_error_code_mapping.py`：覆盖面早已超出 qclaw（多网关多格式错误码映射 + LiteLLM 限流路径），原名有误导性；同步更新 `docs/error-code-mapping.md`
+- `_write_response` 的 `log_sse` 分支从"按 chunk 边界 splitlines 只读诊断"改为"行缓冲逐帧处理"，为规范化提供正确的分帧基础；诊断日志新增 `normalized=N` 计数
 
 ### Fixed
+- **codebuddy 思考链逐 token 换行（2026-08-05，kimi-k3-1 等 reasoning 模型）**：客户端渲染思考链时每个 token 被切成独立段落。根因**不在拼接逻辑，而在帧结构透传**——上游 `copilot.tencent.com` 返回的 SSE 帧不符合 OpenAI 协议：思考阶段每帧夹带 `"content":""`（实测 465/465 帧命中），正文阶段反过来夹带 `"reasoning_content":""`，且 `finish_reason` 用空串而非 `null`。8084 是 `passthrough` 纯字节转发（`aiter_bytes()`），畸形帧原样透传给客户端；客户端见 `content` 键即认为正文块开始 → 结束当前思考段 → 下一帧再开新段 → 逐字换行。**定位关键佐证**：正文阶段同样逐词发送却无此现象，两者唯一结构差异就是思考帧多了空 `content`，据此排除了"客户端把每个 SSE 帧当一行渲染"的可能。修复见 Added 的 SSE 帧规范化层。实测思考帧空 content 465→0、正文帧空 reasoning 67→0、finish_reason 空串 586→0，思考链与正文内容完整无损
+- openrouter 免费池限流文案未被识别 —— `_VENDOR_ERROR_MAPS` 新增 `rate-limited` 关键词（上游返回 `temporarily rate-limited upstream`，2026-08-05 实测 `gemma-4-31b-it:free` 命中），原映射表未覆盖导致该类限流未翻译成 429
 - 【模型映射】按钮误扩散到所有 target 卡片 —— 改为仅 8081 转发网关专属
 - `config_store.load_targets` 丢弃顶层 `anthropicForward` 字段 —— 保留并校验
 - 聚合引擎启动预初始化（首请求前 `/api/aggregate/status` 即可用）

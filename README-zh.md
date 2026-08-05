@@ -30,6 +30,7 @@
 - **热重载**：`targets.json` / `secrets.json` mtime 轮询（2s），修改后自动生效
 - **base_url 规范**：crack 类与 gemini-native 统一 `/v1`（代理内部映射下游）；free/paid 透传用 `routePrefix`（如 `/api/v1`）
 - **codebuddy 非流式兼容**：上游只接受流式（11101），代理自动把非流式请求转流式聚合为完整 JSON，非流式客户端也可用
+- **SSE 帧规范化（`normalizeSse`）**：部分上游返回的 SSE 帧不合规（如 codebuddy 思考帧夹带空 `content`，导致客户端把思考链切成逐 token 换行）。开启后代理逐帧清洗为标准 OpenAI 格式，保守策略只删空字段、不动 `tool_calls` 等结构；解析失败一律原样透传不吞帧
 - **管理界面**：`http://127.0.0.1:8081/dashboard`（任意端口 `/dashboard` 也可访问，`/api/*` 自动代理回 8081）
 
 ## 快速启动

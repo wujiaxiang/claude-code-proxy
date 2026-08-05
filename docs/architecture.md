@@ -65,6 +65,10 @@ Anthropic 协议：base_url = http://192.168.2.128:8081，api_key = "dummy"
       "apikeyEnv": "COPILOT_GHE_TOKEN", // 环境变量兜底
       "models": [...],                 // 模型白名单（字符串或 {id, enabled}）
       "extraHeaders": {"Copilot-Integration-Id": "..."},
+      "cleanCodebuddyBody": false, // 剥离上游不兼容的推理类参数 + system prompt 热重写
+      "cleanQclawBody": false,     // qclaw body 白名单清理
+      "normalizeSse": false,       // SSE 帧规范化（修不合规上游，见下）
+      "normalizeFinishReason": true, // normalizeSse 子开关：finish_reason "" → null
       "isFree": false,
       "enabled": true
     }
@@ -73,6 +77,36 @@ Anthropic 协议：base_url = http://192.168.2.128:8081，api_key = "dummy"
 ```
 
 **secrets 优先级**：`secrets.json` > `apikeyEnv` 环境变量 > 客户端透传（free/paid）。
+
+### SSE 帧规范化（normalizeSse）
+
+部分上游返回的 SSE 帧不符合 OpenAI 协议，而 `passthrough` 是纯字节转发，畸形帧会原样传给客户端。开启 `normalizeSse` 后，代理对该 target 的流式响应逐帧清洗。
+
+**当前用例**：codebuddy（`copilot.tencent.com`）思考帧夹带空 `content`，导致客户端把思考链切成逐 token 换行（详见 [codebuddy.md](codebuddy.md) §3.5）。
+
+**处理链路**：
+
+```
+上游 chunk → _SseLineBuffer 重组完整行 → 诊断统计(基于原始行) → _normalize_codebuddy_sse_line → 写出
+```
+
+**清洗规则**（保守策略）：
+
+| 条件 | 动作 |
+|------|------|
+| `reasoning_content` 非空且 `content == ""` | 删 `content` 键 |
+| `content` 非空且 `reasoning_content == ""` | 删 `reasoning_content` 键 |
+| `finish_reason == ""` | 归一为 `null`（受 `normalizeFinishReason` 控制） |
+| `tool_calls`/`refusal`/`function_call`/`extra_fields` | **不动**（避免破坏依赖键存在性做类型推断的客户端） |
+
+**设计约束**（新增同类逻辑时必须遵守）：
+
+1. **必须先重组行再改写**——SSE 帧会被 TCP 任意切断，纯透传时无所谓，但逐帧改写前不重组就会切坏 JSON
+2. **诊断统计基于改写前的原始行**——否则规范化自身的 bug 会掩盖上游真实异常
+3. **失败一律原样透传**——解析失败/畸形帧/`[DONE]`/keep-alive 都不改写，绝不吞帧或中断流
+4. **未改动的帧返回原对象**——不重新序列化，保住零开销
+
+> `normalizeSse` 为真时会自动启用逐帧处理链路（与 SSE 诊断日志共用）。诊断日志附带 `normalized=N` 表示本次改写的帧数。
 
 > **私密凭据收敛约定（2026-08-05）**：私密凭据唯一事实源是 `secrets.json`（dashboard 可热编辑、mtime 热重载 2s 生效）。`.env` **只放非私密运行配置**（`DEBUG`/`LOG_*`/`COPILOT_GHE_HOST`/`COPILOT_INTEGRATION_ID`/`COPILOT_*_MODEL` 等）。`apikeyEnv` 仅为兼容旧部署的兜底。已收敛：`COPILOT_GHE_TOKEN` 并入 `secrets.json` 的 `copilot_token`（同源，server.py 翻译层热重载同步），`CODEBUDDY_TOKEN` 冗余已删。
 

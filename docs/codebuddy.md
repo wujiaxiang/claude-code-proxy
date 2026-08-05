@@ -67,6 +67,45 @@ python crack_codebuddy.py [--secrets secrets.json] [--force]
 
 ---
 
+## 3.5 上游 SSE 帧不合规与规范化（normalizeSse）
+
+**现象**：客户端渲染 reasoning 模型（kimi-k3-1 等）的思考链时，**每个 token 被切成独立段落**（逐字换行）。
+
+**根因**：上游返回的 SSE 帧不符合 OpenAI 协议——**不是拼接问题，是帧结构问题**。
+
+实测 kimi-k3-1（2026-08-05）：
+
+| 阶段 | 上游实际返回 | 标准 OpenAI 应为 |
+|------|-------------|-----------------|
+| 思考帧（465/465 全中） | `{"delta":{"content":"","reasoning_content":"The",...}}` | `{"delta":{"reasoning_content":"The"}}`（不带 content 键） |
+| 正文帧（67/67 全中） | `{"delta":{"content":"递归","reasoning_content":"",...}}` | `{"delta":{"content":"递归"}}` |
+| finish_reason（每帧） | `""`（空串） | `null`（仅末帧为 `stop` 等） |
+
+8084 是 `passthrough` 纯字节转发（`aiter_bytes()`），畸形帧原样透传。客户端见 `content` 键即认为正文块开始 → 结束当前思考段 → 下一帧再开新段 → 逐字换行。
+
+> **定位关键佐证**：正文阶段同样是逐词发送，却从未出现换行问题。两者唯一的结构差异就是思考帧多了空 `content`——据此排除"客户端把每个 SSE 帧当一行渲染"的解释。
+
+**修复**（targets.json 开 `normalizeSse: true`）：
+
+```
+上游 chunk → _SseLineBuffer 重组完整行 → 诊断统计(原始行) → _normalize_codebuddy_sse_line → 写出
+```
+
+- `_SseLineBuffer`：按 `\n` 切行，处理跨 TCP chunk 粘包。**改写模式下必须**——纯透传时帧被切断无所谓，但要逐帧改写就必须先重组，否则会切坏 JSON
+- `_normalize_codebuddy_sse_line`：保守清洗
+  - `reasoning_content` 非空且 `content == ""` → 删 `content` 键
+  - `content` 非空且 `reasoning_content == ""` → 删 `reasoning_content` 键
+  - `finish_reason == ""` → `null`（子开关 `normalizeFinishReason`，默认 `true`）
+  - **不动** `tool_calls`/`refusal`/`function_call`/`extra_fields`：对本问题零收益，却可能破坏依赖"键存在性"做类型推断的客户端
+- 降级：非 `data:` 行 / `[DONE]` / keep-alive 注释 / 畸形 JSON 一律原样透传，**绝不吞帧或中断流**
+- 性能：未命中规则的帧返回原对象，不重新序列化
+
+**修复效果**：思考帧空 content 465→0，正文帧空 reasoning 67→0，finish_reason 空串 586→0，思考链与正文内容完整无损（中文/emoji/换行符均正确）。
+
+**诊断**：`DEBUG=true` 时 `codebuddy.log` 输出 `SSE 透传完成: data_lines=N finish_reasons=[...] normalized=M`，`normalized` 即本次改写的帧数。
+
+---
+
 ## 4. 额度 / 成长任务查询（crack_codebuddy_q.py）
 
 数据来源全部经本机 token 实测。endpoint 默认 `https://copilot.tencent.com`，失败自动换 `https://www.codebuddy.ai`（401/404/超时换 base）。
@@ -244,7 +283,8 @@ EOF
 1. **上游只支持流式**：codebuddy 上游对非流式请求报 11101，代理已自动转流式聚合；新增错误特征判断时勿绕过该检测（AGENTS.md 陷阱 #10）。
 2. **refreshToken 轮换必须立即持久化**：刷新后旧 refreshToken 立即失效，未回写新值会导致登录态丢失（AGENTS.md 陷阱 #11）。
 3. **仅 Windows 破解**：`crack_codebuddy.py` 仅 Windows 支持；其他 OS 需手动在 dashboard 填写 `codebuddy_token`。
-4. **reasoning 参数必须 opt-in**（历史 #2071 教训）：codebuddy 上游对推理参数（如 `reasoning_effort` / `reasoning_summary`）有特殊校验，可能引发内容安全类错误。当前 codebuddy 走纯 passthrough，代理不注入 reasoning 字段；**若未来在 `_handler_prepare_body` 增加 codebuddy 特判，必须遵循 opt-in 规则**——仅客户端显式传 `reasoning_effort` 时才附加 reasoning 相关字段，否则移除所有 reasoning 字段。新增处理 codebuddy 请求的代码必须遵循此规则。
+4. **上游 SSE 帧不合规，勿假设其符合 OpenAI 协议**：思考帧夹带空 `content`、正文帧夹带空 `reasoning_content`、`finish_reason` 用空串而非 `null`（详见 §3.5）。已由 `normalizeSse` 规范化层修正；**任何新增的 SSE 解析逻辑都不要假设上游字段规范**。改写 SSE 必须先用 `_SseLineBuffer` 重组跨 chunk 的半截帧，且诊断统计要基于改写**前**的原始行——否则规范化自身的 bug 会掩盖上游真实异常。
+5. **reasoning 参数必须 opt-in**（历史 #2071 教训）：codebuddy 上游对推理参数（如 `reasoning_effort` / `reasoning_summary`）有特殊校验，可能引发内容安全类错误。当前 codebuddy 走纯 passthrough，代理不注入 reasoning 字段；**若未来在 `_handler_prepare_body` 增加 codebuddy 特判，必须遵循 opt-in 规则**——仅客户端显式传 `reasoning_effort` 时才附加 reasoning 相关字段，否则移除所有 reasoning 字段。新增处理 codebuddy 请求的代码必须遵循此规则。
 
 ---
 

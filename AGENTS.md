@@ -54,7 +54,7 @@ tail -f /root/shared-workspace/claude-code-proxy/proxy.log
 ## 3. 配置文件
 
 - **`.env`**（全局，gitignored）：**仅运行配置（非私密）**——`DEBUG` / `LOG_FILE` / `LOG_RETENTION_DAYS` / `LOG_ROTATE_WHEN` / `LOG_ROTATE_INTERVAL` / `COPILOT_GHE_HOST` / `COPILOT_INTEGRATION_ID` / `COPILOT_BIG|MEDIUM|SMALL_MODEL`。**已废弃**：`PREFERRED_PROVIDER`（多端口架构下不再控制路由，server.py 仍读取但无实际作用）。**私密凭据一律放 secrets.json**（2026-08-05 收敛）：`COPILOT_GHE_TOKEN` 已并入 secrets.json `copilot_token`，`CODEBUDDY_TOKEN` 冗余已删（target 走 secretRef）
-- **`targets.json`**（Target 定义，核心配置）：必填 `label / listenPort / category / handler / targetHost`；category ∈ `crack|free|paid|aggregate`；handler ∈ `passthrough|copilot|qclaw|gemini-native|trae-work|aggregator`；crack 类必须有 `crackTool`；label/端口不能冲突；`enabled=false` 跳过必填校验（预留位）。secrets 优先级：`secrets.json > apikeyEnv 环境变量 > 客户端透传`。**热重载**：mtime 轮询 2s，改完即生效（含端口动态增删）。完整 schema 见 [docs/architecture.md](docs/architecture.md)
+- **`targets.json`**（Target 定义，核心配置）：必填 `label / listenPort / category / handler / targetHost`；category ∈ `crack|free|paid|aggregate`；handler ∈ `passthrough|copilot|qclaw|gemini-native|trae-work|aggregator`；crack 类必须有 `crackTool`；label/端口不能冲突；`enabled=false` 跳过必填校验（预留位）。secrets 优先级：`secrets.json > apikeyEnv 环境变量 > 客户端透传`。**热重载**：mtime 轮询 2s，改完即生效（含端口动态增删）。可选行为开关：`cleanCodebuddyBody` / `cleanQclawBody` / `normalizeSse`（SSE 帧规范化，修不合规上游）/ `normalizeFinishReason`。完整 schema 见 [docs/architecture.md](docs/architecture.md)
 - **`secrets.json`**（私密 key/token，gitignored，dashboard 可热编辑）：**私密凭据唯一事实源**。破解工具提取的 key/token 写入此文件。当前字段：`copilot_token, copilot_personal_token, codebuddy_token, codebuddy_refresh_token, codebuddy_uid, codebuddy_nickname, trae_work_token, trae_work_refresh_token, trae_work_user_id, trae_work_bound_device_id, qclaw_api_key, qclaw_login_key, qclaw_guid, qclaw_user_id, qclaw_nickname, qclaw_openclaw_token, qclaw_device_token`。注：`copilot_token` 同时供 8082 企业 GHE target（secretRef）与 server.py 翻译层 `COPILOT_GHE_TOKEN`（同源 token，热重载同步）
 
 ---
@@ -212,6 +212,8 @@ $env:Path = "C:\Program Files\QClaw\v0.2.33.617\resources\git\cmd;C:\Windows\Sys
 4. **代理 mount namespace 隔离**：跨进程共享状态放仓库 `.cache/`，勿用 `/tmp`（代理读不到）。
 5. **LXC 跑 Docker AppArmor 冲突**：手动 `docker run` 要加 `--security-opt apparmor=unconfined`（部署环境约束，见全局 CLAUDE.md）。
 6. **聚合网关（8080）**：熔断配额模式（`quotaErrorPatterns`，额度/积分不足 → 摘除端口）与 429 限流模式（`_VENDOR_ERROR_PATTERNS`，只翻译不熔断）必须严格区分，新增错误特征时先判断归哪一类；聚合层**不透传 secretRef/apikeyEnv**，只透传客户端 `Authorization`（凭据归各下游端口自己处理）；会话粘性 key = `(虚拟模型id, session_id)`，改粘性逻辑勿动这个隔离约定。
+7. **上游 SSE 帧不可假设合规**：codebuddy 上游思考帧夹带空 `content`、正文帧夹带空 `reasoning_content`、`finish_reason` 用空串而非 `null`（已由 `normalizeSse` 修正，见 docs/codebuddy.md §3.5）。**改写 SSE 的三条硬约束**：① 必须先用 `_SseLineBuffer` 重组跨 chunk 的半截帧再改写（纯透传时帧被切断无所谓，改写时不重组会切坏 JSON）；② 诊断统计必须基于改写**前**的原始行，否则规范化自身的 bug 会掩盖上游真实异常；③ 解析失败一律原样透传，绝不吞帧或中断流（流断了比渲染难看严重得多）。清洗字段遵循保守原则——只删空 `content`/`reasoning_content`，不动 `tool_calls` 等结构字段。
+8. **排查协议类问题先抓原始字节**：本次思考链换行 bug 曾误判为"流式追加拼接错误"，实际是帧结构问题。有效方法是 `iter_bytes()` 打印原始 SSE 的 `repr()` 逐字段对比标准协议，并用**同一响应内正常阶段作对照**（正文同样逐词发送却无问题 → 锁定唯一结构差异）。
 
 **网关级陷阱（详见各网关文档）**：
 
