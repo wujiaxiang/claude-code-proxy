@@ -328,6 +328,9 @@ class AggregatorEngine:
         retry_same_counts: dict[int, int] = {}
 
         sticky = self._get_sticky(virtual_model_id, session_id)
+        # 本轮进入时的粘性成员快照。若粘性成员失败后换到了别的成员并成功，
+        # 必须把粘性确定性地重新生根到新成员（否则下一次请求还会先打已失败的旧成员）。
+        original_sticky_member = sticky
         candidates_order: list[PoolMember] = []
         if sticky is not None:
             candidates_order.append(sticky)
@@ -378,7 +381,8 @@ class AggregatorEngine:
             if classification == "success":
                 tried_ports.add(member.port)
                 self.note_request(member, "ok", latency_ms)
-                if not was_sticky:
+                # 首次建立粘性，或粘性成员失败后换到了新成员 → 重新生根到当前成功成员
+                if not was_sticky or member != original_sticky_member:
                     self._set_sticky(virtual_model_id, session_id, member)
                 return member, result
 
@@ -432,34 +436,94 @@ class AggregatorEngine:
             self.note_request(member, "err", latency_ms)
             return member, result
 
-        # 降级池
+        # 降级池：与默认池使用完全一致的 classify_failure 五分类语义
+        # （429 / 5xx 持续失败同样绝不熔断——两个池的"不熔断"语义必须一致）。
+        # 唯一差异：成功记 "degraded" 且不更新会话粘性（模块头设计原则第 4 条）。
         if vm.fallback_pool:
             fb_attempts = max(vm.fallback_retries, 1)
             fb_tried: set[int] = set()
-            for attempt_no in range(1, fb_attempts + 1):
-                available = [m for m in self._available(vm.fallback_pool) if m.port not in fb_tried]
-                if not available:
-                    available = self._available(vm.fallback_pool)
-                if not available:
-                    break
-                member = self._weighted_choice(available)
-                fb_tried.add(member.port)
+            # 独立于默认池的计数器/候选队列，避免跨池计数污染（fallbackPool 可能引用同端口）
+            fb_retry_same_counts: dict[int, int] = {}
+            fb_candidates_order: list[PoolMember] = []
+            attempt_no = 0
+            while attempt_no < fb_attempts:
+                attempt_no += 1
+                if fb_candidates_order:
+                    member = fb_candidates_order.pop(0)
+                    if self._is_tripped(member.port):
+                        continue
+                else:
+                    available = [m for m in self._available(vm.fallback_pool) if m.port not in fb_tried]
+                    if not available:
+                        available = self._available(vm.fallback_pool)
+                    if not available:
+                        break
+                    member = self._weighted_choice(available)
                 start = self._clock()
                 try:
                     result = await send_fn(member, {"attempt": attempt_no, "pool": "fallback"})
                 except Exception as e:  # noqa: BLE001
                     last_error = e
+                    fb_tried.add(member.port)
                     self.note_request(member, "err", (self._clock() - start) * 1000)
                     continue
+
                 latency_ms = (self._clock() - start) * 1000
+                status_code = getattr(result, "status_code", None)
                 body_text = self._extract_body_text(result)
-                if self.quota_error(body_text):
-                    self.trip(member.port, "quota_error")
-                    last_error = RuntimeError(f"quota exhausted on port {member.port}")
+                classification = self.classify_failure(status_code, body_text, self.quota_error)
+
+                # D. 成功（2xx / 无状态码）—— 降级池成功记 degraded，且不更新会话粘性
+                if classification == "success":
+                    fb_tried.add(member.port)
+                    self.note_request(member, "degraded", latency_ms)
+                    return member, result
+
+                # A. 凭据/配额类失败：熔断该端口 + 换端点
+                if classification == "retry_other_or_fallback":
+                    reason = (
+                        _RETRY_OTHER_REASONS.get(status_code, "quota_text")
+                        if isinstance(status_code, int)
+                        else "quota_text"
+                    )
+                    fb_tried.add(member.port)
+                    self.trip(member.port, reason)
                     self.note_request(member, "err", latency_ms)
+                    last_error = RuntimeError(f"{reason} on port {member.port}")
                     continue
-                self.note_request(member, "degraded", latency_ms)
-                # 降级池成功不更新会话粘性
+
+                if classification == "retry_same":
+                    # B1. 429 账号级限流：立刻换端点，但绝不熔断
+                    if status_code == 429:
+                        fb_tried.add(member.port)
+                        self.note_request(member, "err", latency_ms)
+                        last_error = RuntimeError(f"429_rate_limit on port {member.port}")
+                        continue
+
+                    # B2. 408/5xx 网络抖动：同端点重试一次，仍失败才换端点；全程不熔断
+                    count = fb_retry_same_counts.get(member.port, 0) + 1
+                    fb_retry_same_counts[member.port] = count
+                    if count == 1:
+                        fb_tried.discard(member.port)
+                        fb_candidates_order.insert(0, member)
+                        self.note_request(member, "err", latency_ms)
+                        continue
+                    fb_tried.add(member.port)
+                    self.note_request(member, "err", latency_ms)
+                    last_error = RuntimeError(f"5xx_persistent on port {member.port}")
+                    continue
+
+                # C. pass_through_to_client / unclassified：不重试、不换端点、不熔断
+                if classification == "unclassified":
+                    import server as _srv
+
+                    _srv.logger.warning(
+                        f"[aggregator] unclassified failure: port={member.port} "
+                        f"model={member.model} status={status_code} "
+                        f"body_prefix={body_text[:200]!r}"
+                    )
+                fb_tried.add(member.port)
+                self.note_request(member, "err", latency_ms)
                 return member, result
 
         raise AllPoolsExhausted(
