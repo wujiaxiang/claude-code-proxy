@@ -12,7 +12,7 @@ trae-work 协议转换单元测试（无网络依赖）
 import json
 import sys
 
-import server
+import gateways.trae_work as trae
 
 PASS = 0
 FAIL = 0
@@ -41,7 +41,7 @@ body = {
         {"role": "user", "content": "总结"},
     ],
 }
-out = server._openai_to_trae_body(body)
+out = trae._openai_to_trae_body(body)
 msgs = out["messages"]
 check("assistant.tool_calls → content 文本化",
       "[Tool Call: bash]" in msgs[1]["content"][0]["text"])
@@ -62,7 +62,7 @@ body2 = {
         {"role": "tool", "tool_call_id": "c2", "content": "file content"},
     ],
 }
-msgs2 = server._openai_to_trae_body(body2)["messages"]
+msgs2 = trae._openai_to_trae_body(body2)["messages"]
 check("content+tool_calls 拼接保留原文",
       msgs2[0]["content"][0]["text"].startswith("我先查一下"))
 check("content+tool_calls 拼接含调用文本",
@@ -77,7 +77,7 @@ body3 = {
         {"role": "tool", "tool_call_id": "unknown", "content": ""},
     ],
 }
-msgs3 = server._openai_to_trae_body(body3)["messages"]
+msgs3 = trae._openai_to_trae_body(body3)["messages"]
 check("无匹配 tool_call_id → [Tool Call Result] 无后缀",
       msgs3[1]["content"][0]["text"] == "[Tool Call Result]")
 
@@ -90,7 +90,7 @@ body4 = {
     "presence_penalty": 0.1, "frequency_penalty": 0.2,
     "stop": ["END"], "seed": 42, "n": 1,
 }
-out4 = server._openai_to_trae_body(body4)
+out4 = trae._openai_to_trae_body(body4)
 check("temperature 透传", out4.get("temperature") == 0.7)
 check("top_p 透传", out4.get("top_p") == 0.9)
 check("presence_penalty 透传", out4.get("presence_penalty") == 0.1)
@@ -100,14 +100,14 @@ check("seed 透传", out4.get("seed") == 42)
 check("n<=1 不传", "n" not in out4)
 check("max_tokens 透传", out4.get("max_tokens") == 32000)
 check("max_tokens 超限截断 128000",
-      server._openai_to_trae_body({"model": "glm-5.2", "messages": [],
+      trae._openai_to_trae_body({"model": "glm-5.2", "messages": [],
                                    "max_tokens": 200000}).get("max_tokens") == 128000)
 
 # ─── 3. _parse_dsml_tool_calls：[Tool Call:] + DSML ───
 print("[3] 工具调用文本解析")
 tc_text = '[Tool Call: bash]\nArguments: {"command":"grep -n xxx /a/b.py"}'
-check("[Tool Call:] 识别", server._looks_like_dsml(tc_text))
-tcs = server._parse_dsml_tool_calls(tc_text)
+check("[Tool Call:] 识别", trae._looks_like_dsml(tc_text))
+tcs = trae._parse_dsml_tool_calls(tc_text)
 check("[Tool Call:] 解析出 1 个", len(tcs) == 1)
 check("[Tool Call:] name 正确", tcs[0]["function"]["name"] == "bash")
 check("[Tool Call:] arguments 为 JSON 字符串",
@@ -115,7 +115,7 @@ check("[Tool Call:] arguments 为 JSON 字符串",
 
 dsml_text = ('<｜DSML｜><｜function｜><｜function name｜>get_weather</｜function｜>'
              '<｜parameter｜>{"city":"北京"}</｜parameter｜></｜function｜></｜DSML｜>')
-check("DSML 识别", server._looks_like_dsml(dsml_text))
+check("DSML 识别", trae._looks_like_dsml(dsml_text))
 
 # DSML 变体 4（2026-08-03 实测，Doubao-Seed-Code）：<｜DSML｜invoke name=".."> +
 # <｜DSML｜parameter name="..">，标签属性形态而非独立标签体。曾完全绕过前 3 种解析器
@@ -127,13 +127,13 @@ dsml_invoke_text = (
     '</｜DSML｜invoke>\n'
     '</｜DSML｜tool_calls>'
 )
-check("DSML invoke 变体识别", server._looks_like_dsml(dsml_invoke_text))
-tcs_invoke = server._parse_dsml_tool_calls(dsml_invoke_text)
+check("DSML invoke 变体识别", trae._looks_like_dsml(dsml_invoke_text))
+tcs_invoke = trae._parse_dsml_tool_calls(dsml_invoke_text)
 check("DSML invoke 解析出 1 个", len(tcs_invoke) == 1)
 check("DSML invoke name 正确", tcs_invoke[0]["function"]["name"] == "bash")
 check("DSML invoke arguments 含 command 参数",
       json.loads(tcs_invoke[0]["function"]["arguments"])["command"] == "ls -la")
-tcs_i, r_i, content_i = server._resolve_trae_text(dsml_invoke_text)
+tcs_i, r_i, content_i = trae._resolve_trae_text(dsml_invoke_text)
 check("DSML invoke resolve 解析出 tool_calls", len(tcs_i) == 1)
 check("DSML invoke resolve 正文已清洗", content_i == "")
 
@@ -147,7 +147,7 @@ dsml_invoke_multi = (
     '</｜DSML｜invoke>\n'
     '</｜DSML｜tool_calls>'
 )
-tcs_multi = server._parse_dsml_tool_calls(dsml_invoke_multi)
+tcs_multi = trae._parse_dsml_tool_calls(dsml_invoke_multi)
 check("DSML invoke 多参数解析出 1 个", len(tcs_multi) == 1)
 multi_args = json.loads(tcs_multi[0]["function"]["arguments"])
 check("DSML invoke 多参数含 3 个 key", len(multi_args) == 3)
@@ -155,26 +155,26 @@ check("DSML invoke 多参数嵌套花括号未截断",
       multi_args["oldString"] == "function foo() { return 1; }")
 
 plain = "这是一个普通回复"
-check("普通文本不误识别", not server._looks_like_dsml(plain))
-check("普通文本解析为空", server._parse_dsml_tool_calls(plain) == [])
+check("普通文本不误识别", not trae._looks_like_dsml(plain))
+check("普通文本解析为空", trae._parse_dsml_tool_calls(plain) == [])
 
 # 兜底告警场景（2026-08-03 新增）：模拟未知的"第 5 种变体"——含 DSML 标记特征
 # 但不匹配任何已知解析器格式，_resolve_trae_text 应记录 WARNING 但不抛异常，
 # 且仍按普通文本处理（不吞掉，不中断），保证"未知新变体"能从日志被发现。
 unknown_variant = '<｜DSML｜unknown_wrapper>some content the parser has never seen</｜DSML｜unknown_wrapper>'
-check("未知变体仍判定为疑似 DSML", server._looks_like_dsml(unknown_variant))
-check("未知变体已知解析器解析为空", server._parse_dsml_tool_calls(unknown_variant) == [])
-tcs_u, r_u, content_u = server._resolve_trae_text(unknown_variant)
+check("未知变体仍判定为疑似 DSML", trae._looks_like_dsml(unknown_variant))
+check("未知变体已知解析器解析为空", trae._parse_dsml_tool_calls(unknown_variant) == [])
+tcs_u, r_u, content_u = trae._resolve_trae_text(unknown_variant)
 check("未知变体 resolve 不抛异常且 tool_calls 为空", tcs_u == [])
 check("未知变体 resolve 原样保留在 content（不吞掉）", "unknown_wrapper" in content_u)
 
 # ─── 4. _trae_chunk_to_openai：新旧格式 ───
 print("[4] output 新旧格式映射")
-oai_new = server._trae_chunk_to_openai({"type": "text", "content": "你好", "reasoning": "思考"}, "glm-5.2")
+oai_new = trae._trae_chunk_to_openai({"type": "text", "content": "你好", "reasoning": "思考"}, "glm-5.2")
 delta_new = oai_new["choices"][0]["delta"]
 check("新格式 content", delta_new.get("content") == "你好")
 check("新格式 reasoning→reasoning_content", delta_new.get("reasoning_content") == "思考")
-oai_old = server._trae_chunk_to_openai({"response": "旧", "reasoning_content": "旧思"}, "glm-5.2")
+oai_old = trae._trae_chunk_to_openai({"response": "旧", "reasoning_content": "旧思"}, "glm-5.2")
 delta_old = oai_old["choices"][0]["delta"]
 check("旧格式 content", delta_old.get("content") == "旧")
 check("旧格式 reasoning_content", delta_old.get("reasoning_content") == "旧思")
@@ -183,7 +183,7 @@ check("旧格式 reasoning_content", delta_old.get("reasoning_content") == "旧�
 print("[5] tool_calls 转换")
 # DSML/XML 解析格式（function 键，无 id/index）→ 必须补 id+index（否则客户端不执行）
 tc_in = [{"type": "function", "function": {"name": "bash", "arguments": '{"command":"ls"}'}}]
-tc_out = server._trae_tool_calls_to_openai(tc_in)
+tc_out = trae._trae_tool_calls_to_openai(tc_in)
 check("function 键转换 name", bool(tc_out) and tc_out[0]["function"]["name"] == "bash")
 check("function 键转换 arguments", tc_out[0]["function"]["arguments"] == '{"command":"ls"}')
 check("缺 id 自动补", tc_out[0].get("id", "").startswith("call_"))
@@ -191,21 +191,21 @@ check("缺 index 自动补", tc_out[0].get("index") == 0)
 # Trae 原生格式（function_call 键，带 id/index）→ 原样保留
 native = [{"index": 3, "id": "call_x9", "type": "function",
            "function_call": {"name": "read", "arguments": '{"path":"a"}'}}]
-native_out = server._trae_tool_calls_to_openai(native)
+native_out = trae._trae_tool_calls_to_openai(native)
 check("function_call 键转换", native_out[0]["function"]["name"] == "read")
 check("原生 id 保留", native_out[0]["id"] == "call_x9")
 check("原生 index 保留", native_out[0]["index"] == 3)
 # 多工具 index 递增
-multi = server._trae_tool_calls_to_openai([
+multi = trae._trae_tool_calls_to_openai([
     {"type": "function", "function": {"name": "a", "arguments": "{}"}},
     {"type": "function", "function": {"name": "b", "arguments": "{}"}},
 ])
 check("多工具 index 递增", [x["index"] for x in multi] == [0, 1])
-check("空输入返回空", server._trae_tool_calls_to_openai([]) == [])
+check("空输入返回空", trae._trae_tool_calls_to_openai([]) == [])
 
 # ─── 6. 完整流式 chunk 转换（DSML 解析 → OpenAI chunk 含 tool_calls）───
 print("[6] 流式 tool_calls chunk 完整性")
-from server import _trae_chunk_to_openai
+from gateways.trae_work import _trae_chunk_to_openai
 oai_chunk = _trae_chunk_to_openai(
     {"response": "", "tool_calls": [{"type": "function", "function": tc["function"]} for tc in tc_in]},
     "glm-5.2",
@@ -224,7 +224,7 @@ check("chunk tool_calls arguments 完整", delta_tc[0]["function"]["arguments"] 
 print("[7] _resolve_trae_text 完整正文解析")
 
 # 7.1 纯文本，无任何标记 → 原样返回，无 tool_calls/reasoning
-tcs, rtext, content = server._resolve_trae_text("你好，这是一段普通回复。")
+tcs, rtext, content = trae._resolve_trae_text("你好，这是一段普通回复。")
 check("纯文本 tool_calls 为空", tcs == [])
 check("纯文本 reasoning 为空", rtext == "")
 check("纯文本 content 原样保留", content == "你好，这是一段普通回复。")
@@ -232,7 +232,7 @@ check("纯文本 content 原样保留", content == "你好，这是一段普通�
 # 7.2 [Tool Call: xxx] 文本格式 —— 曾因开头 "[" 独立成 chunk 被误判丢弃
 # （2026-08-02 实测：trailing tool-fragment dropped）
 full = '[Tool Call: edit]\nArguments: {"filePath":"a.py","oldString":"x","newString":"y"}'
-tcs, rtext, content = server._resolve_trae_text(full)
+tcs, rtext, content = trae._resolve_trae_text(full)
 check("[Tool Call:] 完整文本解析出 1 个 tool_call", len(tcs) == 1)
 check("[Tool Call:] name 正确", tcs and tcs[0]["function"]["name"] == "edit")
 check("[Tool Call:] arguments 含 filePath",
@@ -243,7 +243,7 @@ check("[Tool Call:] content 已清洗（不含调用文本残留）",
 # 7.3 reasoning JSON 字面量 + 后续普通正文 —— 曾因 reasoning JSON 未闭合导致
 # 整轮卡到流结束才吐出（2026-08-02 实测：trailing leftover 未闭合 JSON）
 full_r = '{"reasoning_content":"I need to check the file first."}继续处理下一步。'
-tcs, rtext, content = server._resolve_trae_text(full_r)
+tcs, rtext, content = trae._resolve_trae_text(full_r)
 check("reasoning JSON 提取正确", rtext == "I need to check the file first.")
 check("reasoning 提取后正文保留", content == "继续处理下一步。")
 check("reasoning 场景无 tool_calls", tcs == [])
@@ -255,7 +255,7 @@ check("reasoning 场景无 tool_calls", tcs == [])
 full_multi_r = ('{"reasoning_content":"first thought."}'
                 '{"reasoning_content":" continuing thought, still thinking."}'
                 '现在开始修改代码。')
-tcs, rtext, content = server._resolve_trae_text(full_multi_r)
+tcs, rtext, content = trae._resolve_trae_text(full_multi_r)
 check("多段 reasoning 全部提取拼接", rtext == "first thought. continuing thought, still thinking.")
 check("多段 reasoning 提取后正文无 JSON 字面量泄漏",
       "reasoning_content" not in content, f"content={content!r}")
@@ -265,7 +265,7 @@ check("多段 reasoning 场景无 tool_calls", tcs == [])
 # 7.4 reasoning JSON 未闭合（模型输出被截断，缺尾部 "}）—— 不应崩溃，
 # 且因未闭合无法安全提取，应整体降级为纯文本原样返回（不丢失内容）
 full_unclosed = '{"reasoning_content":"The user wants me to continue, so I need to update'
-tcs, rtext, content = server._resolve_trae_text(full_unclosed)
+tcs, rtext, content = trae._resolve_trae_text(full_unclosed)
 check("reasoning 未闭合不提取", rtext == "")
 check("reasoning 未闭合不崩溃且不丢内容", content == full_unclosed)
 check("reasoning 未闭合无 tool_calls", tcs == [])
@@ -275,13 +275,13 @@ full_dsml = ('前置说明。'
              '<｜DSML｜><｜function｜><｜function name｜>get_weather</｜function｜>'
              '<｜parameter｜>{"city":"北京"}</｜parameter｜></｜function｜></｜DSML｜>'
              '后续说明。')
-tcs, rtext, content = server._resolve_trae_text(full_dsml)
+tcs, rtext, content = trae._resolve_trae_text(full_dsml)
 check("DSML 完整文本解析出 1 个 tool_call", len(tcs) == 1)
 check("DSML name 正确", tcs and tcs[0]["function"]["name"] == "get_weather")
 
 # 7.6 <tool_call> XML 格式（trae-local-api 提示词注入方式）
 full_xml = '好的，我来执行。\n<tool_call>\n{"name": "bash", "arguments": {"command": "ls -la"}}\n</tool_call>'
-tcs, rtext, content = server._resolve_trae_text(full_xml)
+tcs, rtext, content = trae._resolve_trae_text(full_xml)
 check("XML tool_call 解析出 1 个", len(tcs) == 1)
 check("XML tool_call name 正确", tcs and tcs[0]["function"]["name"] == "bash")
 
@@ -296,7 +296,7 @@ full_xml_nested = ('<tool_call>\n{"name": "edit", "arguments": '
                     '"oldString": "function f(x) {{\\n  return x;\\n}}", '
                     '"newString": "function f(x) {{\\n  return x + 1;\\n}}"}}\n'
                     '</tool_call>')
-tcs, rtext, content = server._resolve_trae_text(full_xml_nested)
+tcs, rtext, content = trae._resolve_trae_text(full_xml_nested)
 check("XML 嵌套花括号解析出 1 个 tool_call", len(tcs) == 1)
 check("XML 嵌套花括号 name 正确", tcs and tcs[0]["function"]["name"] == "edit")
 if tcs:
@@ -309,7 +309,7 @@ check("XML 嵌套花括号场景无原始标记泄漏到正文", "tool_call" not
 # 开标签到文本末尾（命中疑似工具调用标记即剥离，不再原样透传半截 XML/JSON），
 # 开标签之前的正文保留。此前"原样保留"会让客户端看到裸露的 <tool_call> 半截。
 full_xml_unclosed = '开始执行。<tool_call>\n{"name": "bash", "arguments": {"command": "ls'
-tcs, rtext, content = server._resolve_trae_text(full_xml_unclosed)
+tcs, rtext, content = trae._resolve_trae_text(full_xml_unclosed)
 check("XML 未闭合不崩溃", True)
 check("XML 未闭合剥离标记不泄漏", "<tool_call>" not in content, f"content={content!r}")
 check("XML 未闭合正文保留", "开始执行" in content, f"content={content!r}")
@@ -318,15 +318,15 @@ check("XML 未闭合无 tool_calls", tcs == [])
 # 7.7 Wave 2：<seed_call> 的 invoke/function 两种非对称闭合变体
 seed_call_invoke = '''<seed_call>
 <invoke name="bash">
-<parameter name="command">.venv/bin/python -c "import server; print('IMPORT OK')"</parameter>
+<parameter name="command">.venv/bin/python -c "import gateways.trae_work as trae; print('IMPORT OK')"</parameter>
 <parameter name="workdir">/root/shared-workspace/claude-code-proxy</parameter>
 </invoke>
 </tool_call>'''
 seed_a_expected = {
-    "command": '.venv/bin/python -c "import server; print(\'IMPORT OK\')"',
+    "command": '.venv/bin/python -c "import gateways.trae_work as trae; print(\'IMPORT OK\')"',
     "workdir": "/root/shared-workspace/claude-code-proxy",
 }
-seed_a_tcs, seed_a_reasoning, seed_a_content = server._resolve_trae_text(seed_call_invoke)
+seed_a_tcs, seed_a_reasoning, seed_a_content = trae._resolve_trae_text(seed_call_invoke)
 check("seed_call invoke 非对称闭合精确解析",
       len(seed_a_tcs) == 1
       and seed_a_tcs[0]["function"]["name"] == "bash"
@@ -343,7 +343,7 @@ seed_b_expected = {
     "command": "git add server.py && git status",
     "workdir": "/root/shared-workspace/claude-code-proxy",
 }
-seed_b_tcs, seed_b_reasoning, seed_b_content = server._resolve_trae_text(seed_call_function)
+seed_b_tcs, seed_b_reasoning, seed_b_content = trae._resolve_trae_text(seed_call_function)
 check("seed_call function string 属性精确解析",
       len(seed_b_tcs) == 1
       and seed_b_tcs[0]["function"]["name"] == "bash"
@@ -369,7 +369,7 @@ mixed_suffix = "Let me verify the change took effect."
 mixed_fixture = (mixed_prefix + "\n<tool_call>\n"
                  + json.dumps({"name": "bash", "arguments": {"command": mixed_command}}, ensure_ascii=False)
                  + "\n</tool_call>\n" + mixed_suffix)
-mixed_tcs, mixed_reasoning, mixed_content = server._resolve_trae_text(mixed_fixture)
+mixed_tcs, mixed_reasoning, mixed_content = trae._resolve_trae_text(mixed_fixture)
 check("自由文本混杂多行 tool_call JSON 精确解析",
       len(mixed_tcs) == 1
       and mixed_tcs[0]["function"]["name"] == "bash"
@@ -380,7 +380,7 @@ check("自由文本混杂多行 tool_call JSON 精确解析",
       and '"arguments"' not in mixed_content)
 
 wave2_plain_text = "This is ordinary prose with braces {not JSON} and no tool marker."
-plain_tcs, plain_reasoning, plain_content = server._resolve_trae_text(wave2_plain_text)
+plain_tcs, plain_reasoning, plain_content = trae._resolve_trae_text(wave2_plain_text)
 check("Wave 2 纯自由文本不误判工具调用",
       plain_tcs == []
       and plain_reasoning == ""
@@ -406,8 +406,8 @@ wave3_tc = '''我来检查当前的 git 状态，看看有哪些修改需要提�
 <parameter name="timeout" string="false">10000</parameter>
 </parameters>
 </tool_call>'''
-w3_tcs, w3_r, w3_c = server._resolve_trae_text(wave3_tc)
-check("tool_call 子标签识别为疑似标记", server._looks_like_dsml(wave3_tc))
+w3_tcs, w3_r, w3_c = trae._resolve_trae_text(wave3_tc)
+check("tool_call 子标签识别为疑似标记", trae._looks_like_dsml(wave3_tc))
 check("tool_call 子标签解析出 1 个", len(w3_tcs) == 1)
 check("tool_call 子标签 name 正确",
       w3_tcs and w3_tcs[0]["function"]["name"] == "bash")
@@ -427,8 +427,8 @@ Found 18 match(es) in 1 file(s)
   389: yield f"data: {{\\"error\\":\\"upstream ...\\"}}"
   807: re.compile(r'"ResourceExhausted"'),
 '''
-w3s_tcs, w3s_r, w3s_c = server._resolve_trae_text(wave3_seed)
-check("seed:tool_result 判定为疑似标记", server._looks_like_dsml(wave3_seed))
+w3s_tcs, w3s_r, w3s_c = trae._resolve_trae_text(wave3_seed)
+check("seed:tool_result 判定为疑似标记", trae._looks_like_dsml(wave3_seed))
 check("seed:tool_result 不解析出 tool_calls", w3s_tcs == [])
 check("seed:tool_result 复述块已剥离",
       "seed:tool_result" not in w3s_c and "server.py" not in w3s_c,
@@ -448,7 +448,7 @@ wave3_mixed = '''<seed:tool_result>
 <parameter name="path" string="true">/root/shared-workspace/claude-code-proxy/server.py</parameter>
 </parameters>
 </tool_call>'''
-w3m_tcs, w3m_r, w3m_c = server._resolve_trae_text(wave3_mixed)
+w3m_tcs, w3m_r, w3m_c = trae._resolve_trae_text(wave3_mixed)
 check("混合结构新调用解析出 1 个", len(w3m_tcs) == 1)
 check("混合结构新调用 name 正确",
       w3m_tcs and w3m_tcs[0]["function"]["name"] == "grep")
@@ -461,12 +461,12 @@ check("混合结构正文保留", "现在让我检查" in w3m_c, f"content={w3m_
 
 # 8.4 纯文本不受影响
 w3_plain = "完全普通的回复，没有工具调用。"
-w3p_tcs, w3p_r, w3p_c = server._resolve_trae_text(w3_plain)
+w3p_tcs, w3p_r, w3p_c = trae._resolve_trae_text(w3_plain)
 check("Wave 3 纯文本不误判", w3p_tcs == [] and w3p_c == w3_plain)
 
 # 8.5 未闭合 <tool_call>（截断）剥离但保留正文
 w3_unclosed = '开始执行。<tool_call>\n{"name": "bash", "arguments": {"command": "ls'
-w3u_tcs, w3u_r, w3u_c = server._resolve_trae_text(w3_unclosed)
+w3u_tcs, w3u_r, w3u_c = trae._resolve_trae_text(w3_unclosed)
 check("未闭合 tool_call 不崩溃且剥离标记",
       "<tool_call>" not in w3u_c and "开始执行" in w3u_c,
       f"content={w3u_c!r}")
@@ -486,7 +486,7 @@ wave82_tc = '''<tool_call>
 <tool_name>bash</tool_name>
 <arguments>{"command": "cd /root/shared-workspace/claude-code-proxy && grep -i 'content_filter' proxy.log | tail -30"}</arguments>
 </tool_call>'''
-w82_tcs, w82_r, w82_c = server._resolve_trae_text(wave82_tc)
+w82_tcs, w82_r, w82_c = trae._resolve_trae_text(wave82_tc)
 check("Wave8.2 <arguments> 解析出 1 个", len(w82_tcs) == 1)
 check("Wave8.2 name=bash", w82_tcs and w82_tcs[0]["function"]["name"] == "bash")
 check("Wave8.2 arguments 含 command key",
@@ -500,7 +500,7 @@ wave82_multi = '''<tool_call>
 <tool_name>edit</tool_name>
 <arguments>{"filePath": "/a/b.py", "oldString": "if (x) { return 1; }", "newString": "if (y) { return 2; }"}</arguments>
 </tool_call>'''
-w82m_tcs, w82m_r, w82m_c = server._resolve_trae_text(wave82_multi)
+w82m_tcs, w82m_r, w82m_c = trae._resolve_trae_text(wave82_multi)
 check("Wave8.2 多参数解析出 1 个", len(w82m_tcs) == 1)
 w82m_args = json.loads(w82m_tcs[0]["function"]["arguments"]) if w82m_tcs else {}
 check("Wave8.2 嵌套花括号未截断", w82m_args.get("oldString") == "if (x) { return 1; }")
@@ -519,7 +519,7 @@ wave82_chain = '''<tool_call>
 <tool_name>bash</tool_name>
 <arguments>{"command": "systemctl status claude-code-proxy"}</arguments>
 </tool_call>'''
-w82c_tcs, w82c_r, w82c_c = server._resolve_trae_text(wave82_chain)
+w82c_tcs, w82c_r, w82c_c = trae._resolve_trae_text(wave82_chain)
 check("Wave8.2 连续调用解析出 3 个", len(w82c_tcs) == 3)
 check("Wave8.2 3 个 name 正确",
       w82c_tcs and [tc["function"]["name"] for tc in w82c_tcs] == ["bash", "grep", "bash"])
@@ -538,7 +538,7 @@ print("[9] Wave 4: 官方 seed-oss/Qwen3 XML 语法")
 # 9.1 seed:think + seed:tool_call + function= + parameter=
 w4_1 = ('<seed:think>I need to check the file.</seed:think>'
         '<seed:tool_call><function=bash><parameter=command>ls -la</parameter></function></seed:tool_call>')
-w41_t, w41_r, w41_c = server._resolve_trae_text(w4_1)
+w41_t, w41_r, w41_c = trae._resolve_trae_text(w4_1)
 check("官方 seed:tool_call 解析出 1 个", len(w41_t) == 1)
 check("官方 seed:tool_call name 正确",
       w41_t and w41_t[0]["function"]["name"] == "bash")
@@ -551,7 +551,7 @@ check("官方 seed:tool_call 调用块剥离", "seed:tool_call" not in w41_c, f"
 w4_2 = ('<tool_call><function=edit><parameter=filePath>/a/b.py</parameter>'
         '<parameter=oldString>function foo() { return 1; }</parameter>'
         '<parameter=newString>function foo() { return 2; }</parameter></function></tool_call>')
-w42_t, w42_r, w42_c = server._resolve_trae_text(w4_2)
+w42_t, w42_r, w42_c = trae._resolve_trae_text(w4_2)
 check("官方多参数解析出 1 个", len(w42_t) == 1)
 w42_args = json.loads(w42_t[0]["function"]["arguments"]) if w42_t else {}
 check("官方多参数含 3 个 key", len(w42_args) == 3)
@@ -560,7 +560,7 @@ check("官方多参数嵌套花括号未截断",
 
 # 9.3 裸 function= 无 tool_call 包裹（官方 parser 的 fallback）
 w4_3 = '<function=bash><parameter=command>ls</parameter></function>'
-w43_t, w43_r, w43_c = server._resolve_trae_text(w4_3)
+w43_t, w43_r, w43_c = trae._resolve_trae_text(w4_3)
 check("官方裸 function= fallback 解析出 1 个", len(w43_t) == 1)
 check("官方裸 function= name 正确",
       w43_t and w43_t[0]["function"]["name"] == "bash")
@@ -569,23 +569,23 @@ check("官方裸 function= 标记剥离", "function" not in w43_c, f"content={w4
 # 9.4 连续两个 seed:tool_call（官方 parser 容忍连续调用）
 w4_4 = ('<seed:tool_call><function=bash><parameter=command>git add</parameter></function></seed:tool_call>'
         '<seed:tool_call><function=bash><parameter=command>git status</parameter></function></seed:tool_call>')
-w44_t, w44_r, w44_c = server._resolve_trae_text(w4_4)
+w44_t, w44_r, w44_c = trae._resolve_trae_text(w4_4)
 check("官方连续调用解析出 2 个", len(w44_t) == 2)
 
 # 9.5 Qwen3 原生 <think>/<tool_call>（无 seed 前缀）
 w4_5 = '<think>Let me check</think><tool_call><function=bash><parameter=command>ls</parameter></function></tool_call>'
-w45_t, w45_r, w45_c = server._resolve_trae_text(w4_5)
+w45_t, w45_r, w45_c = trae._resolve_trae_text(w4_5)
 check("Qwen3 原生格式解析出 1 个", len(w45_t) == 1)
 check("Qwen3 think 标签剥离", "think" not in w45_c, f"content={w45_c!r}")
 
 # 9.6 未闭合 <seed:think>（截断）剥离
 w4_6 = '<seed:think>thinking...'
-w46_t, w46_r, w46_c = server._resolve_trae_text(w4_6)
+w46_t, w46_r, w46_c = trae._resolve_trae_text(w4_6)
 check("未闭合 seed:think 剥离", "seed:think" not in w46_c, f"content={w46_c!r}")
 
 # 9.7 正文 + 官方调用混合
 w4_7 = '我来执行。\n<seed:tool_call><function=bash><parameter=command>ls</parameter></function></seed:tool_call>'
-w47_t, w47_r, w47_c = server._resolve_trae_text(w4_7)
+w47_t, w47_r, w47_c = trae._resolve_trae_text(w4_7)
 check("官方调用混合正文保留", len(w47_t) == 1 and "我来执行" in w47_c)
 check("官方调用混合无标记泄漏", "seed:tool_call" not in w47_c, f"content={w47_c!r}")
 
@@ -609,7 +609,7 @@ w5_cases = [
     ("未闭合未知标签", '<any_tool><args>{"cmd":', ""),
 ]
 for w5_name, w5_text, w5_exp in w5_cases:
-    w5_t, w5_r, w5_c = server._resolve_trae_text(w5_text)
+    w5_t, w5_r, w5_c = trae._resolve_trae_text(w5_text)
     check(f"Wave5 [{w5_name}] 无 XML 标记泄漏",
           "<" not in w5_c, f"content={w5_c!r}")
     if w5_exp is not None:
@@ -624,14 +624,14 @@ w5_normals = [
     "调用 function 这个词的普通句子。",
 ]
 for w5_n in w5_normals:
-    w5_d = server._looks_like_dsml(w5_n)
-    w5_t, w5_r, w5_c = server._resolve_trae_text(w5_n)
+    w5_d = trae._looks_like_dsml(w5_n)
+    w5_t, w5_r, w5_c = trae._resolve_trae_text(w5_n)
     check(f"Wave5 普通文本不误伤: {w5_n[:20]}...",
           not w5_d and w5_t == [] and w5_c == w5_n,
           f"detected={w5_d} content={w5_c!r}")
 
 # 7.7 空文本 → 全部返回空
-tcs, rtext, content = server._resolve_trae_text("")
+tcs, rtext, content = trae._resolve_trae_text("")
 check("空文本 tool_calls 为空", tcs == [])
 check("空文本 reasoning 为空", rtext == "")
 check("空文本 content 为空", content == "")
