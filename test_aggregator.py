@@ -301,6 +301,26 @@ def test_empty_default_pool_raises_on_construct():
         pass
 
 
+def test_classify_failure_status_codes():
+    """classify_failure 三层判定：状态码优先于文本，2xx 绝不文本兜底。"""
+    eng = AggregatorEngine(make_target(), rng=random.Random(1))
+
+    # 已知状态码直接返回映射分类
+    assert eng.classify_failure(401, "", lambda t: False) == "retry_other_or_fallback"
+    assert eng.classify_failure(500, "", lambda t: False) == "retry_same"
+    assert eng.classify_failure(400, "", lambda t: False) == "pass_through_to_client"
+
+    # 关键回归：2xx 即使 body 命中配额文本也绝不判定为熔断/重试
+    assert eng.classify_failure(200, "insufficient credit", lambda t: True) == "success"
+
+    # None 状态码按 success 处理
+    assert eng.classify_failure(None, "", lambda t: True) == "success"
+
+    # 未知状态码且非 2xx → 文本兜底
+    assert eng.classify_failure(418, "", lambda t: False) == "unclassified"
+    assert eng.classify_failure(418, "insufficient credit", lambda t: True) == "retry_other_or_fallback"
+
+
 def main():
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for t in tests:

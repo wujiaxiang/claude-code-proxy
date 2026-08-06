@@ -32,6 +32,25 @@ class AllPoolsExhausted(Exception):
         self.last_error = last_error
 
 
+# 聚合网关失败分类表（状态码严格优先于文本）。
+# 命中此表的状态码直接返回对应分类，绝不回退到文本判断。
+_HTTP_STATUS_CLASSIFICATION: dict[int, str] = {
+    400: "pass_through_to_client",
+    401: "retry_other_or_fallback",
+    402: "retry_other_or_fallback",
+    403: "retry_other_or_fallback",
+    404: "pass_through_to_client",
+    408: "retry_same",
+    422: "pass_through_to_client",
+    429: "retry_same",
+    500: "retry_same",
+    502: "retry_same",
+    503: "retry_same",
+    504: "retry_same",
+    508: "retry_same",
+}
+
+
 @dataclass(frozen=True)
 class PoolMember:
     port: int
@@ -266,6 +285,31 @@ class AggregatorEngine:
 
     def quota_error(self, body_text: str) -> bool:
         return any(p.search(body_text) for p in self._quota_patterns)
+
+    def classify_failure(
+        self,
+        status_code: int | None,
+        body_text: str,
+        quota_error_fn=None,
+    ) -> str:
+        """分类一次失败的下游响应，供后续重试/熔断/降级使用。
+
+        判定优先级（严格）：状态码优先于文本。
+        1. 2xx 或 None 状态码 → "success"，绝不调用 quota_error_fn
+           （配额词可能出现在正常对话内容里，对 2xx 做文本兜底会误熔断）。
+        2. 状态码命中 _HTTP_STATUS_CLASSIFICATION → 直接返回映射分类，不看文本。
+        3. 状态码不在映射表且非 2xx → 此时才回退到文本：
+           用 quota_error_fn（None 时 self.quota_error）查配额词，命中返回
+           "retry_other_or_fallback"，否则 "unclassified"。
+        """
+        if status_code is None or 200 <= status_code < 300:
+            return "success"
+        if status_code in _HTTP_STATUS_CLASSIFICATION:
+            return _HTTP_STATUS_CLASSIFICATION[status_code]
+        fn = quota_error_fn if quota_error_fn is not None else self.quota_error
+        if fn(body_text):
+            return "retry_other_or_fallback"
+        return "unclassified"
 
     async def route_request(self, virtual_model_id: str, session_id: str | None, send_fn):
         vm = self._require_vm(virtual_model_id)
