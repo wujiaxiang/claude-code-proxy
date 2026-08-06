@@ -7,7 +7,7 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
-from aggregator import AggregatorEngine, AllPoolsExhausted  # noqa: E402
+from gateways.aggregator.engine import AggregatorEngine, AllPoolsExhausted  # noqa: E402
 
 passed = 0
 failed = 0
