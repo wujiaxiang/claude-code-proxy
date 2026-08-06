@@ -289,6 +289,7 @@ def cmd_refresh(secrets_path: Path, auth: dict) -> int:
     返回新 Token + 新 RefreshToken。刷新成功后写回 secrets.json。
     """
     import urllib.error
+    import urllib.request
     rt = auth.get("refreshToken", "") or _load_secrets(secrets_path).get("trae_work_refresh_token", "")
     if not rt:
         print("❌ 无 refreshToken，无法刷新")

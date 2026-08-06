@@ -24,8 +24,8 @@ def _dpapi_unprotect(encrypted_bytes: bytes) -> bytes:
         _fields_ = [("cbData", ctypes.wintypes.DWORD),
                     ("pbData", ctypes.POINTER(ctypes.c_char))]
 
-    crypt32 = ctypes.windll.crypt32
-    kernel32 = ctypes.windll.kernel32
+    crypt32 = ctypes.windll.crypt32  # pyright: ignore[reportAttributeAccessIssue]  # Windows 专属 DPAPI，Linux 静态检查误报
+    kernel32 = ctypes.windll.kernel32  # pyright: ignore[reportAttributeAccessIssue]  # Windows 专属 DPAPI，Linux 静态检查误报
     blob_in = _DATA_BLOB(len(encrypted_bytes),
                          ctypes.cast(ctypes.c_char_p(encrypted_bytes),
                                      ctypes.POINTER(ctypes.c_char)))
@@ -40,7 +40,7 @@ def _dpapi_unprotect(encrypted_bytes: bytes) -> bytes:
         ctypes.byref(blob_in), None, None, None, None, 0, ctypes.byref(blob_out)
     )
     if not ok:
-        raise OSError(f"CryptUnprotectData failed (WinError {ctypes.get_last_error()})")
+        raise OSError(f"CryptUnprotectData failed (WinError {ctypes.get_last_error()})")  # pyright: ignore[reportAttributeAccessIssue]  # Windows 专属 DPAPI，Linux 静态检查误报
     try:
         return ctypes.string_at(blob_out.pbData, blob_out.cbData)
     finally:

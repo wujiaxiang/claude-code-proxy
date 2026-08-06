@@ -117,7 +117,7 @@ def _post_json(url: str, body: dict, token: str, timeout: int = 20) -> dict:
         return json.loads(resp.read().decode("utf-8"))
 
 
-def _jwt_exp(token: str):
+def _jwt_exp(token: str) -> datetime.datetime | None:
     """解析 JWT exp，返回 (datetime|None)。"""
     try:
         p = token.split(".")[1]
@@ -173,13 +173,15 @@ def trae_status(token: str, refresh_token: str = "") -> dict:
         result["checkin"] = trae_checkin(token)
     except Exception as e:
         result["checkin"] = {"error": str(e)[:200]}
+    _exp = _jwt_exp(token)
     result["refresh"] = {
-        "tokenExpireAt": _jwt_exp(token).isoformat() if _jwt_exp(token) else None,
+        "tokenExpireAt": _exp.isoformat() if _exp else None,
         "refreshExpireAt": None,
     }
     # 从额度响应提取 userId 作为账号显示（Trae 无公开昵称端点）
     try:
         packs = result.get("quota") or []
+        uid = None
         for p in packs:
             uid = None
             # quota 项里不直接带 userId；重新调一次额度接口拿顶层字段
@@ -232,6 +234,8 @@ def _import_handler(label: str):
         "qclaw": ("crack_qclaw_q", "qclaw_status"),
     }.get(label, (None, None))
     if mod_name:
+        if not func_name:
+            return
         import importlib
         mod = importlib.import_module(mod_name)
         CRACK_STATUS_HANDLERS[label] = getattr(mod, func_name)
