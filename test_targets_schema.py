@@ -10,6 +10,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
 import config_store
+from config_store import validate_targets
 
 passed = 0
 failed = 0
@@ -64,7 +65,7 @@ def test_validate_duplicate_labels():
         {"label": "a", "listenPort": 8083, "category": "free", "handler": "passthrough", "targetHost": "y.com", "models": []},
     ]}
     errors = config_store.validate_targets(cfg)
-    assert any("label" in e and "a" in e for e in errors), f"应报重复 label，实际: {errors}"
+    assert any("label" in e["msg"] and "a" in e["msg"] for e in errors), f"应报重复 label，实际: {errors}"
 
 
 def test_validate_duplicate_ports():
@@ -73,7 +74,7 @@ def test_validate_duplicate_ports():
         {"label": "b", "listenPort": 8082, "category": "free", "handler": "passthrough", "targetHost": "y.com", "models": []},
     ]}
     errors = config_store.validate_targets(cfg)
-    assert any("端口" in e or "port" in e.lower() for e in errors), f"应报重复端口，实际: {errors}"
+    assert any("端口" in e["msg"] or "port" in e["msg"].lower() for e in errors), f"应报重复端口，实际: {errors}"
 
 
 def test_validate_invalid_category():
@@ -81,7 +82,7 @@ def test_validate_invalid_category():
         {"label": "a", "listenPort": 8082, "category": "hack", "handler": "passthrough", "targetHost": "x.com", "models": []},
     ]}
     errors = config_store.validate_targets(cfg)
-    assert any("category" in e for e in errors), f"应报非法 category，实际: {errors}"
+    assert any("category" in e["msg"] for e in errors), f"应报非法 category，实际: {errors}"
 
 
 def test_validate_missing_fields():
@@ -124,7 +125,7 @@ def test_validate_aggregator_missing_virtual_models():
         {"label": "aggregator", "listenPort": 8080, "category": "aggregate", "handler": "aggregator"},
     ]}
     errors = config_store.validate_targets(cfg)
-    assert any("aggregator" in e and "virtualModels" in e for e in errors), f"应报缺少 virtualModels，实际: {errors}"
+    assert any("aggregator" in e["msg"] and "virtualModels" in e["msg"] for e in errors), f"应报缺少 virtualModels，实际: {errors}"
 
 
 def test_validate_aggregator_empty_virtual_models():
@@ -134,7 +135,7 @@ def test_validate_aggregator_empty_virtual_models():
          "virtualModels": {}},
     ]}
     errors = config_store.validate_targets(cfg)
-    assert any("aggregator" in e and "virtualModels" in e for e in errors), f"应报空 virtualModels，实际: {errors}"
+    assert any("aggregator" in e["msg"] and "virtualModels" in e["msg"] for e in errors), f"应报空 virtualModels，实际: {errors}"
 
 
 def test_validate_aggregator_empty_default_pool():
@@ -144,7 +145,7 @@ def test_validate_aggregator_empty_default_pool():
          "virtualModels": {"agg:sonnet": {"defaultPool": []}}},
     ]}
     errors = config_store.validate_targets(cfg)
-    assert any("agg:sonnet" in e and "defaultPool" in e for e in errors), f"应报 defaultPool 为空，实际: {errors}"
+    assert any("agg:sonnet" in e["msg"] and "defaultPool" in e["msg"] for e in errors), f"应报 defaultPool 为空，实际: {errors}"
 
 
 def test_validate_aggregator_bad_pool_member():
@@ -154,7 +155,7 @@ def test_validate_aggregator_bad_pool_member():
          "virtualModels": {"agg:sonnet": {"defaultPool": [{"port": 8082}]}}},
     ]}
     errors = config_store.validate_targets(cfg)
-    assert any("agg:sonnet" in e and "model" in e for e in errors), f"应报成员缺 model，实际: {errors}"
+    assert any("agg:sonnet" in e["msg"] and "model" in e["msg"] for e in errors), f"应报成员缺 model，实际: {errors}"
 
 
 def test_validate_aggregator_bad_weight():
@@ -164,7 +165,7 @@ def test_validate_aggregator_bad_weight():
          "virtualModels": {"agg:sonnet": {"defaultPool": [{"port": 8082, "model": "m", "weight": -1}]}}},
     ]}
     errors = config_store.validate_targets(cfg)
-    assert any("agg:sonnet" in e and "weight" in e for e in errors), f"应报 weight 非法，实际: {errors}"
+    assert any("agg:sonnet" in e["msg"] and "weight" in e["msg"] for e in errors), f"应报 weight 非法，实际: {errors}"
 
 
 # ─── models / modelDefaults 顶层配置校验 ───
@@ -181,7 +182,7 @@ def test_validate_models_bad_default_port():
     """modelDefaults.defaultPort 为负数 → 报错。"""
     cfg = {"targets": [], "modelDefaults": {"defaultPort": -1}, "models": []}
     errors = config_store.validate_targets(cfg)
-    assert any("defaultPort" in e for e in errors), f"应报 defaultPort 非法，实际: {errors}"
+    assert any("defaultPort" in e["msg"] for e in errors), f"应报 defaultPort 非法，实际: {errors}"
 
 
 def test_validate_models_missing_field():
@@ -189,7 +190,7 @@ def test_validate_models_missing_field():
     cfg = {"targets": [], "modelDefaults": {"defaultPort": 8082},
            "models": [{"name": "a", "aliases": [], "target": {"port": 8082}}]}
     errors = config_store.validate_targets(cfg)
-    assert any("model" in e for e in errors), f"应报缺 target.model，实际: {errors}"
+    assert any(e["path"] == "models[0].target.model" for e in errors), f"应报缺 target.model，实际: {errors}"
 
 
 def test_validate_models_duplicate_alias():
@@ -198,7 +199,58 @@ def test_validate_models_duplicate_alias():
            "models": [{"name": "a", "aliases": ["dup"], "target": {"port": 8082, "model": "x"}},
                       {"name": "b", "aliases": ["dup"], "target": {"port": 8083, "model": "y"}}]}
     errors = config_store.validate_targets(cfg)
-    assert any("dup" in e for e in errors), f"应报重复别名，实际: {errors}"
+    assert any("dup" in e["msg"] for e in errors), f"应报重复别名，实际: {errors}"
+
+
+# ─── P2 结构化错误（RED：validate_targets 当前返回 str，重构后应返回 {"path","msg"}） ───
+def _assert_structured(errors, ctx=""):
+    """严格判定每个元素是 dict 且含 path/msg 两键。字符串元素必然失败（防误 GREEN）。"""
+    assert isinstance(errors, list), f"{ctx}: 返回值应为 list，实际 {type(errors).__name__}"
+    assert errors, f"{ctx}: 应至少报一个错误，实际为空"
+    for e in errors:
+        assert isinstance(e, dict), f"{ctx}: 元素应为 dict（结构化错误），实际 {type(e).__name__}: {e!r}"
+        assert "path" in e and "msg" in e, f"{ctx}: 元素应含 path/msg 两键，实际 keys={sorted(e)}"
+        assert isinstance(e["path"], str) and isinstance(e["msg"], str), \
+            f"{ctx}: path/msg 应为 str，实际 {e!r}"
+
+
+def _paths(errors):
+    """提取 path 集合；非 dict 元素直接跳过，保证字符串返回值无法误命中。"""
+    return {e["path"] for e in errors if isinstance(e, dict) and "path" in e}
+
+
+def test_validate_targets_returns_structured():
+    """缺 label 的 target → 返回 [{"path","msg"}] 结构化列表，而非字符串列表。"""
+    cfg = {"targets": [
+        {"listenPort": 8082, "category": "crack", "handler": "passthrough",
+         "targetHost": "x.com", "crackTool": "crack_x.py", "models": []},
+    ]}
+    errors = validate_targets(cfg)
+    _assert_structured(errors, "缺 label")
+
+
+def test_validate_targets_path_addressing():
+    """3 个 target，index 2 缺 label → 存在 path == 'targets[2].label' 的错误项。"""
+    ok = {"category": "free", "handler": "passthrough", "targetHost": "x.com", "models": []}
+    cfg = {"targets": [
+        {"label": "a", "listenPort": 8090, **ok},
+        {"label": "b", "listenPort": 8091, **ok},
+        {"listenPort": 8092, **ok},  # index 2 缺 label
+    ]}
+    errors = validate_targets(cfg)
+    _assert_structured(errors, "targets[2] 缺 label")
+    assert "targets[2].label" in _paths(errors), \
+        f"应有 path='targets[2].label'，实际 paths={sorted(_paths(errors))}"
+
+
+def test_validate_targets_model_path():
+    """models[1] 非 dict → 错误 path 定位到 models[1]（含子路径前缀亦可）。"""
+    cfg = {"targets": [], "modelDefaults": {"defaultPort": 8082},
+           "models": [{"id": "a"}, "bad"]}
+    errors = validate_targets(cfg)
+    _assert_structured(errors, "models[1] 非 dict")
+    assert any(p == "models[1]" or p.startswith("models[1].") for p in _paths(errors)), \
+        f"应有 path 指向 models[1]，实际 paths={sorted(_paths(errors))}"
 
 
 # ─── secrets 读写与打码 ───
@@ -383,5 +435,97 @@ def test_handler_prepare_body_cross_port():
         _srv._MODELS_CFG["modelDefaults"] = {"defaultPort": 8082}
 
 
+# ─── P2: _get_target_models 统一接口契约测试（RED：函数尚未实现）───
+def _inject_targets(targets, models=None, model_defaults=None):
+    """临时把 fixture 注入 server 全局，返回还原函数。"""
+    import server as _srv
+    saved_t = _srv._TARGETS
+    saved_m = _srv._MODELS_CFG
+    _srv._TARGETS = targets
+    if models is not None or model_defaults is not None:
+        _srv._MODELS_CFG = {
+            "models": models or [],
+            "modelDefaults": model_defaults or {"defaultPort": 8082},
+        }
+    def restore():
+        # 必须逐条 setattr：setattr 返回 None，用 and 串联会短路导致后者永不执行，
+        # _MODELS_CFG 泄漏到后续测试（曾使 8081/validate 系列在全量跑时集体假失败）。
+        _srv._TARGETS = saved_t
+        _srv._MODELS_CFG = saved_m
+
+    return restore
+
+
+def test_get_target_models_copilot():
+    """copilot handler → 上游 /models 拉取（mock），source=copilot。"""
+    import server as _srv
+    from unittest.mock import patch
+    tgt = {"label": "copilot-8082", "listenPort": 8082, "category": "crack",
+           "handler": "copilot", "targetHost": "x", "crackTool": "gh"}
+    restore = _inject_targets([tgt])
+    try:
+        with patch("server._fetch_live_models", return_value=["gpt-4", "gpt-3.5-turbo"]):
+            models = _srv._get_target_models("copilot-8082")
+        assert models, "copilot 应返回非空模型列表"
+        assert all(isinstance(m, dict) and m.get("source") == "copilot" for m in models), \
+            f"copilot 模型 source 应为 copilot: {models}"
+    finally:
+        restore()
+
+
+def test_get_target_models_static():
+    """codebuddy/qclaw 类 → target.get('models') 静态来源，source 正确。"""
+    import server as _srv
+    tgt = {"label": "codebuddy-8084", "listenPort": 8084, "category": "crack",
+           "handler": "passthrough", "targetHost": "x",
+           "models": [{"id": "m1", "enabled": True}]}
+    restore = _inject_targets([tgt])
+    try:
+        models = _srv._get_target_models("codebuddy-8084")
+        assert models, "静态模型应非空"
+        assert models[0]["id"] == "m1", f"应含 m1: {models}"
+        assert models[0].get("source") in ("codebuddy", "qclaw", "trae-work", "passthrough"), \
+            f"source 应标记静态来源: {models[0]}"
+    finally:
+        restore()
+
+
+def test_get_target_models_anthropic():
+    """8081 anthropic 端口 → 等价于 _anthropic_port_models()，source=anthropic。"""
+    import server as _srv
+    tgt = {"label": "anthropic-compatible", "listenPort": 8081, "category": "free",
+           "handler": "passthrough", "targetHost": "x"}
+    restore = _inject_targets([tgt],
+                               models=[{"name": "sonnet", "aliases": ["s"], "target": {"port": 8082, "model": "claude-sonnet"}}],
+                               model_defaults={"defaultPort": 8081})
+    try:
+        models = _srv._get_target_models("anthropic-compatible")
+        ref = _srv._anthropic_port_models()
+        assert models, "anthropic 端口应返回模型"
+        assert [m["id"] for m in models] == [m["id"] for m in ref], \
+            f"应与 _anthropic_port_models 一致: {models} != {ref}"
+        assert all(m.get("source") == "anthropic" for m in models), \
+            f"source 应为 anthropic: {models}"
+    finally:
+        restore()
+
+
+def test_get_target_models_aggregator():
+    """aggregator → virtualModels，source=aggregator。"""
+    import server as _srv
+    tgt = {"label": "agg-8080", "listenPort": 8080, "category": "aggregate",
+           "handler": "aggregator",
+           "virtualModels": {"agg:sonnet": {"defaultPool": [{"port": 8082, "model": "claude-sonnet"}]}}}
+    restore = _inject_targets([tgt])
+    try:
+        models = _srv._get_target_models("agg-8080")
+        assert models, "聚合网关应返回虚拟模型"
+        assert all(m.get("source") == "aggregator" for m in models), \
+            f"source 应为 aggregator: {models}"
+        assert any(m["id"] == "agg:sonnet" for m in models), f"应含 agg:sonnet: {models}"
+    finally:
+        restore()
+
+
 if __name__ == "__main__":
-    sys.exit(main())
+    main()
