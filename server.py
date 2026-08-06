@@ -398,7 +398,7 @@ async def _reset_litellm_clients():
         logger.info("🔄 proxy http client reset")
     # 2) 清除 litellm 异步客户端
     try:
-        await _llm.close_litellm_async_clients()
+        await _llm.close_litellm_async_clients()  # pyright: ignore[reportPrivateImportUsage] - litellm 未在 __all__ 导出但为公开运行时 API
         logger.info("🔄 litellm async clients reset")
     except Exception as _e:
         logger.warning(f"Failed to reset litellm async clients: {_e}")
@@ -443,7 +443,8 @@ def _is_rate_limit_error(exc: Exception) -> bool:
     命中后调用方应返回 HTTP 429 + Retry-After，让下游客户端（如 opencode）自动重试。
     关键字复用 _VENDOR_ERROR_MAPS，保持单点维护。
     """
-    if isinstance(exc, (litellm.RateLimitError, getattr(litellm, "RouterRateLimitError", ()))):
+    from litellm.exceptions import RateLimitError as _LiteLLMRateLimitError  # litellm.RateLimitError 的同一个类，走公开导出路径
+    if isinstance(exc, (_LiteLLMRateLimitError, getattr(litellm, "RouterRateLimitError", ()))):
         return True
     text = str(exc)
     if not text:
@@ -508,19 +509,21 @@ def _convert_oai_to_anthropic(oai_data: dict, request, original_model: str):  # 
             except Exception as _e:
                 logger.debug(f"tiktoken output estimate failed: {_e}")
 
-    return MessagesResponse(
-        id=f"msg_{uuid.uuid4().hex[:12]}",
-        type="message",
-        role="assistant",
-        model=original_model,
-        content=content_blocks or [{"type": "text", "text": ""}],
-        stop_reason=choice.get("finish_reason") or "stop",
-        stop_sequence=None,
-        usage=Usage(
+    # 用 model_validate 而非关键字构造：content/stop_reason 是运行时 dict/动态字符串，
+    # 交给 Pydantic 校验与关键字构造完全等价，且避免静态类型层的字面量不匹配。
+    return MessagesResponse.model_validate({
+        "id": f"msg_{uuid.uuid4().hex[:12]}",
+        "type": "message",
+        "role": "assistant",
+        "model": original_model,
+        "content": content_blocks or [{"type": "text", "text": ""}],
+        "stop_reason": choice.get("finish_reason") or "stop",
+        "stop_sequence": None,
+        "usage": Usage(
             input_tokens=prompt_tokens,
             output_tokens=completion_tokens,
         ),
-    )
+    })
 
 
 @asynccontextmanager
@@ -528,7 +531,7 @@ async def lifespan(app):
     # 网关抓包：CAPTURE_GATEWAY=true 时激活
     if os.environ.get("CAPTURE_GATEWAY", "").lower() == "true":
         try:
-            from _gateway_capture import activate_capture, get_capture_file
+            from _gateway_capture import activate_capture, get_capture_file  # pyright: ignore[reportMissingImports] - 可选调试模块（CAPTURE_GATEWAY=true 才存在）
             activate_capture()
             logger.info(f"📡 Gateway capture activated → {get_capture_file()}")
         except Exception as _ce:
@@ -1164,7 +1167,7 @@ async def _write_response_with_status_override(writer, resp, effective_status: i
             pass
 
 
-def _resolve_auth(headers: dict, target: dict = None, provider: str = None) -> dict:
+def _resolve_auth(headers: dict, target: Optional[dict] = None, provider: Optional[str] = None) -> dict:
     """统一鉴权 headers 解析。
     - target 有 apikey → 注入（覆盖客户端传入的 key，vendor 场景）
     - target 有 apikeyEnv → 从环境变量读取（避免 key 明文入仓）
@@ -1183,7 +1186,8 @@ def _resolve_auth(headers: dict, target: dict = None, provider: str = None) -> d
 
     if api_key:
         fwd["authorization"] = f"Bearer {api_key}"
-        logger.debug(f"key: injected ({target.get('label', 'unknown')})")
+        # api_key 非空蕴含 target 非空，(target or {}) 仅为类型收窄，取值等价
+        logger.debug(f"key: injected ({(target or {}).get('label', 'unknown')})")
     elif headers.get("authorization"):
         fwd["authorization"] = headers["authorization"]
         logger.debug("key: passed through from client request")
@@ -1719,13 +1723,14 @@ async def _get_target_models_async(label: str) -> List[dict]:
     return _build_target_models(target, source, live_ids)
 
 
-_ANTHROPIC_STATS: Dict[str, int] = {"totalRequests": 0, "passthroughOk": 0, "passthroughError": 0, "startedAt": datetime.now().isoformat()}
+# 值混合 int 计数与 str 时间戳，故不加值类型约束（与 _TARGET_STATS 同风格）
+_ANTHROPIC_STATS: dict = {"totalRequests": 0, "passthroughOk": 0, "passthroughError": 0, "startedAt": datetime.now().isoformat()}
 
 
 # ─── 8082 OpenAI 协议端口（asyncio TCP，纯透传 + 多 provider 路由）───
 
 _OPENAI_PORT = int(os.environ.get("OPENAI_PORT", "8082"))
-_OPENAI_STATS: Dict[str, int] = {"totalRequests": 0, "passthroughOk": 0, "passthroughError": 0, "startedAt": datetime.now().isoformat()}
+_OPENAI_STATS: dict = {"totalRequests": 0, "passthroughOk": 0, "passthroughError": 0, "startedAt": datetime.now().isoformat()}
 
 
 def _choose_openai_upstream(body_json: dict):
@@ -1981,7 +1986,7 @@ async def _anthropic_server(host="0.0.0.0", port=8081):
     return srv
 
 
-async def _handle_target_request(reader, writer, target):
+async def _handle_target_request(reader, writer, target):  # pyright: ignore[reportGeneralTypeIssues] - 统一透传引擎分支路径多，pyright 放弃分析；拆分会改变转发/统计行为，故仅抑制该诊断
     """统一透传引擎：处理单个 target 端口的全部请求。
     与原 _handle_vendor_request 兼容，新增 handler 分发 / 鉴权注入 / 401 缺 token。
     """
@@ -2831,8 +2836,8 @@ async def log_requests(request: Request, call_next):
     path = request.url.path
 
     # ── 8081 自身统计：/v1/messages 请求数 + 模型级统计 ──
+    req_model = "unknown"
     if path == "/v1/messages" and method == "POST":
-        req_model = "unknown"
         try:
             body = await request.body()
             req_model = json.loads(body.decode("utf-8")).get("model", "unknown") if body else "unknown"
@@ -3062,7 +3067,7 @@ def convert_anthropic_to_litellm(anthropic_request: MessagesRequest) -> Dict[str
                                     for cb in block.content:
                                         if isinstance(cb, dict) and cb.get("type") == "text":
                                             result_content += cb.get("text", "") + "\n"
-                                        elif hasattr(cb, "type") and cb.type == "text":
+                                        elif not isinstance(cb, dict) and hasattr(cb, "type") and cb.type == "text":
                                             result_content += cb.text + "\n"
                                         else:
                                             result_content += str(cb) + "\n"
@@ -3105,7 +3110,7 @@ def convert_anthropic_to_litellm(anthropic_request: MessagesRequest) -> Dict[str
                                 tc["function"]["provider_specific_fields"] = {"thought_signature": sig}
                                 sigs_for_provider.append(sig)
                             tool_calls.append(tc)
-                msg_entry = {"role": "assistant"}
+                msg_entry: Dict[str, Any] = {"role": "assistant"}
                 if text_content:
                     msg_entry["content"] = text_content
                 else:
@@ -3146,7 +3151,7 @@ def convert_anthropic_to_litellm(anthropic_request: MessagesRequest) -> Dict[str
                             )
                     elif block.type == "tool_result":
                         # Handle different formats of tool result content
-                        processed_content_block = {
+                        processed_content_block: Dict[str, Any] = {
                             "type": "tool_result",
                             "tool_use_id": block.tool_use_id
                             if hasattr(block, "tool_use_id")
@@ -3255,11 +3260,13 @@ def convert_anthropic_to_litellm(anthropic_request: MessagesRequest) -> Dict[str
                     logger.error(f"Could not convert tool to dict: {tool}")
                     continue  # Skip this tool if conversion fails
 
+            # 注：tools 声明为 List[Tool]（Pydantic 模型恒有 .dict），上面的 hasattr 分支必进，
+            # tool_dict 在此必然已绑定；pyright 无法推断，故仅抑制该诊断，不改控制流。
             # Clean the schema if targeting a Gemini model
-            input_schema = tool_dict.get("input_schema", {})
+            input_schema = tool_dict.get("input_schema", {})  # pyright: ignore[reportPossiblyUnboundVariable]
             if is_gemini_model:
                 logger.debug(
-                    f"Cleaning schema for Gemini tool: {tool_dict.get('name')}"
+                    f"Cleaning schema for Gemini tool: {tool_dict.get('name')}"  # pyright: ignore[reportPossiblyUnboundVariable]
                 )
                 input_schema = clean_gemini_schema(input_schema)
 
@@ -3267,8 +3274,8 @@ def convert_anthropic_to_litellm(anthropic_request: MessagesRequest) -> Dict[str
             openai_tool = {
                 "type": "function",
                 "function": {
-                    "name": tool_dict["name"],
-                    "description": tool_dict.get("description", ""),
+                    "name": tool_dict["name"],  # pyright: ignore[reportPossiblyUnboundVariable]
+                    "description": tool_dict.get("description", ""),  # pyright: ignore[reportPossiblyUnboundVariable]
                     "parameters": input_schema,  # Use potentially cleaned schema
                 },
             }
@@ -3279,7 +3286,8 @@ def convert_anthropic_to_litellm(anthropic_request: MessagesRequest) -> Dict[str
     # Convert tool_choice to OpenAI format if present
     if anthropic_request.tool_choice:
         if hasattr(anthropic_request.tool_choice, "dict"):
-            tool_choice_dict = anthropic_request.tool_choice.dict()
+            # 声明类型是 Dict[str, Any]（无 .dict），该分支只对实际传入的 Pydantic 对象生效，保持原兼容逻辑
+            tool_choice_dict = anthropic_request.tool_choice.dict()  # pyright: ignore[reportAttributeAccessIssue]
         else:
             tool_choice_dict = anthropic_request.tool_choice
 
@@ -3302,7 +3310,9 @@ def convert_anthropic_to_litellm(anthropic_request: MessagesRequest) -> Dict[str
 
 
 def convert_litellm_to_anthropic(
-    litellm_response: Union[Dict[str, Any], Any], original_request: MessagesRequest
+    # 实参可能是 LiteLLM ModelResponse 或 dict，函数内已用 hasattr/isinstance 逐一分派；
+    # 原 Union[Dict[str, Any], Any] 等价于 Any，写成 Any 才能让静态检查正确反映动态分派。
+    litellm_response: Any, original_request: MessagesRequest
 ) -> MessagesResponse:
     """Convert LiteLLM (OpenAI format) response to Anthropic API response format."""
 
@@ -3354,7 +3364,7 @@ def convert_litellm_to_anthropic(
                 # If .dict() fails, try to use model_dump or __dict__
                 try:
                     response_dict = (
-                        litellm_response.model_dump()
+                        litellm_response.model_dump()  # pyright: ignore[reportAttributeAccessIssue] - 已由 hasattr 保证
                         if hasattr(litellm_response, "model_dump")
                         else litellm_response.__dict__
                     )
@@ -3387,8 +3397,10 @@ def convert_litellm_to_anthropic(
         # ── 处理 reasoning_content（DeepSeek 等模型的思考过程）──
         # DeepSeek 返回的 reasoning_content 是独立字段，需要转为 Anthropic 的 thinking block
         reasoning_text = None
-        if hasattr(message, "model_extra") and isinstance(message.model_extra, dict):
-            reasoning_text = message.model_extra.get("reasoning_content") or message.model_extra.get("reasoning_text")
+        # message 可能是 Pydantic 消息对象 / dict / None，取 model_extra 用 getattr 收窄（与 hasattr+isinstance 等价）
+        _msg_extra = getattr(message, "model_extra", None)
+        if isinstance(_msg_extra, dict):
+            reasoning_text = _msg_extra.get("reasoning_content") or _msg_extra.get("reasoning_text")
         if reasoning_text is None:
             reasoning_text = getattr(message, "reasoning_content", None) or getattr(message, "reasoning_text", None)
         if reasoning_text is None and isinstance(message, dict):
@@ -3540,15 +3552,15 @@ def convert_litellm_to_anthropic(
             content.append({"type": "text", "text": ""})
 
         # Create Anthropic-style response
-        anthropic_response = MessagesResponse(
-            id=response_id,
-            model=original_request.model,
-            role="assistant",
-            content=content,
-            stop_reason=stop_reason,
-            stop_sequence=None,
-            usage=Usage(input_tokens=prompt_tokens, output_tokens=completion_tokens),
-        )
+        anthropic_response = MessagesResponse.model_validate({
+            "id": response_id,
+            "model": original_request.model,
+            "role": "assistant",
+            "content": content,
+            "stop_reason": stop_reason,
+            "stop_sequence": None,
+            "usage": Usage(input_tokens=prompt_tokens, output_tokens=completion_tokens),
+        })
 
         return anthropic_response
 
@@ -3562,19 +3574,19 @@ def convert_litellm_to_anthropic(
         logger.error(error_message)
 
         # In case of any error, create a fallback response
-        return MessagesResponse(
-            id=f"msg_{uuid.uuid4()}",
-            model=original_request.model,
-            role="assistant",
-            content=[
+        return MessagesResponse.model_validate({
+            "id": f"msg_{uuid.uuid4()}",
+            "model": original_request.model,
+            "role": "assistant",
+            "content": [
                 {
                     "type": "text",
                     "text": f"Error converting response: {str(e)}. Please check server logs.",
                 }
             ],
-            stop_reason="end_turn",
-            usage=Usage(input_tokens=0, output_tokens=0),
-        )
+            "stop_reason": "end_turn",
+            "usage": Usage(input_tokens=0, output_tokens=0),
+        })
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -3753,8 +3765,9 @@ async def openai_chat_completions(raw_request: Request):
                                     _choices = resp_data.get("choices") or [{}]
                                     _msg = _choices[0].get("message", {}) if _choices else {}
                                     _out_text = _msg.get("content", "") or ""
-                                    if _msg.get("reasoning_content"):
-                                        _out_text += _msg.get("reasoning_content")
+                                    _reasoning = _msg.get("reasoning_content")
+                                    if _reasoning:
+                                        _out_text += _reasoning
                                     for _tc in _msg.get("tool_calls", []) or []:
                                         try:
                                             _out_text += json.dumps(_tc.get("function", {}).get("arguments", ""), ensure_ascii=False)
@@ -3801,7 +3814,8 @@ async def openai_chat_completions(raw_request: Request):
             else:
                 litellm_req.pop("stream", None)
                 resp = await litellm.acompletion(**litellm_req)
-                return JSONResponse(content=resp.model_dump())
+                # 非流式分支 acompletion 必返回 ModelResponse（stream 已 pop），联合类型里的 CustomStreamWrapper 不会出现
+                return JSONResponse(content=resp.model_dump())  # pyright: ignore[reportAttributeAccessIssue]
 
         return await _do_litellm_call()
 
@@ -3816,7 +3830,9 @@ async def openai_chat_completions(raw_request: Request):
                 async with httpx.AsyncClient(timeout=httpx.Timeout(60.0, connect=5.0), trust_env=False) as client:
                     resp = await client.post(
                         f"{QCLAW_BASE_URL}/chat/completions",
-                        json=_clean_qclaw_body(litellm_req),
+                        # litellm_req 只在翻译分支绑定；qclaw 走透传分支时此处未绑定会 NameError，
+                        # 被下方 except retry_e 捕获转 502（既有行为，不做初始化以免改变语义）
+                        json=_clean_qclaw_body(litellm_req),  # pyright: ignore[reportPossiblyUnboundVariable]
                         headers={
                             "Authorization": f"Bearer {QCLAW_API_KEY}",
                             "Content-Type": "application/json",
@@ -3961,10 +3977,12 @@ async def handle_streaming(
 
                     # Process reasoning content first (avoid Agent context loss)
                     reasoning_text = None
-                    if hasattr(delta, "model_extra") and isinstance(delta.model_extra, dict):
+                    # delta 可能是 Pydantic delta 对象或 dict，用 getattr 取 model_extra（与 hasattr+isinstance 等价）
+                    _delta_extra = getattr(delta, "model_extra", None)
+                    if isinstance(_delta_extra, dict):
                         reasoning_text = (
-                            delta.model_extra.get("reasoning_content")
-                            or delta.model_extra.get("reasoning_text")
+                            _delta_extra.get("reasoning_content")
+                            or _delta_extra.get("reasoning_text")
                         )
                     if reasoning_text is None:
                         reasoning_text = getattr(delta, "reasoning_content", None)
@@ -3992,7 +4010,7 @@ async def handle_streaming(
                     # Process text content
                     delta_content = None
                     if hasattr(delta, "content"):
-                        delta_content = delta.content
+                        delta_content = delta.content  # pyright: ignore[reportAttributeAccessIssue] - delta 为 dict 时 hasattr 为假，走下面分支
                     elif isinstance(delta, dict) and "content" in delta:
                         delta_content = delta["content"]
 
@@ -4022,7 +4040,7 @@ async def handle_streaming(
 
                     # Handle different formats of tool calls
                     if hasattr(delta, "tool_calls"):
-                        delta_tool_calls = delta.tool_calls
+                        delta_tool_calls = delta.tool_calls  # pyright: ignore[reportAttributeAccessIssue] - delta 为 dict 时 hasattr 为假，走下面分支
                     elif isinstance(delta, dict) and "tool_calls" in delta:
                         delta_tool_calls = delta["tool_calls"]
 
@@ -4063,7 +4081,7 @@ async def handle_streaming(
                             if isinstance(tool_call, dict) and "index" in tool_call:
                                 current_index = tool_call["index"]
                             elif hasattr(tool_call, "index"):
-                                current_index = tool_call.index
+                                current_index = tool_call.index  # pyright: ignore[reportAttributeAccessIssue] - 上一分支已处理 dict，此处只可能是对象
                             else:
                                 current_index = 0
 
@@ -4312,7 +4330,8 @@ async def handle_streaming(
                 or original_request.original_model
                 or original_request.model,
                 "stream_phase": "outer_handler",
-                "output_tokens": output_tokens if "output_tokens" in locals() else 0,
+                # 等价于原 `output_tokens if "output_tokens" in locals() else 0`（异常可能发生在赋值前）
+                "output_tokens": locals().get("output_tokens", 0),
             },
         )
 
@@ -5269,7 +5288,7 @@ def _derive_models_source(target: dict) -> str:
 
     优先级：handler 直映射 > Anthropic 入口（8081 / anthropic* label）> label 细分 > passthrough。
     """
-    handler = target.get("handler")
+    handler = target.get("handler") or ""  # 缺 handler 时用 "" 查表，与 None 同样查不到，结果等价
     direct = _MODELS_SOURCE_BY_HANDLER.get(handler)
     if direct:
         return direct
