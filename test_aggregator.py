@@ -313,8 +313,10 @@ def test_classify_failure_status_codes():
     # 关键回归：2xx 即使 body 命中配额文本也绝不判定为熔断/重试
     assert eng.classify_failure(200, "insufficient credit", lambda t: True) == "success"
 
-    # None 状态码按 success 处理
-    assert eng.classify_failure(None, "", lambda t: True) == "success"
+    # None 状态码（无状态码信号）→ 文本兜底：命中配额词 → retry_other_or_fallback
+    assert eng.classify_failure(None, "insufficient credit", lambda t: True) == "retry_other_or_fallback"
+    # None 状态码且文本未命中 → 安全默认 success
+    assert eng.classify_failure(None, "", lambda t: False) == "success"
 
     # 未知状态码且非 2xx → 文本兜底
     assert eng.classify_failure(418, "", lambda t: False) == "unclassified"

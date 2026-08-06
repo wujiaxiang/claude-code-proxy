@@ -303,21 +303,25 @@ class AggregatorEngine:
         """分类一次失败的下游响应，供后续重试/熔断/降级使用。
 
         判定优先级（严格）：状态码优先于文本。
-        1. 2xx 或 None 状态码 → "success"，绝不调用 quota_error_fn
+        1. 2xx 状态码 → "success"，绝不调用 quota_error_fn
            （配额词可能出现在正常对话内容里，对 2xx 做文本兜底会误熔断）。
         2. 状态码命中 _HTTP_STATUS_CLASSIFICATION → 直接返回映射分类，不看文本。
-        3. 状态码不在映射表且非 2xx → 此时才回退到文本：
+        3. 状态码不在映射表（含 None 无状态码信号）→ 此时回退到文本：
            用 quota_error_fn（None 时 self.quota_error）查配额词，命中返回
-           "retry_other_or_fallback"，否则 "unclassified"。
+           "retry_other_or_fallback"。
+           - None 且无状态码信号、文本也未命中 → 安全默认 "success"（裸字符串正常内容）
+           - 有状态码但未知且文本未命中 → "unclassified"
         """
-        if status_code is None or 200 <= status_code < 300:
+        if status_code is not None and 200 <= status_code < 300:
             return "success"
-        if status_code in _HTTP_STATUS_CLASSIFICATION:
+        if status_code is not None and status_code in _HTTP_STATUS_CLASSIFICATION:
             return _HTTP_STATUS_CLASSIFICATION[status_code]
         fn = quota_error_fn if quota_error_fn is not None else self.quota_error
         if fn(body_text):
             return "retry_other_or_fallback"
-        return "unclassified"
+        if status_code is None:
+            return "success"  # 无状态码且文本未命中 → 安全默认成功
+        return "unclassified"  # 有状态码但未知且文本未命中 → unclassified
 
     async def route_request(self, virtual_model_id: str, session_id: str | None, send_fn):
         vm = self._require_vm(virtual_model_id)
@@ -374,7 +378,12 @@ class AggregatorEngine:
 
             latency_ms = (self._clock() - start) * 1000
             status_code = getattr(result, "status_code", None)
-            body_text = self._extract_body_text(result)
+            # 惰性 body 读取：仅当状态码能确定分类（2xx 或命中映射表）时才不需要 body；
+            # None 状态码无成功/分类信号，需要文本兜底，也必须读 body
+            if status_code is not None and (200 <= status_code < 300 or status_code in _HTTP_STATUS_CLASSIFICATION):
+                body_text = ""
+            else:
+                body_text = self._extract_body_text(result)
             classification = self.classify_failure(status_code, body_text, self.quota_error)
 
             # D. 成功（2xx / 无状态码）—— 唯一成功路径
@@ -470,7 +479,12 @@ class AggregatorEngine:
 
                 latency_ms = (self._clock() - start) * 1000
                 status_code = getattr(result, "status_code", None)
-                body_text = self._extract_body_text(result)
+                # 惰性 body 读取：仅当状态码能确定分类（2xx 或命中映射表）时才不需要 body；
+                # None 状态码无成功/分类信号，需要文本兜底，也必须读 body
+                if status_code is not None and (200 <= status_code < 300 or status_code in _HTTP_STATUS_CLASSIFICATION):
+                    body_text = ""
+                else:
+                    body_text = self._extract_body_text(result)
                 classification = self.classify_failure(status_code, body_text, self.quota_error)
 
                 # D. 成功（2xx / 无状态码）—— 降级池成功记 degraded，且不更新会话粘性
@@ -543,6 +557,16 @@ class AggregatorEngine:
         """
         if isinstance(result, str):
             return result
+        # 流式响应（httpx stream=True 未 read）的提前判断：content-type 含
+        # text/event-stream 直接返回 ""，避免访问 .text 触发 httpx.ResponseNotRead
+        # 异常（虽被下方 try/except 兜底，但无谓异常路径会污染日志）。
+        # 核心约束：绝不调用 .aread()/.read() 消费流式 body，否则会破坏
+        # http_adapter 的 _write_response 流式转发（body 只能被下游读一次）。
+        headers = getattr(result, "headers", None)
+        if headers is not None:
+            ct = headers.get("content-type", "") if hasattr(headers, "get") else ""
+            if "text/event-stream" in ct:
+                return ""
         try:
             text = getattr(result, "text", None)
             if text is None:
