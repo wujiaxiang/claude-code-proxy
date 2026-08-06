@@ -3030,6 +3030,23 @@ function aggBreakerInfo(state) {{
   return {{cls: 'agg-dot ok', label: '正常'}};
 }}
 
+function aggErrorLabel(et) {{
+  if (et === '401_auth') return '凭据失效';
+  if (et === '402_billing') return '欠费';
+  if (et === '403_forbidden') return '禁止访问';
+  if (et === '429_rate_limit') return '限流';
+  if (et === 'quota_text') return '配额耗尽';
+  if (et === 'unclassified') return '未分类';
+  if (et === '5xx_persistent') return '5xx 持续';
+  if (et.endsWith('_transient')) return '瞬时限流';
+  return et;
+}}
+
+function formatTs(ts) {{
+  if (!ts || ts === 0) return '—';
+  try {{ return new Date(ts * 1000).toLocaleString(); }} catch {{ return String(ts); }}
+}}
+
 function aggMemberDot(m) {{
   if (!m || m.requests === 0) return 'agg-dot dim';
   var bad = (m.err || 0) + (m.degraded || 0);
@@ -3149,23 +3166,51 @@ async function loadAggregateStatus() {{
         renderPool(fbPool, '降级池') +
         '</div></details>';
     }});
-    // ── 熔断状态区（保留）──
+    // ── ⚠️ 高危事件区：熔断端口 + 错误类型汇总 ──
     var brks = r.breakers || {{}};
     var brkKeys = Object.keys(brks);
-    html += '<div class="agg-vm"><div class="agg-vm-head">熔断状态</div>';
-    if (brkKeys.length === 0) {{
-      html += '<div class="agg-vm-row"><span class="m">无熔断端口</span></div>';
-    }} else {{
-      brkKeys.forEach(function(port) {{
-        var b = brks[port] || {{}};
-        var info = aggBreakerInfo(b.state);
-        html += '<div class="agg-brk"><span class="' + info.cls + '"></span>' +
-          '<span class="m">:' + escHtml(port) + '</span>' +
-          '<span>' + info.label + '</span>' +
-          (b.reason ? '<span class="reason">' + escHtml(b.reason) + '</span>' : '') + '</div>';
+    // 汇总所有虚拟模型的 error_types
+    var errTypeCounts = {{}};
+    var vms = r.virtual_models || {{}};
+    Object.keys(vms).forEach(function(vmId) {{
+      var members = vms[vmId] || {{}};
+      Object.keys(members).forEach(function(mk) {{
+        var m = members[mk] || {{}};
+        var ets = m.error_types || {{}};
+        Object.keys(ets).forEach(function(et) {{
+          errTypeCounts[et] = (errTypeCounts[et] || 0) + ets[et];
+        }});
       }});
+    }});
+    var hasBreakers = brkKeys.length > 0;
+    var hasErrTypes = Object.keys(errTypeCounts).length > 0;
+    if (hasBreakers || hasErrTypes) {{
+      html += '<div class="agg-vm"><div class="agg-vm-head">⚠️ 高危事件</div>';
+      if (hasBreakers) {{
+        html += '<div class="agg-vm-head" style="margin-top:6px; font-size:11px; color:#fbbf24;">熔断端口</div>';
+        brkKeys.forEach(function(port) {{
+          var b = brks[port] || {{}};
+          var info = aggBreakerInfo(b.state);
+          var ts = formatTs(b.tripped_at);
+          html += '<div class="agg-brk"><span class="' + info.cls + '"></span>' +
+            '<span class="m">:' + escHtml(port) + '</span>' +
+            '<span>' + info.label + '</span>' +
+            (b.reason ? '<span class="reason">' + escHtml(b.reason) + '</span>' : '') +
+            (ts !== '—' ? '<span class="reason" style="color:#8b93a7;">' + escHtml(ts) + '</span>' : '') + '</div>';
+        }});
+      }}
+      if (hasErrTypes) {{
+        html += '<div class="agg-vm-head" style="margin-top:6px; font-size:11px; color:#7dd3fc;">错误类型统计</div>';
+        var etKeys = Object.keys(errTypeCounts).sort(function(a,b) {{ return errTypeCounts[b] - errTypeCounts[a]; }});
+        etKeys.forEach(function(et) {{
+          var cnt = errTypeCounts[et];
+          var label = aggErrorLabel(et);
+          html += '<div class="agg-vm-row"><span class="m">' + escHtml(label) + ' <code style="color:#6b7280;font-size:10px;">(' + escHtml(et) + ')</code></span>' +
+            '<span class="s" style="color:#f87171;font-weight:600;">' + cnt + '</span></div>';
+        }});
+      }}
+      html += '</div>';
     }}
-    html += '</div>';
     el.innerHTML = html;
     // 恢复用户展开的池详情（10s 刷新重写 innerHTML 后 open 状态会丢失）
     openIds.forEach(function(id){{

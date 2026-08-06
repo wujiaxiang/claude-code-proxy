@@ -615,7 +615,7 @@ class AggregatorEngine:
         return {
             "virtual_models": per_vm,
             "session": self.session_stats(),
-            "breakers": {port: {"state": b.state, "reason": b.reason} for port, b in self._breakers.items()},
+            "breakers": {port: {"state": b.state, "reason": b.reason, "tripped_at": b.tripped_at} for port, b in self._breakers.items()},
             "started_at": self._started_at,
             "uptime_seconds": uptime_seconds,
         }

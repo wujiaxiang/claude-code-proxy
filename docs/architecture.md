@@ -162,7 +162,7 @@ Anthropic 协议：base_url = http://192.168.2.128:8081，api_key = "dummy"
 - **`virtualModels`**：虚拟模型 id → 配置的字典。每个虚拟模型含 `defaultPool`（必填，非空）+ `fallbackPool`（可空）+ `defaultRetries` / `fallbackRetries`（可省略，回退 `poolDefaults`）
 - **池成员**：`{"port": 下游端口, "model": 真实模型名, "weight": 可选权重}`；`weight` 缺省用 `poolDefaults.weight`（默认 1，平等）
 - **`poolDefaults`**：聚合级默认值，被虚拟模型级字段覆盖
-- **`quotaErrorPatterns`**：配额/积分不足类错误的正则列表（大小写不敏感）。**与 429 限流严格区分**：429 由 `_VENDOR_ERROR_PATTERNS` 翻译但不摘除端口；配额匹配会**熔断**该端口
+- **`quotaErrorPatterns`**：配额/积分不足类错误的正则列表（大小写不敏感），作为**状态码无法分类时的文本兜底**（详见下文「失败分类」）。**与 429 限流严格区分**：429 由 `_VENDOR_ERROR_PATTERNS` 翻译但不摘除端口；配额文本命中会**熔断**该端口
 - 校验（config_store.py）：aggregator target 必须有非空 `virtualModels`，每个虚拟模型必须有非空 `defaultPool`，`fallbackPool` 必须为列表；`targetHost`/`targetPort` 允许为空
 
 ### 路由策略
@@ -173,16 +173,88 @@ Anthropic 协议：base_url = http://192.168.2.128:8081，api_key = "dummy"
 
 ### 重试与降级
 
-1. 默认池尝试 `defaultRetries` 次（每次换成员，避免同一成员重复失败）
+1. 默认池尝试 `defaultRetries` 次（默认每次换成员，避免同一成员重复失败；唯一例外是 408/5xx 的「同端点重试 1 次」，见下文失败分类）
 2. 默认池全部失败 → 降级池尝试 `fallbackRetries` 次（走 `fallbackPool` 成员，成功记为降级）
 3. 全部失败 → **503**（`AllPoolsExhausted`）；降级池为空则默认池失败后直接 503
 
-### 配额熔断与探测恢复
+注意：并非所有非 2xx 都会进重试循环。`pass_through_to_client`（400/404/422）和 `unclassified` 分类会**立即返回客户端**，不消耗剩余重试次数——客户端自己请求写错了，换个下游端口也是一样的错。
 
-- **触发**：下游响应体匹配 `quotaErrorPatterns`（如「余额不足」「积分不足」「resource exhausted」）→ 按**端口**熔断（该端口所有虚拟模型的所有成员一并摘除，`reason: "quota_error"`）
-- **熔断期间**：路由跳过该端口（粘性缓存若指向它也失效重选）；状态由 `tripped_ports()` 暴露
-- **探测恢复**：`_aggregator_prober` 每 5s 检查一次熔断端口是否到达 `probeIntervalSeconds` 间隔，到期发最小探测请求（`{"model": "probe", "max_tokens": 1}`），状态码 < 500 视为恢复并解除熔断，否则保持熔断并重置计时
-- **与 429 的区别**：429 限流由统一转发层的 `_VENDOR_ERROR_PATTERNS` 处理（只翻译状态码、重试策略预留），**不触发熔断**；配额/积分不足才是熔断依据
+### 失败分类（classify_failure 五分类）
+
+每次下游响应都先过 `AggregatorEngine.classify_failure(status_code, body_text)`，返回五种分类之一，后续的重试 / 熔断 / 降级 / 透传全部由分类决定。默认池与降级池用**完全一致**的五分类语义，唯一差异是降级池成功记 `degraded` 且不更新会话粘性。
+
+| 分类 | 含义 | 触发条件 | 行为 |
+|---|---|---|---|
+| `success` | 成功 | 2xx；或无状态码（`None`）且文本未命中配额词 | 正常返回 + 会话粘性生根（降级池记 `degraded`，不生根） |
+| `retry_same` | 可重试 | 408 / 429 / 500 / 502 / 503 / 504 / 508 | **429**：直接换端点，不熔断；**408/5xx**：同端点重试 1 次，仍失败换端点，全程不熔断 |
+| `retry_other_or_fallback` | 应换端点 | 401 / 402 / 403；或未知状态码经文本兜底命中 `quotaErrorPatterns` | **熔断该端口**（reason 具体化）+ 换端点 |
+| `pass_through_to_client` | 直接透传 | 400 / 404 / 422 | 不重试、不换端点、不熔断，响应原样返回客户端 |
+| `unclassified` | 未分类 | 有状态码但不在映射表，且文本未命中 | 按透传处理 + 打 `WARNING` 日志（端口 / 模型 / 状态码 / body 前 200 字符） |
+
+状态码 → 分类的映射表是代码内置常量 `_HTTP_STATUS_CLASSIFICATION`（`gateways/aggregator/engine.py`）：
+
+```
+400 → pass_through_to_client   408 → retry_same    429 → retry_same
+401 → retry_other_or_fallback  422 → pass_through_to_client
+402 → retry_other_or_fallback  500/502/503/504/508 → retry_same
+403 → retry_other_or_fallback  404 → pass_through_to_client
+```
+
+**⚠️ 两条硬规则（判定优先级，务必记住）**
+
+1. **状态码严格优先于文本。** 2xx 响应即使 body 里含 `insufficient credit` / 「余额不足」这类配额词，也**绝不**判定为失败或熔断——这些词完全可能出现在正常对话内容里（用户问「什么是 quota exceeded」），对 2xx 做文本兜底必然误熔断。代码里 2xx 分支直接 `return "success"`，根本不调用 `quota_error_fn`。
+2. **文本兜底只在状态码无法分类时生效。** 只有状态码不在 `_HTTP_STATUS_CLASSIFICATION` 里（未知非 2xx 状态码），才回退去匹配 `quotaErrorPatterns`。命中 → `retry_other_or_fallback`（reason 记 `quota_text`），未命中 → `unclassified`。状态码为 `None`（无状态码信号，如测试注入的裸字符串）且文本未命中时，安全默认 `success`。
+
+性能上还有个惰性优化：状态码已能确定分类（2xx 或命中映射表）时压根不读 body，只有需要文本兜底才调 `_extract_body_text`。流式响应（`text/event-stream`）一律返回空文本，绝不消费流 body（否则会破坏 `_write_response` 的流式转发）。
+
+### 熔断规则与探测恢复
+
+**会触发熔断（trip）的只有四种**，reason 是具体分类字符串，不再是笼统的 `quota_error`：
+
+| 状态码 / 条件 | trip reason | 说明 |
+|---|---|---|
+| 401 | `401_auth` | token 过期 / 无效 |
+| 402 | `402_billing` | 欠费 |
+| 403 | `403_forbidden` | 被封禁 / 无权限 |
+| 未知状态码 + 文本命中 `quotaErrorPatterns` | `quota_text` | 上游用非标准方式包装的配额耗尽 |
+
+**绝不触发熔断的两类**：
+
+- **429（限流）**：账号级瞬时问题，同端点重试无意义 → 立刻换端点。之所以不 trip，是因为熔断粒度是端口，trip 300s 会误伤共享该端口的其它虚拟模型和会话，而限流本身几十秒就自行恢复了。计入 `error_types` 的 `429_rate_limit`。
+- **5xx / 408（网络抖动）**：同端点重试 1 次（首次失败计入 `error_types` 的 `{status}_transient`，如 `500_transient`），仍失败才换端点（记 `5xx_persistent`），全程不熔断。单次抖动就摘端口会误伤健康节点。
+
+**熔断行为**：粒度是**端口**——`trip(port)` 会摘除该端口下*所有*虚拟模型池中的*所有*成员（同一端口可能同时服务 `agg:sonnet` 和 `agg:opus`）。熔断期间路由跳过该端口，粘性缓存若指向它也失效重选。
+
+**探测恢复**：`_aggregator_prober` 每 5s 检查一次熔断端口是否到达 `probeIntervalSeconds` 间隔，到期发最小探测请求（`{"model": "probe", "max_tokens": 1}`），状态码 < 500 视为恢复并解除熔断，否则保持熔断并重置计时。
+
+**与 server.py 429 翻译层的关系（既有设计不变）**：聚合层的 `quotaErrorPatterns` 与统一转发层翻译 429 用的 `_VENDOR_ERROR_PATTERNS` 是**两套完全分离的机制**。后者只翻译状态码文案，不参与聚合层的任何熔断决策。
+
+### 如何新增一条错误规则
+
+先判断这条规则该落在**代码常量表**还是 **targets.json 配置**：
+
+| 场景 | 改哪里 | 生效方式 |
+|---|---|---|
+| 状态码语义清晰的标准错误（401/402/403/429/5xx 这类） | `gateways/aggregator/engine.py` 的 `_HTTP_STATUS_CLASSIFICATION`（必要时同步 `_RETRY_OTHER_REASONS`） | 改代码，需重启服务 |
+| 上游用非标准文本包装配额错误的边缘情况 | `targets.json` 里该 aggregator target 的 `quotaErrorPatterns` | 改配置，mtime 轮询 2s 自动热重载 |
+
+**例 1：某上游用 418 表示配额耗尽，希望被正确分类并熔断。**
+这是状态码规则，改代码常量表。在 `_HTTP_STATUS_CLASSIFICATION` 加一行：
+
+```python
+418: "retry_other_or_fallback",
+```
+
+想让 trip reason 更可读，再在 `_RETRY_OTHER_REASONS` 加 `418: "418_quota"`；不加则统一记为 `quota_text`。改完重启服务。
+
+**例 2：某上游用非标准 body 文本 `over capacity` 表示欠费。**
+这是文本兜底，改 `targets.json` 该 aggregator target 的 `quotaErrorPatterns` 数组：
+
+```jsonc
+"quotaErrorPatterns": ["insufficient credit", "quota exceeded", "余额不足", "over capacity"]
+```
+
+保存即热重载生效。**但要先确认上游返回的状态码**：文本兜底只在状态码不在 `_HTTP_STATUS_CLASSIFICATION` 里时才会被查。如果上游返回 200 带这段文本，2xx 直接判 `success`，这条正则永远不会被触发（这是刻意设计，见上文硬规则 1）；如果上游返回的是 402/403 这类已在表里的状态码，也走不到文本兜底——那种情况本来就已经被正确熔断了，不需要加正则。真正需要这条正则的场景是：上游返回一个**表里没有的非 2xx 状态码**（如 419、520），body 里带自定义配额文案。
 
 ### 认证边界
 
@@ -190,8 +262,25 @@ Anthropic 协议：base_url = http://192.168.2.128:8081，api_key = "dummy"
 
 ### 监控
 
-- `GET /api/aggregate/status`：返回 `configured` + 每虚拟模型每成员的 `requests / ok / err / degraded / avg_latency_ms` + 会话粘性（`cache_size / hits / lookups / hit_rate`）+ 熔断端口（`breakers`）。不包含任何密钥
-- dashboard「聚合网关」分组新增 8080 卡片，运行时状态由前端 fetch `/api/aggregate/status` 填充，**10s 自动刷新**
+`GET /api/aggregate/status`（即 `engine.get_stats()`）返回，不含任何密钥：
+
+- **`virtual_models`**：虚拟模型 id → `{"端口:模型": {requests, ok, err, degraded, avg_latency_ms, error_types}}`。`error_types` 是该成员按错误类型分列的计数字典，键就是上文分类表里的 reason 字符串（`401_auth` / `402_billing` / `403_forbidden` / `quota_text` / `429_rate_limit` / `500_transient` 等 `{status}_transient` / `5xx_persistent` / `pass_through_to_client` / `unclassified`）。这是区分「token 过期」「欠费」「被封禁」「限流触顶」的关键依据——同样是错误计数上涨，401 要去刷 token，402 要去充值，429 只需等限流窗口过去
+- **`session`**：会话粘性 `cache_size / hits / lookups / hit_rate`
+- **`breakers`**：熔断端口 → `{state, reason, tripped_at}`。`state` ∈ `normal` / `tripped` / `probing`，`reason` 为具体分类字符串，`tripped_at` 是熔断发生时的 Unix 时间戳
+- **`started_at` / `uptime_seconds`**
+
+dashboard「聚合网关」分组的 8080 卡片由前端 `loadAggregateStatus()` fetch 该接口填充，**10s 自动刷新**：
+
+- 每个虚拟模型一个可折叠详情块，内含默认池 / 降级池表格（端口·模型 / 权重 / 请求 / 成功率 / 错误 / 降级 / 延迟）；10s 刷新会保留用户已展开的折叠状态
+
+#### ⚠️ 高危事件区
+
+**有熔断端口**（`breakers` 非空）**或**有错误类型计数（汇总后的 `error_types` 非空）时，卡片才额外渲染「⚠️ 高危事件」区块；两者都为空时**整个区块不渲染**（一切正常时不占版面，也没有「无熔断端口」之类的空状态文案）。区块内两部分同样各自按需渲染：
+
+- **熔断端口**（仅 `breakers` 非空时）：每条一行——端口号 + 状态指示灯 + reason 徽标（`401_auth` / `402_billing` / `403_forbidden` / `quota_text`）+ `tripped_at` 本地化时间（`formatTs`；时间戳为 0 或缺失时该时间省略不显示）
+- **错误类型统计**（仅汇总非空时）：把所有虚拟模型所有成员的 `error_types` 汇总相加，按计数**从高到低降序**排列，每行显示中文标签（`aggErrorLabel`，如 `401_auth` → 「凭据失效」）+ 原始 key + 计数。计数为 0 的类型不会出现（`error_types` 里根本没有这个键）
+
+这个区块的价值在于**一眼分辨故障性质**：401 是 token 过期（去重新破解），402 是欠费（去充值），403 是被封禁（换账号），429 是限流触顶（等窗口过去，不必人工介入），`5xx_persistent` 是上游持续不可用（查上游状态）。没有它，dashboard 上只能看到「错误数涨了」，无从判断该动哪个网关。
 
 ### 配置编辑（dashboard，非黑盒）
 
@@ -223,7 +312,7 @@ Anthropic 协议：base_url = http://192.168.2.128:8081，api_key = "dummy"
 
 **管理入口**：dashboard 8081 卡片「✏️ 模型定义」→ `GET/PUT /api/models`
 
-实现：`aggregator.py`（`AggregatorEngine`，纯路由/熔断/统计逻辑，无网络 I/O）+ `server.py`（`_handle_aggregate_request` 分发 / `_aggregator_prober` 探测 / reload 钩子 / `/api/aggregate/status`、`/api/aggregate/config`、`/api/models` / lifespan 预初始化引擎）+ `config_store.py`（aggregate/aggregator 校验 + 顶层 `modelDefaults/models` 校验与保留加载）。
+实现：`gateways/aggregator/engine.py`（`AggregatorEngine`，纯路由/分类/熔断/统计逻辑，无网络 I/O）+ `gateways/aggregator/http_adapter.py`（`_handle_aggregate_request` 分发 / `_aggregator_prober` 探测）+ `server.py`（reload 钩子 / `/api/aggregate/status`、`/api/aggregate/config`、`/api/models` / lifespan 预初始化引擎）+ `config_store.py`（aggregate/aggregator 校验 + 顶层 `modelDefaults/models` 校验与保留加载）。
 
 ## 路径重写（_rewrite_upstream_path）
 
@@ -301,4 +390,6 @@ Anthropic 协议：base_url = http://192.168.2.128:8081，api_key = "dummy"
 | `3003 all models failed` | trae-work | 模型不在多模态白名单时传图（glm 系） | 传图改用内置多模态模型（`Doubao_1_6` 等） |
 | `1005` | trae-work | 同上（doubao 系）/ 模型不可用 | 同上；或换可用模型 |
 | `4001 param is invalid` | trae-work | content 格式错误（如 `image` 字段） | 图片块用标准 `{"type":"image_url","image_url":{"url":...}}` |
-| `402 / 429` | 聚合网关（8080） | 下游配额不足（熔断摘除） / 限流（重试不摘除） | 熔断由 `quotaErrorPatterns` 判定，429 仅翻译 |
+| `401 / 402 / 403` | 聚合网关（8080） | 下游 token 过期 / 欠费 / 被封禁 | 按端口熔断，reason 分别为 `401_auth` / `402_billing` / `403_forbidden`，需人工介入 |
+| `429` | 聚合网关（8080） | 下游账号级限流 | 直接换端点，**不熔断**（限流自行恢复，trip 会误伤共享该端口的其它虚拟模型） |
+| `5xx / 408` | 聚合网关（8080） | 下游网络抖动 | 同端点重试 1 次，仍失败换端点，**不熔断** |
