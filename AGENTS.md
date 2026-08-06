@@ -9,7 +9,7 @@
 
 **claude-code-proxy** 是一个 FastAPI 代理服务，让 Anthropic 客户端（如 Claude Code）能用多种后端（OpenAI / Gemini / Copilot Enterprise / QClaw / CodeBuddy / Trae Work）。
 
-- **主入口**：`server.py`（单文件 ~7000 行，多端口代理引擎 + dashboard 一体化，**配置驱动**——所有端口/供应商/模型由 `targets.json` 定义，改配置不动 server.py）
+- **主入口**：`server.py`（框架层 + 入口，~5500 行）多模块架构：框架层（server.py）+ 网关实现层（`gateways/`）+ 管理面板层（`dashboard/`）。**配置驱动**——所有端口/供应商/模型由 `targets.json` 定义，改配置不动 server.py；改具体网关注辑进 `gateways/<网关>.py`，改 dashboard 进 `dashboard/routes.py`
 - **依赖**：Python 3.10+ / fastapi / uvicorn / httpx / litellm / python-dotenv / tiktoken / pydantic（虚拟环境 `.venv/`，Windows 用 `.venv\Scripts\python.exe`）
 - **配置模块**：`config_store.py`（targets.json 加载/迁移/校验、secrets.json 读写、热重载）
 
@@ -168,20 +168,30 @@ tail -f codebuddy.log                 # 查
 
 ---
 
-## 7. 代码结构（server.py）
+## 7. 代码结构（多模块）
 
-> 单文件 ~7000 行；行号随版本漂移，实际位置用 `grep` 定位，不建议依赖行号。功能模块分组：
+> 2026-08-06 从单文件拆分（原 server.py 10996 行）。三层架构：框架层（server.py）/ 网关实现层（gateways/）/ 管理面板层（dashboard/）。行号随版本漂移，实际位置用 `grep` 定位，不建议依赖行号。
 
-```
-启动链   日志配置 → tiktoken 本地估算（QClaw usage 注入）→ httpx 客户端管理（trust_env=False）+ QClaw body 清理
-         → lifespan（启动诊断 + target 端口启动 + 破解工具调用）→ QClaw API Key DPAPI/AES 解密 → 模型注册 + 全局状态
-转发链   路径重写（_rewrite_upstream_path + _HANDLER_PATH_MAP）+ targets 加载 → 配置热重载（mtime 轮询 2s）
-         → 统一 target 转发引擎（_handle_target_request，多端口核心）→ Provider 策略（_PROVIDER_STRATEGIES）
-         → Anthropic↔LiteLLM 双向转换（翻译层核心）→ /v1/chat/completions → 流式响应（handle_streaming）+ /v1/messages
-网关专属  gemini-native 协议转换 · trae-work 协议代理（_handle_traework）· codebuddy 非流式聚合 · 模型级统计（_bump_model_stats）
-Dashboard  HTML/CSS/JS（DASHBOARD_STYLE + _build_card_html）→ REST API（/api/targets、/api/secret 系列、/api/crack/*、/api/prune-models）
-         → 页面渲染主函数 → catch_all 兜底 + 彩色请求日志 + 主入口
-```
+### 目录结构
+
+- **server.py**（框架层 + 入口，~5500 行）：连接池、日志基础设施、HTTP 转发引擎核心工具（`_parse_http_request`/`_write_response`/`_SseLineBuffer`）、路径重写（`_HANDLER_PATH_MAP`）、Provider 策略注册表（`_PROVIDER_STRATEGIES`）、Anthropic Pydantic 模型、Anthropic↔LiteLLM 翻译层、核心 API 端点（`/v1/chat/completions`、`/v1/messages`）、ModelRegistry、配置热重载、多端口分发核心（`_handle_target_request`/`_vendor_server`）、catch_all 兜底
+  - ⚠️ 顶部有主模块别名代码（`if __name__ == "__main__" and "server" not in sys.modules: sys.modules["server"] = sys.modules["__main__"]`），**禁止删除**（防止 gateways/dashboard 的延迟 import 触发 server 双加载）
+- **gateways/qclaw.py**：QClaw 解密 + body 清洗 + 透传（`_qclaw_provider`）；改 QClaw 逻辑进这里
+- **gateways/codebuddy.py**：CodeBuddy body 清洗 + 流聚合 + SSE 规范化；改 CodeBuddy 逻辑进这里
+- **gateways/trae_work.py**：Trae Work 协议转换 + DSML 解析器族（含 5 套工具调用文本标记解析器，最大网关）；改 Trae Work 逻辑进这里
+- **gateways/gemini_native.py**：Gemini 原生协议转换
+- **gateways/copilot.py**：Copilot Responses API 转换 + GHE 配置
+- **gateways/aggregator/engine.py**：聚合网关纯引擎逻辑（`AggregatorEngine`，路由 / 会话粘性 / 熔断 / 降级）
+- **gateways/aggregator/http_adapter.py**：聚合网关 HTTP 适配（`_handle_aggregate_request`/`_aggregator_prober`）
+  - ⚠️ `_AGGREGATOR_ENGINE` 全局通过 `import server as _srv` + `_srv._AGGREGATOR_ENGINE` 模块属性共享
+- **dashboard/routes.py**：管理面板全套（`DASHBOARD_STYLE` + HTML 渲染 + 18 个 `/api/*` 路由，FastAPI `APIRouter`，server.py 里 `app.include_router(dashboard_router)` 挂载）；改 dashboard 进这里
+- **config_store.py**：`targets.json` 加载/迁移/校验、secrets.json 读写、热重载（独立模块，未拆分）
+
+### 跨模块约定（新增，拆分后必须遵守）
+
+1. 网关模块 / dashboard 对 server 的共享依赖（logger、`get_http_client`、`_cfg` 等）用**函数内延迟导入** `from server import X`——server.py 顶部主模块别名保证不双加载
+2. 热重载可变全局（`_TARGETS`/`_SECRETS`/`_AGGREGATOR_ENGINE` 等）跨模块访问必须用 `import server as _srv` + `_srv.X` 模块属性方式，**禁止 `from server import X`**（值拷贝会在热重载后读到旧快照）
+3. 新增网关 = 在 `gateways/` 建一个模块 + server.py 注册（开闭原则）
 
 ### Provider 策略机制（开闭原则）
 
