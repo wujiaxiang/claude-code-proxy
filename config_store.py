@@ -74,36 +74,49 @@ def load_targets(path: Path = TARGETS_PATH) -> dict:
     return result
 
 
+def _err(errors: list, path: str, msg: str) -> None:
+    """追加一条结构化错误：{"path": 点号寻址, "msg": 人类可读消息}。"""
+    errors.append({"path": path, "msg": msg})
+
+
 def validate_targets(cfg: dict) -> list:
-    """校验配置，返回错误消息列表（空 = 通过）。"""
+    """校验配置，返回结构化错误列表 [{"path", "msg"}]（空 = 通过）。
+
+    path 用点号 + 下标寻址（如 targets[2].label / models[1].target.port），
+    下标一律取 enumerate 序号，缺 label 时也能精确定位。
+    """
     errors = []
     targets = cfg.get("targets", [])
     labels = {}
     ports = {}
 
-    for t in targets:
+    for i, t in enumerate(targets):
         label = t.get("label", "")
+        base = f"targets[{i}]"
         disabled = t.get("enabled") is False
         if not disabled:
             for field in _REQUIRED_FIELDS:
                 if field == "targetHost" and t.get("handler") == "aggregator":
                     continue  # 聚合 target 无真实上游 host，仅由 virtualModels 池定义
                 if not t.get(field):
-                    errors.append(f"target '{label}' 缺少必需字段: {field}")
+                    _err(errors, f"{base}.{field}", f"{base} 缺少必需字段: {field}")
             if t.get("category") not in VALID_CATEGORIES:
-                errors.append(f"target '{label}' category 非法: {t.get('category')}（合法: {VALID_CATEGORIES}）")
+                _err(errors, f"{base}.category",
+                     f"{base} category 非法: {t.get('category')}（合法: {VALID_CATEGORIES}）")
             if t.get("handler") not in VALID_HANDLERS:
-                errors.append(f"target '{label}' handler 非法: {t.get('handler')}（合法: {VALID_HANDLERS}）")
+                _err(errors, f"{base}.handler",
+                     f"{base} handler 非法: {t.get('handler')}（合法: {VALID_HANDLERS}）")
             if t.get("category") == "crack" and not t.get("crackTool"):
-                errors.append(f"crack target '{label}' 缺少 crackTool")
+                _err(errors, f"{base}.crackTool", f"crack {base} 缺少 crackTool")
             if t.get("handler") == "aggregator":
-                _validate_aggregator_target(t, label, errors)
+                _validate_aggregator_target(t, label, base, errors)
         if label in labels:
-            errors.append(f"重复 label: '{label}'")
+            _err(errors, f"{base}.label", f"重复 label: '{label}'")
         labels[label] = True
         port = t.get("listenPort")
         if port in ports:
-            errors.append(f"端口 {port} 被多个 target 占用 ({ports[port]}, {label})")
+            _err(errors, f"{base}.listenPort",
+                 f"端口 {port} 被多个 target 占用 ({ports[port]}, {label})")
         ports[port] = label
 
     # modelDefaults.defaultPort 校验
@@ -111,7 +124,8 @@ def validate_targets(cfg: dict) -> list:
     default_port = model_defaults.get("defaultPort")
     if default_port is not None:
         if not isinstance(default_port, int) or default_port < 0:
-            errors.append("modelDefaults.defaultPort must be a non-negative integer")
+            _err(errors, "modelDefaults.defaultPort",
+                 "modelDefaults.defaultPort must be a non-negative integer")
 
     # models 结构校验与全局唯一性
     _validate_models(cfg.get("models", []), errors)
@@ -120,52 +134,55 @@ def validate_targets(cfg: dict) -> list:
 
 
 def _validate_models(models: list, errors: list) -> None:
-    """校验 models 结构和全局 name/alias 唯一性。"""
+    """校验 models 结构和全局 name/alias 唯一性（追加结构化 {path,msg}）。"""
     if not isinstance(models, list):
-        errors.append("models must be a list")
+        _err(errors, "models", "models must be a list")
         return
 
     seen = set()
     for i, m in enumerate(models):
+        base = f"models[{i}]"
         if not isinstance(m, dict):
-            errors.append(f"models[{i}] must be a dict")
+            _err(errors, base, f"{base} must be a dict")
             continue
 
         # name
         name = m.get("name")
         if not isinstance(name, str) or not name:
-            errors.append(f"models[{i}] missing or invalid 'name' (non-empty string)")
+            _err(errors, f"{base}.name", f"{base} missing or invalid 'name' (non-empty string)")
         else:
             if name in seen:
-                errors.append(f"duplicate model name: '{name}'")
+                _err(errors, f"{base}.name", f"duplicate model name: '{name}'")
             seen.add(name)
 
         # aliases
         aliases = m.get("aliases", [])
         if not isinstance(aliases, list):
-            errors.append(f"models[{i}] 'aliases' must be a list")
+            _err(errors, f"{base}.aliases", f"{base} 'aliases' must be a list")
         else:
             for j, a in enumerate(aliases):
                 if not isinstance(a, str):
-                    errors.append(f"models[{i}].aliases[{j}] must be a string")
+                    _err(errors, f"{base}.aliases[{j}]", f"{base}.aliases[{j}] must be a string")
                 else:
                     if a in seen:
-                        errors.append(f"duplicate alias '{a}' (used by name '{name}' or another alias)")
+                        _err(errors, f"{base}.aliases[{j}]",
+                             f"duplicate alias '{a}' (used by name '{name}' or another alias)")
                     seen.add(a)
 
         # target
         target = m.get("target")
         if not isinstance(target, dict):
-            errors.append(f"models[{i}] missing or invalid 'target' (must be dict)")
+            _err(errors, f"{base}.target", f"{base} missing or invalid 'target' (must be dict)")
         else:
             port = target.get("port")
             if not isinstance(port, int):
-                errors.append(f"models[{i}].target.port must be an integer")
+                _err(errors, f"{base}.target.port", f"{base}.target.port must be an integer")
             elif port == ANTHROPIC_PORT:
-                errors.append(f"models[{i}].target.port must not be {ANTHROPIC_PORT} (anthropic-compatible self-port, would create routing loop)")
+                _err(errors, f"{base}.target.port",
+                     f"{base}.target.port must not be {ANTHROPIC_PORT} (anthropic-compatible self-port, would create routing loop)")
             model_name = target.get("model")
             if not isinstance(model_name, str) or not model_name:
-                errors.append(f"models[{i}].target.model must be a non-empty string")
+                _err(errors, f"{base}.target.model", f"{base}.target.model must be a non-empty string")
 
 
 def _resolve_model_alias(models, requested_model: str) -> Optional[dict]:
@@ -199,63 +216,77 @@ def _resolve_model_alias(models, requested_model: str) -> Optional[dict]:
 
 ANTHROPIC_PORT = 8081  # 从 server.py:2891 的 _ANTHROPIC_PORT = int(os.environ.get("ANTHROPIC_PORT", "8081")) 同源默认值
 
-def _validate_aggregator_target(t: dict, label: str, errors: list) -> None:
-    """校验聚合网关 target：virtualModels / poolDefaults / quotaErrorPatterns。"""
+def _validate_aggregator_target(t: dict, label: str, base: str, errors: list) -> None:
+    """校验聚合网关 target：virtualModels / poolDefaults / quotaErrorPatterns。
+
+    base 为该 target 的点号寻址前缀（如 targets[0]），错误以 {"path","msg"} 结构追加。
+    """
     vm = t.get("virtualModels")
     if not isinstance(vm, dict) or not vm:
-        errors.append(f"aggregator target '{label}' 缺少 virtualModels")
+        _err(errors, f"{base}.virtualModels", f"aggregator target '{label}' 缺少 virtualModels")
         return
     for vmid, entry in vm.items():
+        vbase = f"{base}.virtualModels.{vmid}"
         if not isinstance(entry, dict):
-            errors.append(f"aggregator target '{label}' 虚拟模型 '{vmid}' 配置必须为对象")
+            _err(errors, vbase, f"aggregator target '{label}' 虚拟模型 '{vmid}' 配置必须为对象")
             continue
         default_pool = entry.get("defaultPool")
         if not isinstance(default_pool, list) or not default_pool:
-            errors.append(f"aggregator target '{label}' 虚拟模型 '{vmid}' 缺少非空 defaultPool")
+            _err(errors, f"{vbase}.defaultPool",
+                 f"aggregator target '{label}' 虚拟模型 '{vmid}' 缺少非空 defaultPool")
         else:
             for i, m in enumerate(default_pool):
-                _validate_pool_member(label, vmid, "defaultPool", i, m, errors)
+                _validate_pool_member(label, vmid, "defaultPool", i, m, vbase, errors)
         fallback_pool = entry.get("fallbackPool")
         if fallback_pool is not None and not isinstance(fallback_pool, list):
-            errors.append(f"aggregator target '{label}' 虚拟模型 '{vmid}' 的 fallbackPool 必须为列表")
+            _err(errors, f"{vbase}.fallbackPool",
+                 f"aggregator target '{label}' 虚拟模型 '{vmid}' 的 fallbackPool 必须为列表")
         elif isinstance(fallback_pool, list):
             for i, m in enumerate(fallback_pool):
-                _validate_pool_member(label, vmid, "fallbackPool", i, m, errors)
+                _validate_pool_member(label, vmid, "fallbackPool", i, m, vbase, errors)
         for key in ("defaultRetries", "fallbackRetries"):
             r = entry.get(key)
             if r is not None and (isinstance(r, bool) or not isinstance(r, int) or r < 0):
-                errors.append(f"aggregator target '{label}' 虚拟模型 '{vmid}' 的 {key} 必须为非负整数")
+                _err(errors, f"{vbase}.{key}",
+                     f"aggregator target '{label}' 虚拟模型 '{vmid}' 的 {key} 必须为非负整数")
     pd = t.get("poolDefaults")
     if pd is not None:
         if not isinstance(pd, dict):
-            errors.append(f"aggregator target '{label}' 的 poolDefaults 必须为对象")
+            _err(errors, f"{base}.poolDefaults", f"aggregator target '{label}' 的 poolDefaults 必须为对象")
         else:
             for key in ("defaultRetries", "fallbackRetries", "sessionAffinityTtlSeconds",
                         "probeIntervalSeconds", "weight"):
                 v = pd.get(key)
                 if v is not None and (isinstance(v, bool) or not isinstance(v, (int, float)) or v < 0):
-                    errors.append(f"aggregator target '{label}' 的 poolDefaults.{key} 必须为非负数字")
+                    _err(errors, f"{base}.poolDefaults.{key}",
+                         f"aggregator target '{label}' 的 poolDefaults.{key} 必须为非负数字")
     qep = t.get("quotaErrorPatterns")
     if qep is not None and not isinstance(qep, list):
-        errors.append(f"aggregator target '{label}' 的 quotaErrorPatterns 必须为列表")
+        _err(errors, f"{base}.quotaErrorPatterns", f"aggregator target '{label}' 的 quotaErrorPatterns 必须为列表")
 
 
-def _validate_pool_member(label: str, vmid: str, pool_key: str, idx: int, m: object, errors: list) -> None:
+def _validate_pool_member(label: str, vmid: str, pool_key: str, idx: int, m: object,
+                          vbase: str, errors: list) -> None:
     """校验池成员：必须为 dict 且含 port(int)/model(str)；weight 可选，若非 None 必须为非负数字。"""
+    mbase = f"{vbase}.{pool_key}[{idx}]"
     if not isinstance(m, dict):
-        errors.append(f"aggregator target '{label}' 虚拟模型 '{vmid}' {pool_key}[{idx}] 必须为对象")
+        _err(errors, mbase, f"aggregator target '{label}' 虚拟模型 '{vmid}' {pool_key}[{idx}] 必须为对象")
         return
     port = m.get("port")
     if isinstance(port, bool) or not isinstance(port, int):
-        errors.append(f"aggregator target '{label}' 虚拟模型 '{vmid}' {pool_key}[{idx}] 的 port 必须为整数")
+        _err(errors, f"{mbase}.port",
+             f"aggregator target '{label}' 虚拟模型 '{vmid}' {pool_key}[{idx}] 的 port 必须为整数")
     elif port == ANTHROPIC_PORT:
-        errors.append(f"aggregator target '{label}' 虚拟模型 '{vmid}' {pool_key}[{idx}] 的 port 不得为 {ANTHROPIC_PORT}（anthropic-compatible 自身端口，会形成路由死循环）")
+        _err(errors, f"{mbase}.port",
+             f"aggregator target '{label}' 虚拟模型 '{vmid}' {pool_key}[{idx}] 的 port 不得为 {ANTHROPIC_PORT}（anthropic-compatible 自身端口，会形成路由死循环）")
     model = m.get("model")
     if not isinstance(model, str) or not model:
-        errors.append(f"aggregator target '{label}' 虚拟模型 '{vmid}' {pool_key}[{idx}] 的 model 必须为非空字符串")
+        _err(errors, f"{mbase}.model",
+             f"aggregator target '{label}' 虚拟模型 '{vmid}' {pool_key}[{idx}] 的 model 必须为非空字符串")
     weight = m.get("weight")
     if weight is not None and (isinstance(weight, bool) or not isinstance(weight, (int, float)) or weight < 0):
-        errors.append(f"aggregator target '{label}' 虚拟模型 '{vmid}' {pool_key}[{idx}] 的 weight 必须为非负数字")
+        _err(errors, f"{mbase}.weight",
+             f"aggregator target '{label}' 虚拟模型 '{vmid}' {pool_key}[{idx}] 的 weight 必须为非负数字")
 
 
 def save_targets(cfg: dict, path: Path = TARGETS_PATH) -> None:
