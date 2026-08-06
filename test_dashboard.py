@@ -341,6 +341,90 @@ def test_model_master_toggle():
     assert "syncMasterState" in body or "model-master" in body, "应有总开关联动 JS"
 
 
+# ─── P2 回归快照基线（ModelRegistry 接入前锁定当前行为） ───
+# Wave4 将 dashboard() 从直接读 _TARGETS 改为读 ModelRegistry 后，这些测试必须仍 PASS。
+import server as _server
+
+
+def test_dashboard_registry_equivalence_models():
+    """卡片数量、copilot 卡片存在、8081 模型数均与 server 内部状态一致。
+
+    当前 dashboard() 直接读 _TARGETS / _MODELS_CFG 渲染；Wave4 改读 ModelRegistry
+    后这些不变式必须保持——卡片数不丢、8081 模型数不变、分类栅栏完整。
+    """
+    status, body = _get_dashboard()
+    assert status == 200, f"dashboard HTTP {status}"
+
+    # ① 卡片数量 = 2 特殊卡片（8080 聚合 + 8081 anthropic-compatible）
+    #   + 10 个非 aggregate 的 enabled target（aggregator 类在卡片循环中被 pass 跳过）
+    ports = re.findall(r'data-port="(\d+)"', body)
+    assert len(ports) >= 10, f"至少 10 个 data-port 卡片，实际 {len(ports)}"
+    # enabled 且非 aggregate 类 target 数 = 渲染出的 target 卡片数下限
+    enabled_targets = [t for t in _server._TARGETS if t.get("enabled", True)]
+    non_agg_targets = [t for t in enabled_targets if t.get("category") != "aggregate"]
+    assert len(ports) == len(non_agg_targets) + 2, (
+        f"卡片总数应为 {len(non_agg_targets) + 2}（{len(non_agg_targets)} 个 target 卡片 + 8080/8081），"
+        f"实际 {len(ports)}"
+    )
+
+    # ② 已知 copilot-enterprise 卡片存在（data-port="8082"）
+    assert "8082" in ports, "缺少 copilot-enterprise (8082) 卡片"
+
+    # ③ 8081 卡片模型区模型数 = _anthropic_port_models() 返回值数（当前 3: sonnet/haiku/opus）
+    ap_models = _server._anthropic_port_models()
+    # 定位方法：以 data-port="8081" 为锚点，向前找到第一个 <tbody>，
+    # 在其中计数 <tr data-model= 行（所有 model-table 行均带 data-model 属性）
+    port_8081_pos = body.find('data-port="8081"')
+    assert port_8081_pos != -1, "dashboard 中未找到 8081 卡片 data-port 属性"
+    tbody_start = body.find("<tbody>", port_8081_pos)
+    tbody_end = body.find("</tbody>", tbody_start)
+    assert tbody_start != -1 and tbody_end != -1, "8081 卡片中未找到模型表 tbody"
+    tbody = body[tbody_start:tbody_end]
+    model_rows = re.findall(r'<tr[^>]*data-model=', tbody)
+    assert len(model_rows) == len(ap_models), (
+        f"8081 卡片模型行数应为 {len(ap_models)}，实际 {len(model_rows)}"
+    )
+
+
+def test_dashboard_dangling_banner():
+    """悬空引用警示条：当前无悬空时不应显示。
+
+    id="dangling-bar" 的 div 存在于 HTML 中，但 /api/config/dangling 返回空列表，
+    前端 loadDanglingBar() 会移除 show class。断言标记存在且 API 无悬空项。
+    """
+    # 验证 dangling-bar DOM 元素存在
+    _, body = _get_dashboard()
+    assert 'id="dangling-bar"' in body, "dashboard 应包含 dangling-bar 容器 div"
+
+    # 验证 API 端点返回空项（当前配置无悬空引用）
+    conn = http.client.HTTPConnection("127.0.0.1", 8081, timeout=15)
+    conn.request("GET", "/api/config/dangling")
+    resp = conn.getresponse()
+    data = json.loads(resp.read().decode("utf-8", errors="replace"))
+    conn.close()
+    assert resp.status == 200, f"dangling API HTTP {resp.status}"
+    items = data.get("items", [])
+    assert items == [], f"当前配置应无悬空引用，实际 {len(items)} 条: {items}"
+
+
+def test_dashboard_models_endpoint_shape():
+    """/api/targets/{label}/models 端点返回含 .model-table 的 HTML（查看视图）。
+
+    该端点由 get_models_html() 渲染，当前直接读 target 配置构建模型表。
+    Wave4 改读 ModelRegistry 后返回的 HTML 结构应等价——无论如何源变，客户端看见的
+    还是包含 .model-table 和 model 行的标准结构。
+    """
+    # copilot-enterprise（8082，handler=copilot）支持上游模型拉取
+    conn = http.client.HTTPConnection("127.0.0.1", 8081, timeout=30)
+    conn.request("GET", "/api/targets/copilot-enterprise/models")
+    resp = conn.getresponse()
+    body = resp.read().decode("utf-8", errors="replace")
+    conn.close()
+    assert resp.status == 200, f"/api/targets/copilot-enterprise/models HTTP {resp.status}"
+    assert "model-table" in body, "模型端点应返回 model-table 样式的 HTML"
+    assert "<tr" in body, "模型端点应包含模型表行"
+
+
 def main():
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     failed = 0

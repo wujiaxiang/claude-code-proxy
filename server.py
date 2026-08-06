@@ -3789,35 +3789,52 @@ def _live_model_ids(target: dict) -> List[str]:
     return [str(m) for m in (result or [])]
 
 
-def _get_target_models(label: str) -> List[dict]:
-    """统一接口：返回某 target 的模型列表，收敛四种 modelsSource。
+def _target_model_source(target: dict) -> str:
+    """target 的模型来源标记，与 _get_target_models 的分派规则同源。
 
-    返回 [{id, display_name, aliases, target, source}]，source 标记来源：
-    anthropic（8081 顶层 models[]）/ aggregator（virtualModels）/
-    copilot（上游实时拉取）/ codebuddy|qclaw|trae-work|<handler>（静态 models[]）。
-    label 不存在时返回 []。
+    纯配置推断，不触发任何上游请求 —— 因此可在 async 的 dashboard 渲染路径里
+    安全调用（_get_target_models 对 copilot 会 asyncio.run 拉取上游，在运行中的
+    事件循环里会抛 RuntimeError，且每张卡片一次网络往返）。
     """
-    target = next((t for t in _TARGETS if t.get("label") == label), None)
-    if target is None:
-        return []
-
+    label = str(target.get("label") or "")
     if target.get("listenPort") == 8081 or label == "anthropic-compatible":
-        return [{**m, "source": "anthropic"} for m in _anthropic_port_models()]
-
+        return "anthropic"
     handler = target.get("handler")
     if handler == "aggregator":
+        return "aggregator"
+    if handler == "copilot":
+        return "copilot"
+    return _static_model_source(target)
+
+
+def _build_target_models(target: dict, source: str, live_ids: List[str]) -> List[dict]:
+    """按 source 装配模型列表。copilot 的上游 id 由调用方注入。
+
+    唯一实现，_get_target_models（同步）与 _get_target_models_async（async 路径）
+    共用；copilot 的上游拉取方式是二者唯一的差异，故作为参数传入而非在此分支。
+    """
+    if source == "anthropic":
+        return [{**m, "source": "anthropic"} for m in _anthropic_port_models()]
+
+    if source == "aggregator":
         return [
             {"id": str(vid), "display_name": str(vid), "aliases": [], "target": {}, "source": "aggregator"}
             for vid in (target.get("virtualModels") or {})
         ]
 
-    if handler == "copilot":
+    if source == "copilot":
+        # enabled 取自 targets.json 白名单：上游返回的是全量模型，而面板只展示
+        # 已开启的那些。一律 True 会把被关掉的模型重新显示出来（copilot 曾由 4 变 44）。
+        local_enabled = {
+            str(m.get("id")): m.get("enabled", True)
+            for m in (target.get("models") or []) if isinstance(m, dict) and m.get("id")
+        }
         return [
-            {"id": mid, "display_name": mid, "aliases": [], "target": {}, "source": "copilot"}
-            for mid in _live_model_ids(target)
+            {"id": mid, "display_name": _humanize_model_name(mid), "aliases": [],
+             "enabled": local_enabled.get(mid, True), "target": {}, "source": "copilot"}
+            for mid in live_ids
         ]
 
-    source = _static_model_source(target)
     out: List[dict] = []
     for m in (target.get("models") or []):
         mid = str(m.get("id")) if isinstance(m, dict) else str(m)
@@ -3825,12 +3842,52 @@ def _get_target_models(label: str) -> List[dict]:
             continue
         out.append({
             "id": mid,
-            "display_name": (m.get("display_name") if isinstance(m, dict) else None) or mid,
+            # 无显式 display_name 时回落 _humanize_model_name，与 _anthropic_port_models
+            # 及 _model_details_html 的既有渲染保持一致（回落成裸 id 会改变面板显示名）。
+            "display_name": (m.get("display_name") if isinstance(m, dict) else None) or _humanize_model_name(mid),
             "aliases": list(m.get("aliases") or []) if isinstance(m, dict) else [],
+            # enabled 是模型白名单开关，必须原样带出：dashboard 只渲染 enabled 的模型，
+            # 缺字段会被 _model_details_html 默认成 True，把已关闭的模型重新显示出来。
+            "enabled": m.get("enabled", True) if isinstance(m, dict) else True,
             "target": {},
             "source": source,
         })
     return out
+
+
+def _get_target_models(label: str) -> List[dict]:
+    """统一接口（同步）：返回某 target 的模型列表，收敛四种 modelsSource。
+
+    返回 [{id, display_name, aliases, enabled, target, source}]，source 标记来源：
+    anthropic（8081 顶层 models[]）/ aggregator（virtualModels）/
+    copilot（上游实时拉取）/ codebuddy|qclaw|trae-work|<handler>（静态 models[]）。
+    label 不存在时返回 []。
+
+    注意：copilot target 会同步拉取上游（asyncio.run），故不可在运行中的事件
+    循环里调用——async 路径请用 _get_target_models_async。
+    """
+    target = next((t for t in _TARGETS if t.get("label") == label), None)
+    if target is None:
+        return []
+    source = _target_model_source(target)
+    live_ids = _live_model_ids(target) if source == "copilot" else []
+    return _build_target_models(target, source, live_ids)
+
+
+async def _get_target_models_async(label: str) -> List[dict]:
+    """统一接口（async）：与 _get_target_models 同结果，copilot 走 await 拉取。
+
+    async 端点（FastAPI 路由）必须用这个版本：同步版对 copilot 会
+    asyncio.run() 到运行中的事件循环上，直接抛 RuntimeError。
+    """
+    target = next((t for t in _TARGETS if t.get("label") == label), None)
+    if target is None:
+        return []
+    source = _target_model_source(target)
+    live_ids: List[str] = []
+    if source == "copilot":
+        live_ids = [str(m) for m in (await _fetch_live_models(target) or [])]
+    return _build_target_models(target, source, live_ids)
 
 
 _ANTHROPIC_STATS: Dict[str, int] = {"totalRequests": 0, "passthroughOk": 0, "passthroughError": 0, "startedAt": datetime.now().isoformat()}
@@ -7458,6 +7515,7 @@ DASHBOARD_STYLE = """
   .sub .refresh-time { font-size: 12px; color: var(--text-tertiary); }
   code { color: var(--brand-cyan); }
   a { color: #7aa2ff; }
+  .field-error { border-color: var(--danger) !important; box-shadow: 0 0 0 2px rgba(248,113,113,0.25); }
 
   /* ── 总览栏：KPI 统计卡（OpenRouter 大数字风格）── */
   .overview-bar { display: flex; gap: 20px; flex-wrap: wrap; align-items: stretch; background: linear-gradient(180deg, rgba(22,22,36,0.9) 0%, rgba(13,13,20,0.9) 100%); border: 1px solid var(--border); border-radius: var(--radius-lg); padding: 16px; margin-bottom: 26px; box-shadow: 0 10px 40px rgba(0,0,0,0.45), inset 0 1px 0 rgba(255,255,255,0.05); backdrop-filter: blur(4px); }
@@ -8034,7 +8092,7 @@ def _format_uptime(started_at_str):
         return "—"
 
 
-def _model_details_html(models, model_stats=None, label=None, edit_mode=False, can_prune=False, col_429="429"):
+def _model_details_html(models, model_stats=None, label=None, edit_mode=False, can_prune=False, col_429="429", target_index=-1):
     """模型列表表格（正常态）+ 模型编辑 modal 内容（edit_mode）。
 
     支持 models 为字符串列表（默认启用）、dict 列表（含 id/display_name/enabled）。
@@ -8042,6 +8100,7 @@ def _model_details_html(models, model_stats=None, label=None, edit_mode=False, c
     edit_mode: True 时返回 modal 编辑界面 HTML：全部模型 + 每个模型的 iOS 风格滑动开关（无删除按钮）。
     can_prune: 该网关上游是否支持 /models（copilot 系支持；codebuddy/qclaw/trae-work 不支持，
                不显示"清理过期模型"按钮，避免点击报"上游不可达"）。
+    target_index: 该 target 在 targets[] 中的下标（-1 = 未知），用于 data-path 错误回显。
     """
     editable = label is not None
     # 规范化：统一为 [{id, display, enabled, aliases}]
@@ -8070,8 +8129,9 @@ def _model_details_html(models, model_stats=None, label=None, edit_mode=False, c
         rows_html = ""
         if not norm:
             rows_html = '<div class="no-models">(暂无模型数据，在下方添加)</div>'
-        for n in norm:
+        for i, n in enumerate(norm):
             checked = 'checked' if n.get("enabled", True) else ''
+            dp = f' data-path="targets[{target_index}].models[{i}].enabled"' if target_index >= 0 else ''
             rows_html += (
                 f'<div class="mrow" data-model="{_html_escape(n["id"])}">'
                 f'  <div class="mrow-info">'
@@ -8079,7 +8139,7 @@ def _model_details_html(models, model_stats=None, label=None, edit_mode=False, c
                 f'    <div class="mrow-name">{_html_escape(n["display"])}</div>'
                 f'  </div>'
                 f'  <label class="switch" title="展示此模型">'
-                f'    <input type="checkbox" class="model-show" data-model="{_html_escape(n["id"])}" {checked}>'
+                f'    <input type="checkbox" class="model-show"{dp} data-model="{_html_escape(n["id"])}" {checked}>'
                 f'    <span class="switch-slider"></span>'
                 f'  </label>'
                 f'  <button class="mrow-del" onclick="removeModelRow(this)" title="删除此模型">×</button>'
@@ -8955,6 +9015,7 @@ async def api_target_models_html(label: str, edit: int = 0):
     """返回单个 target 的模型区 HTML（edit=1 时渲染编辑态：全部模型 + 展示开关）。
 
     供 dashboard 前端「编辑模型」切换时无整页刷新重渲染。
+    非 edit 态走统一接口 _get_target_models(label)（收敛四种 modelsSource）。
     edit=1 时优先从下游 /models 拉取真实模型列表（与 copilot 一致），
     拉取失败则降级为 targets.json 配置的 models。
     """
@@ -8962,8 +9023,10 @@ async def api_target_models_html(label: str, edit: int = 0):
     target = next((t for t in _TARGETS if t["label"] == label), None)
     if target is None:
         raise HTTPException(status_code=404, detail=f"target '{label}' 不存在")
-    models = target.get("models", [])
+    target_idx = next((i for i, t in enumerate(_TARGETS) if t.get("label") == label), -1)
     if edit:
+        # 编辑态以 targets.json 原始 models[] 为本地事实源做合并（上游优先）。
+        models = target.get("models", [])
         live = await _fetch_live_models(target)
         if live:
             # 合并：以下游为准，保留 targets.json 中已存在的 enabled 状态
@@ -8981,12 +9044,17 @@ async def api_target_models_html(label: str, edit: int = 0):
                 if mid and mid not in seen:
                     merged.append({"id": mid, "enabled": en})
             models = merged
-    stats = _TARGET_STATS.get(label, {})
+    else:
+        # aggregator 的模型是 virtualModels（由聚合网关卡片单独渲染，且不属于本端点
+        # 的白名单编辑语义），此处沿用旧行为只看 models[]，避免凭空多出 10 个虚拟模型。
+        models = ([] if _target_model_source(target) == "aggregator"
+                  else await _get_target_models_async(label))
     html = _model_details_html(
         models,
         model_stats=_MODEL_STATS.get(label, {}),
         label=label,
         edit_mode=bool(edit),
+        target_index=target_idx,
     )
     return _HR(html)
 
@@ -9291,8 +9359,10 @@ async def dashboard():
             label=t["label"],
             port=port,
             meta_badges=meta_badges,
-            # 上游是否支持 /models：配置驱动（targets.json hasModels）+ handler 兜底（copilot 系天然支持）
-            can_prune=(t.get("hasModels") is True or t.get("handler") == "copilot"),
+            # 上游是否支持 /models：走统一接口的 source 语义（copilot 系天然支持）
+            # + 配置驱动兜底（targets.json hasModels）。用 _target_model_source 而非
+            # _get_target_models：后者对 copilot 会同步拉取上游，在此 async 路径下会抛错。
+            can_prune=(_target_model_source(t) == "copilot" or t.get("hasModels") is True),
         )
         if category == "crack":
             crack_cards.append(card)
@@ -9426,6 +9496,23 @@ function mmMsg(el, kind, text) {{
   var K = {{ok: "success", warn: "danger", err: "danger", info: ""}};
   el.textContent = text || "";
   el.className = "modal-msg " + (K[kind] !== undefined ? K[kind] : "");
+}}
+
+// 将后端 validate_targets 返回的 path 回显到对应字段；整体消息始终保留作兜底。
+function mmShowErrors(msgEl, errors) {{
+  document.querySelectorAll('.field-error').forEach(function(el) {{ el.classList.remove('field-error'); }});
+  var items = Array.isArray(errors) ? errors : [errors];
+  var messages = [];
+  items.forEach(function(item) {{
+    var path = item && typeof item === 'object' ? item.path : '';
+    var text = item && typeof item === 'object' ? item.msg : String(item || '保存失败');
+    if (text) messages.push(path ? path + ': ' + text : text);
+    if (!path) return;
+    document.querySelectorAll('[data-path]').forEach(function(field) {{
+      if (field.dataset.path === path) field.classList.add('field-error');
+    }});
+  }});
+  mmMsg(msgEl, 'err', messages.join('；') || '保存失败');
 }}
 
 // 统一行插入：永远插在 section 末尾的添加按钮行之前。
@@ -9659,7 +9746,7 @@ async function saveModelEditor(btn) {{
         btn.disabled = false; btn.textContent = '保存';
       }}, 1200);
     }} else {{
-      mmMsg(msg, 'err', '❌ 保存失败: ' + JSON.stringify(r.detail || r));
+      mmShowErrors(msg, r.detail || r);
       btn.disabled = false; btn.textContent = '保存';
     }}
   }} catch (e) {{
@@ -9816,33 +9903,33 @@ function buildModelsEditorHtml(r) {{
   html += '<div class="agg-section"><div class="agg-section-title">默认转发端口</div><div class="agg-fields">' +
     '<label class="agg-field">' +
     '  <span class="agg-label">modelDefaults.defaultPort（未命中定义的兜底端口）</span>' +
-    '  <input type="number" class="agg-input md-default-port" value="' + escHtml(String((r.modelDefaults || {{}}).defaultPort)) + '" aria-label="默认转发端口">' +
+    '  <input type="number" class="agg-input md-default-port" data-path="modelDefaults.defaultPort" value="' + escHtml(String((r.modelDefaults || {{}}).defaultPort)) + '" aria-label="默认转发端口">' +
     '</label>' +
     '</div></div>';
   html += '<div class="agg-section"><div class="agg-section-title">模型定义列表</div>';
   if (models.length === 0) {{
-    html += modelsRowHtml('', '', '', '');
+    html += modelsRowHtml('', '', '', '', 0);
   }} else {{
-    models.forEach(function(m) {{
+    models.forEach(function(m, i) {{
       var aliases = (m.aliases || []).join(', ');
       var t = m.target || {{}};
-      html += modelsRowHtml(m.name, aliases, t.port, t.model);
+      html += modelsRowHtml(m.name, aliases, t.port, t.model, i);
     }});
   }}
   html += '<div class="agg-add-row"><button class="mm-add-btn" onclick="addModelsRow()">+ 添加模型</button></div></div>';
   return html;
 }}
 
-function modelsRowHtml(name, aliases, port, model) {{
+function modelsRowHtml(name, aliases, port, model, index) {{
   var n = (name === undefined || name === null) ? '' : escHtml(String(name));
   var a = (aliases === undefined || aliases === null) ? '' : escHtml(String(aliases));
   var p = (port === undefined || port === null) ? '' : escHtml(String(port));
   var m = (model === undefined || model === null) ? '' : escHtml(String(model));
   return '<div class="mm-row">' +
-    '<input type="text" class="agg-input md-name" value="' + n + '" placeholder="模型名（如 sonnet）" aria-label="模型名">' +
-    '<input type="text" class="agg-input md-aliases" value="' + a + '" placeholder="别名，逗号分隔" aria-label="别名">' +
-    aggPortSelectHtml(p) +
-    aggModelSelectHtml(p, m) +
+    '<input type="text" class="agg-input md-name" data-path="models[' + index + '].name" value="' + n + '" placeholder="模型名（如 sonnet）" aria-label="模型名">' +
+    '<input type="text" class="agg-input md-aliases" data-path="models[' + index + '].aliases" value="' + a + '" placeholder="别名，逗号分隔" aria-label="别名">' +
+    aggPortSelectHtml(p, 'models[' + index + '].target.port') +
+    aggModelSelectHtml(p, m, 'models[' + index + '].target.model') +
     '<button class="mm-del" onclick="removeModelsRow(this)" title="删除此行">×</button>' +
     '</div>';
 }}
@@ -9850,12 +9937,26 @@ function modelsRowHtml(name, aliases, port, model) {{
 function addModelsRow() {{
   var body = document.getElementById('models-modal-body');
   if (!body) return;
-  mmInsertRow(body, modelsRowHtml('', '', '', ''), '.agg-add-row');
+  mmInsertRow(body, modelsRowHtml('', '', '', '', body.querySelectorAll('.mm-row').length), '.agg-add-row');
 }}
 
 function removeModelsRow(btn) {{
   var row = btn.closest('.mm-row');
   if (row) row.remove();
+}}
+
+function syncModelsPaths(body) {{
+  body.querySelectorAll('.mm-row').forEach(function(row, index) {{
+    var prefix = 'models[' + index + ']';
+    var name = row.querySelector('.md-name');
+    var aliases = row.querySelector('.md-aliases');
+    var port = row.querySelector('.agg-mem-port');
+    var model = row.querySelector('.agg-mem-model');
+    if (name) name.dataset.path = prefix + '.name';
+    if (aliases) aliases.dataset.path = prefix + '.aliases';
+    if (port) port.dataset.path = prefix + '.target.port';
+    if (model) model.dataset.path = prefix + '.target.model';
+  }});
 }}
 
 function closeModelsEditor() {{
@@ -9867,6 +9968,7 @@ async function saveModelsEditor(btn) {{
   var body = document.getElementById('models-modal-body');
   var msg = document.getElementById('models-modal-msg');
   if (!body || !msg) return;
+  syncModelsPaths(body);
   var defaultPortEl = body.querySelector('.md-default-port');
   var defaultPort = defaultPortEl ? defaultPortEl.value.trim() : '';
   if (defaultPort === '' || isNaN(Number(defaultPort)) || Number(defaultPort) < 0 || Number(defaultPort) % 1 !== 0) {{
@@ -9903,7 +10005,7 @@ async function saveModelsEditor(btn) {{
   }});
   var r = await resp.json();
   if (!resp.ok) {{
-    mmMsg(msg, 'err', '⚠️ 保存失败: ' + (r.detail || JSON.stringify(r)));
+    mmShowErrors(msg, r.detail || r);
     return;
   }}
   // 生效位置提示（docs §2.4.2）：显示实际保存条目数 + 改动出现在哪
@@ -9919,15 +10021,16 @@ function aggNumField(key, labelText, val, placeholder) {{
   var v = (val === undefined || val === null) ? '' : escHtml(String(val));
   return '<label class="agg-field">' +
     '<span class="agg-label">' + labelText + '</span>' +
-    '<input type="number" class="agg-input agg-pd-num" data-key="' + key + '" value="' + v + '" placeholder="' + (placeholder || '') + '" aria-label="' + labelText + '">' +
+    '<input type="number" class="agg-input agg-pd-num" data-key="' + key + '" data-path="poolDefaults.' + key + '" value="' + v + '" placeholder="' + (placeholder || '') + '" aria-label="' + labelText + '">' +
     '</label>';
 }}
 
 // 聚合可用端口缓存（由 buildAggConfigHtml 在打开编辑器时注入）
 var _aggAvailablePorts = {{}};
 
-function aggPortSelectHtml(selectedPort) {{
-  var html = '<select class="agg-input agg-mem-port" aria-label="端口" onchange="onAggPortChange(this)">';
+function aggPortSelectHtml(selectedPort, path) {{
+  var attr = path ? ' data-path="' + escHtml(path) + '"' : '';
+  var html = '<select class="agg-input agg-mem-port"' + attr + ' aria-label="端口" onchange="onAggPortChange(this)">';
   html += '<option value=""' + (selectedPort ? '' : ' selected') + '>选择端口</option>';
   var keys = Object.keys(_aggAvailablePorts).sort(function(a, b) {{ return Number(a) - Number(b); }});
   keys.forEach(function(pk) {{
@@ -9943,8 +10046,9 @@ function aggPortSelectHtml(selectedPort) {{
   return html;
 }}
 
-function aggModelSelectHtml(selectedPort, selectedModel) {{
-  var html = '<select class="agg-input agg-mem-model" aria-label="模型" onchange="onAggModelChange(this)">';
+function aggModelSelectHtml(selectedPort, selectedModel, path) {{
+  var attr = path ? ' data-path="' + escHtml(path) + '"' : '';
+  var html = '<select class="agg-input agg-mem-model"' + attr + ' aria-label="模型" onchange="onAggModelChange(this)">';
   html += '<option value=""' + (selectedModel ? '' : ' selected') + '>选择模型</option>';
   var models = [];
   if (selectedPort !== undefined && selectedPort !== null && selectedPort !== '' && _aggAvailablePorts[String(selectedPort)]) {{
@@ -9971,7 +10075,7 @@ function onAggPortChange(selEl) {{
   if (!modelSel) return;
   var port = selEl.value;
   // 重建模型下拉（不传 poolKey，统一只显示所选端口的真实模型）
-  var newHtml = aggModelSelectHtml(port, '');
+  var newHtml = aggModelSelectHtml(port, '', modelSel.dataset.path);
   var tmp = document.createElement('div');
   tmp.innerHTML = newHtml;
   var newSel = tmp.firstChild;
@@ -9985,12 +10089,13 @@ function onAggModelChange(selEl) {{
   // 保留钩子：未来可扩展 agg:xxx 模型的特殊处理
 }}
 
-function aggPoolMemberRow(port, model, weight, poolKey) {{
+function aggPoolMemberRow(port, model, weight, poolKey, vmid, index) {{
   var w = (weight === undefined || weight === null) ? '' : escHtml(String(weight));
+  var prefix = vmid ? 'virtualModels.' + vmid + '.' + (poolKey === 'default' ? 'defaultPool' : 'fallbackPool') + '[' + index + ']' : '';
   return '<div class="agg-pool-row">' +
-    aggPortSelectHtml(port) +
-    aggModelSelectHtml(port, model) +
-    '<input type="number" class="agg-input agg-mem-weight" value="' + w + '" placeholder="权重" aria-label="权重">' +
+    aggPortSelectHtml(port, prefix ? prefix + '.port' : '') +
+    aggModelSelectHtml(port, model, prefix ? prefix + '.model' : '') +
+    '<input type="number" class="agg-input agg-mem-weight"' + (prefix ? ' data-path="' + escHtml(prefix + '.weight') + '"' : '') + ' value="' + w + '" placeholder="权重" aria-label="权重">' +
     '<button class="mm-del" onclick="removeAggPoolMember(this)" title="删除成员">×</button>' +
     '</div>';
 }}
@@ -10003,26 +10108,26 @@ function aggVmBlock(id, vm) {{
   var html = '<div class="agg-vm">' +
     '<div class="agg-vm-head">' +
     '  <span class="agg-label">虚拟模型 id</span>' +
-    '  <input type="text" class="agg-input agg-vm-id" value="' + escHtml(String(id)) + '" placeholder="如 agg:sonnet" aria-label="虚拟模型 id">' +
+    '  <input type="text" class="agg-input agg-vm-id" data-path="virtualModels.' + escHtml(String(id)) + '" value="' + escHtml(String(id)) + '" placeholder="如 agg:sonnet" aria-label="虚拟模型 id">' +
     '  <button class="mm-del" onclick="removeAggVm(this)" title="删除此虚拟模型">🗑</button>' +
     '</div>';
   html += '<div class="agg-pool" data-pool="default">' +
     '<div class="agg-pool-title">默认池 defaultPool</div>';
-  if (d.length) {{ d.forEach(function(mem) {{ html += aggPoolMemberRow(mem.port, mem.model, mem.weight, 'default'); }}); }}
-  else {{ html += aggPoolMemberRow('', '', '', 'default'); }}
+  if (d.length) {{ d.forEach(function(mem, i) {{ html += aggPoolMemberRow(mem.port, mem.model, mem.weight, 'default', id, i); }}); }}
+  else {{ html += aggPoolMemberRow('', '', '', 'default', id, 0); }}
   html += '<div class="agg-add-row"><button class="mm-add-btn" onclick="addAggPoolMember(this, &quot;default&quot;)">+ 添加成员</button></div></div>';
   html += '<div class="agg-pool" data-pool="fallback">' +
     '<div class="agg-pool-title">降级池 fallbackPool</div>';
-  if (f.length) {{ f.forEach(function(mem) {{ html += aggPoolMemberRow(mem.port, mem.model, mem.weight, 'fallback'); }}); }}
+  if (f.length) {{ f.forEach(function(mem, i) {{ html += aggPoolMemberRow(mem.port, mem.model, mem.weight, 'fallback', id, i); }}); }}
   html += '<div class="agg-add-row"><button class="mm-add-btn" onclick="addAggPoolMember(this, &quot;fallback&quot;)">+ 添加降级成员</button></div></div>';
   html += '<div class="agg-vm-retries">' +
     '<label class="agg-field">' +
     '  <span class="agg-label">defaultRetries（空=继承池默认）</span>' +
-    '  <input type="number" class="agg-input agg-vm-dr" value="' + dr + '" placeholder="继承" aria-label="defaultRetries">' +
+    '  <input type="number" class="agg-input agg-vm-dr" data-path="virtualModels.' + escHtml(String(id)) + '.defaultRetries" value="' + dr + '" placeholder="继承" aria-label="defaultRetries">' +
     '</label>' +
     '<label class="agg-field">' +
     '  <span class="agg-label">fallbackRetries（空=继承池默认）</span>' +
-    '  <input type="number" class="agg-input agg-vm-fr" value="' + fr + '" placeholder="继承" aria-label="fallbackRetries">' +
+    '  <input type="number" class="agg-input agg-vm-fr" data-path="virtualModels.' + escHtml(String(id)) + '.fallbackRetries" value="' + fr + '" placeholder="继承" aria-label="fallbackRetries">' +
     '</label>' +
     '</div>' +
     '</div>';
@@ -10104,7 +10209,11 @@ function removeAggVm(btn) {{
 function addAggPoolMember(btn, poolKey) {{
   var pool = btn.closest('.agg-pool');
   if (!pool) return;
-  var html = aggPoolMemberRow('', '', '', poolKey || (pool.dataset ? pool.dataset.pool : ''));
+  var vm = pool.closest('.agg-vm');
+  var idEl = vm ? vm.querySelector('.agg-vm-id') : null;
+  var vmid = idEl ? idEl.value.trim() : '';
+  var resolvedPool = poolKey || (pool.dataset ? pool.dataset.pool : '');
+  var html = aggPoolMemberRow('', '', '', resolvedPool, vmid, pool.querySelectorAll('.agg-pool-row').length);
   mmInsertRow(pool, html, '.agg-add-row');
 }}
 
@@ -10113,10 +10222,35 @@ function removeAggPoolMember(btn) {{
   if (row) row.remove();
 }}
 
+function syncAggPaths(body) {{
+  body.querySelectorAll('.agg-vm').forEach(function(vm) {{
+    var idEl = vm.querySelector('.agg-vm-id');
+    var vmid = idEl ? idEl.value.trim() : '';
+    if (idEl) idEl.dataset.path = 'virtualModels.' + vmid;
+    vm.querySelectorAll('.agg-pool').forEach(function(pool) {{
+      var key = pool.dataset.pool === 'default' ? 'defaultPool' : 'fallbackPool';
+      pool.querySelectorAll('.agg-pool-row').forEach(function(row, index) {{
+        var prefix = 'virtualModels.' + vmid + '.' + key + '[' + index + ']';
+        var port = row.querySelector('.agg-mem-port');
+        var model = row.querySelector('.agg-mem-model');
+        var weight = row.querySelector('.agg-mem-weight');
+        if (port) port.dataset.path = prefix + '.port';
+        if (model) model.dataset.path = prefix + '.model';
+        if (weight) weight.dataset.path = prefix + '.weight';
+      }});
+    }});
+    var dr = vm.querySelector('.agg-vm-dr');
+    var fr = vm.querySelector('.agg-vm-fr');
+    if (dr) dr.dataset.path = 'virtualModels.' + vmid + '.defaultRetries';
+    if (fr) fr.dataset.path = 'virtualModels.' + vmid + '.fallbackRetries';
+  }});
+}}
+
 async function saveAggConfig(btn) {{
   var body = document.getElementById('agg-modal-body');
   var msg = document.getElementById('agg-modal-msg');
   if (!body || !msg) return;
+  syncAggPaths(body);
   var poolDefaults = {{}};
   var bad = false;
   body.querySelectorAll('.agg-pd-num').forEach(function(inp) {{
@@ -10229,8 +10363,7 @@ async function saveAggConfig(btn) {{
         btn.disabled = false; btn.textContent = '保存'; btn.style.background = '';
       }}, 1200);
     }} else {{
-      var errs = Array.isArray(r.detail) ? r.detail.join('；') : JSON.stringify(r.detail || r);
-      mmMsg(msg, 'err', '❌ 保存失败: ' + errs);
+      mmShowErrors(msg, r.detail || r);
       btn.disabled = false; btn.textContent = '保存'; btn.style.background = '';
     }}
   }} catch (e) {{
