@@ -425,6 +425,150 @@ def test_dashboard_models_endpoint_shape():
     assert "<tr" in body, "模型端点应包含模型表行"
 
 
+# ─── 聚合网关高危事件展示区：数据层验证（纯引擎层，无需服务） ───
+# dashboard 的高危事件区由前端 JS loadAggregateStatus() 渲染，Python 测不到 DOM。
+# 因此验证对象为其消费的数据契约：
+#   r.breakers[port].{state, reason, tripped_at}
+#   r.virtual_models[vmId][memberKey].error_types  (dict[str,int])
+# 这些字段全部来自 AggregatorEngine.get_stats()，直接构造引擎断言即可，
+# 不依赖 FastAPI / 真实服务（本文件其余测试才需要 8081/8082 在跑）。
+import random  # noqa: E402
+from pathlib import Path  # noqa: E402
+
+sys.path.insert(0, str(Path(__file__).parent))
+from gateways.aggregator.engine import AggregatorEngine  # noqa: E402
+
+
+def _make_agg_target():
+    """构造聚合网关 target 配置（结构对齐 test_aggregator.py 的 make_target）。"""
+    return {
+        "label": "aggregator", "listenPort": 8080, "category": "aggregate", "handler": "aggregator",
+        "poolDefaults": {"defaultRetries": 2, "fallbackRetries": 1, "sessionAffinityTtlSeconds": 3600,
+                         "probeIntervalSeconds": 300, "weight": 1},
+        "quotaErrorPatterns": ["insufficient credit", "quota exceeded", "余额不足"],
+        "virtualModels": {
+            "agg:sonnet": {
+                "defaultPool": [
+                    {"port": 8082, "model": "claude-sonnet-5", "weight": 3},
+                    {"port": 8084, "model": "deepseek-v4-pro", "weight": 2},
+                ],
+                "fallbackPool": [{"port": 8094, "model": "some-model"}],
+            },
+        },
+    }
+
+
+def _member_by_port(engine, vm_id, port):
+    """从引擎已解析的池里取指定端口的 PoolMember（用于 note_request）。"""
+    vm = engine._models[vm_id]
+    for m in vm.default_pool + vm.fallback_pool:
+        if m.port == port:
+            return m
+    raise AssertionError(f"{vm_id} 池中无端口 {port}")
+
+
+def test_aggregate_status_breakers_include_tripped_at():
+    """熔断端口条目须含 state / reason / tripped_at（前端熔断端口列表三要素）。"""
+    eng = AggregatorEngine(_make_agg_target(), rng=random.Random(1))
+    eng.trip(8084, "401_auth")
+    stats = eng.get_stats()
+
+    assert "breakers" in stats, "get_stats() 应含 breakers 字段"
+    brks = stats["breakers"]
+    assert 8084 in brks, f"熔断端口 8084 应出现在 breakers，实际 keys={list(brks)}"
+    b = brks[8084]
+    assert b["state"] == "tripped", f"state 应为 tripped，实际 {b['state']!r}"
+    assert b["reason"] == "401_auth", f"reason 应透传熔断原因，实际 {b['reason']!r}"
+    assert isinstance(b["tripped_at"], float), f"tripped_at 应为 float，实际 {type(b['tripped_at'])}"
+    assert b["tripped_at"] > 0, f"tripped_at 应为熔断发生时刻（>0），实际 {b['tripped_at']}"
+    # 未熔断端口不应混入
+    assert 8082 not in brks, "未熔断的 8082 不应出现在 breakers"
+
+
+def test_aggregate_status_error_types_present():
+    """error_types 按类型计数；429 限流只计数不熔断（与配额熔断严格区分）。"""
+    eng = AggregatorEngine(_make_agg_target(), rng=random.Random(1))
+    m8084 = _member_by_port(eng, "agg:sonnet", 8084)
+    m8082 = _member_by_port(eng, "agg:sonnet", 8082)
+
+    # ① 401 鉴权失败 → 计数 + 熔断
+    eng.note_request(m8084, "err", 120.0, error_type="401_auth")
+    eng.trip(8084, "401_auth")
+
+    # ② 429 限流 → 只计数，不熔断
+    eng.note_request(m8082, "err", 80.0, error_type="429_rate_limit")
+    eng.note_request(m8082, "err", 90.0, error_type="429_rate_limit")
+
+    stats = eng.get_stats()
+    members = stats["virtual_models"]["agg:sonnet"]
+
+    et_8084 = members["8084:deepseek-v4-pro"]["error_types"]
+    assert et_8084.get("401_auth", 0) >= 1, f"8084 应记录 401_auth，实际 {et_8084}"
+
+    et_8082 = members["8082:claude-sonnet-5"]["error_types"]
+    assert et_8082.get("429_rate_limit", 0) == 2, f"8082 应记录 2 次 429_rate_limit，实际 {et_8082}"
+
+    brks = stats["breakers"]
+    assert 8084 in brks, "401 场景端口应熔断"
+    assert 8082 not in brks, f"429 限流不应触发熔断，实际 breakers={list(brks)}"
+
+
+def test_aggregate_status_no_breakers_empty_state():
+    """无熔断且无错误时：breakers 为空 dict、所有成员 error_types 为空。
+
+    对应前端 `if (hasBreakers || hasErrTypes)` —— 此时条件不成立，高危事件区不渲染。
+    """
+    eng = AggregatorEngine(_make_agg_target(), rng=random.Random(1))
+    m = _member_by_port(eng, "agg:sonnet", 8082)
+    eng.note_request(m, "ok", 50.0)  # 成功请求不产生 error_types
+
+    stats = eng.get_stats()
+    assert stats["breakers"] == {}, f"无熔断时 breakers 应为空 dict，实际 {stats['breakers']}"
+
+    has_err_types = False
+    for vm_id, members in stats["virtual_models"].items():
+        for mk, ms in members.items():
+            assert "error_types" in ms, f"{vm_id}/{mk} 成员统计应含 error_types 字段"
+            if ms["error_types"]:
+                has_err_types = True
+    assert not has_err_types, "成功请求不应产生 error_types 计数"
+    # 前端渲染条件复现
+    assert not (bool(stats["breakers"]) or has_err_types), "空状态下前端高危事件区渲染条件应不成立"
+
+
+def test_api_aggregate_status_returns_tripped_at():
+    """接口层：/api/aggregate/status 响应结构含高危事件区所需字段。
+
+    需要 8081 在跑（与本文件其余测试同前提）。聚合网关未配置时（configured=False）
+    仅断言该显式契约，不误报失败。
+    """
+    conn = http.client.HTTPConnection("127.0.0.1", 8081, timeout=15)
+    conn.request("GET", "/api/aggregate/status")
+    resp = conn.getresponse()
+    body = resp.read().decode("utf-8", errors="replace")
+    conn.close()
+    assert resp.status == 200, f"/api/aggregate/status HTTP {resp.status}"
+    data = json.loads(body)
+    if not data.get("configured"):
+        assert data == {"configured": False}, f"未配置聚合网关时应只返回 configured=False，实际 {data}"
+        return
+
+    assert "breakers" in data, "响应应含 breakers（高危事件区熔断端口来源）"
+    assert isinstance(data["breakers"], dict), "breakers 应为对象"
+    for port, b in data["breakers"].items():
+        for key in ("state", "reason", "tripped_at"):
+            assert key in b, f"breakers[{port}] 缺少字段 {key}"
+        assert isinstance(b["tripped_at"], (int, float)), f"breakers[{port}].tripped_at 应为数字"
+        assert b["tripped_at"] > 0, f"breakers[{port}].tripped_at 应 > 0"
+
+    assert "virtual_models" in data, "响应应含 virtual_models（error_types 汇总来源）"
+    for vm_id, members in data["virtual_models"].items():
+        assert isinstance(members, dict), f"{vm_id} 成员统计应为对象"
+        for mk, ms in members.items():
+            assert "error_types" in ms, f"{vm_id}/{mk} 缺少 error_types 字段"
+            assert isinstance(ms["error_types"], dict), f"{vm_id}/{mk}.error_types 应为 dict[str,int]"
+
+
 def main():
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     failed = 0
