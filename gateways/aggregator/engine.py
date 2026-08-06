@@ -50,6 +50,14 @@ _HTTP_STATUS_CLASSIFICATION: dict[int, str] = {
     508: "retry_same",
 }
 
+# retry_other_or_fallback 分类下的熔断原因（状态码 → reason）。
+# 不在表内（即由配额文本兜底命中）统一记为 "quota_text"。
+_RETRY_OTHER_REASONS: dict[int, str] = {
+    401: "401_auth",
+    402: "402_billing",
+    403: "403_forbidden",
+}
+
 
 @dataclass(frozen=True)
 class PoolMember:
@@ -315,6 +323,9 @@ class AggregatorEngine:
         vm = self._require_vm(virtual_model_id)
         last_error: Exception | None = None
         tried_ports: set[int] = set()
+        # 端口 → 该端口累计的 retry_same（408/5xx）次数。
+        # 第一次允许同端点重试（不加入 tried_ports），第二次起换端点。
+        retry_same_counts: dict[int, int] = {}
 
         sticky = self._get_sticky(virtual_model_id, session_id)
         candidates_order: list[PoolMember] = []
@@ -345,7 +356,6 @@ class AggregatorEngine:
                     break
                 member = self._weighted_choice(available)
 
-            tried_ports.add(member.port)
             was_sticky = session_id is not None and self._sessions.get(
                 self._session_key(virtual_model_id, session_id)
             ) is not None and self._sessions[self._session_key(virtual_model_id, session_id)].member == member
@@ -355,20 +365,71 @@ class AggregatorEngine:
                 result = await send_fn(member, {"attempt": attempt_no, "pool": "default"})
             except Exception as e:  # noqa: BLE001 - 成员失败即重试，非本引擎逻辑错误
                 last_error = e
+                tried_ports.add(member.port)
                 self.note_request(member, "err", (self._clock() - start) * 1000)
                 continue
 
             latency_ms = (self._clock() - start) * 1000
+            status_code = getattr(result, "status_code", None)
             body_text = self._extract_body_text(result)
-            if self.quota_error(body_text):
-                self.trip(member.port, "quota_error")
-                last_error = RuntimeError(f"quota exhausted on port {member.port}")
+            classification = self.classify_failure(status_code, body_text, self.quota_error)
+
+            # D. 成功（2xx / 无状态码）—— 唯一成功路径
+            if classification == "success":
+                tried_ports.add(member.port)
+                self.note_request(member, "ok", latency_ms)
+                if not was_sticky:
+                    self._set_sticky(virtual_model_id, session_id, member)
+                return member, result
+
+            # A. 凭据/配额类失败：熔断该端口 + 换端点
+            if classification == "retry_other_or_fallback":
+                reason = (
+                    _RETRY_OTHER_REASONS.get(status_code, "quota_text")
+                    if isinstance(status_code, int)
+                    else "quota_text"
+                )
+                tried_ports.add(member.port)
+                self.trip(member.port, reason)
                 self.note_request(member, "err", latency_ms)
+                last_error = RuntimeError(f"{reason} on port {member.port}")
                 continue
 
-            self.note_request(member, "ok", latency_ms)
-            if not was_sticky:
-                self._set_sticky(virtual_model_id, session_id, member)
+            if classification == "retry_same":
+                # B1. 429 账号级限流：立刻换端点，但绝不熔断
+                #     （限流会自行恢复，trip 300s 会误伤共享该端口的其他虚拟模型/会话）
+                if status_code == 429:
+                    tried_ports.add(member.port)
+                    self.note_request(member, "err", latency_ms)
+                    last_error = RuntimeError(f"429_rate_limit on port {member.port}")
+                    continue
+
+                # B2. 408/5xx 网络抖动：同端点重试一次，仍失败才换端点；全程不熔断
+                count = retry_same_counts.get(member.port, 0) + 1
+                retry_same_counts[member.port] = count
+                if count == 1:
+                    # 不加入 tried_ports，并把该成员放回候选队首 → 下一轮确定性地
+                    # 重新选中同一端口，真实实现"同端点重试 1 次"语义
+                    tried_ports.discard(member.port)
+                    candidates_order.insert(0, member)
+                    self.note_request(member, "err", latency_ms)
+                    continue
+                tried_ports.add(member.port)
+                self.note_request(member, "err", latency_ms)
+                last_error = RuntimeError(f"5xx_persistent on port {member.port}")
+                continue
+
+            # C. pass_through_to_client / unclassified：不重试、不换端点、不熔断
+            if classification == "unclassified":
+                import server as _srv
+
+                _srv.logger.warning(
+                    f"[aggregator] unclassified failure: port={member.port} "
+                    f"model={member.model} status={status_code} "
+                    f"body_prefix={body_text[:200]!r}"
+                )
+            tried_ports.add(member.port)
+            self.note_request(member, "err", latency_ms)
             return member, result
 
         # 降级池
