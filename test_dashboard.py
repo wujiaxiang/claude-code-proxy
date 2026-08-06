@@ -12,6 +12,7 @@ import http.client
 import json
 import re
 import sys
+import uuid
 
 HOST = "127.0.0.1"
 PORT = 8082
@@ -86,6 +87,45 @@ def test_api_targets_endpoint():
     for expected in ("copilot", "codebuddy", "qclaw", "trae-work",
                      "openrouter", "nvidia", "gemini", "opencode-zen"):
         assert expected in labels, f"/api/targets 缺少 label: {expected}"
+
+
+def _aggregate_status():
+    conn = http.client.HTTPConnection("127.0.0.1", 8081, timeout=15)
+    conn.request("GET", "/api/aggregate/status")
+    resp = conn.getresponse()
+    body = resp.read().decode("utf-8", errors="replace")
+    conn.close()
+    assert resp.status == 200, f"/api/aggregate/status HTTP {resp.status}"
+    return json.loads(body)
+
+
+def test_anthropic_messages_forwards_session_id_to_aggregator():
+    """8081 转发模型请求时必须保留 X-Session-Id，供 8080 建立粘性。"""
+    before = _aggregate_status()["session"]
+    session_id = f"dashboard-test-{uuid.uuid4()}"
+    body = json.dumps({
+        "model": "haiku",
+        "max_tokens": 128,
+        "messages": [{"role": "user", "content": "Reply only with OK."}],
+    }).encode("utf-8")
+
+    for _ in range(3):
+        conn = http.client.HTTPConnection("127.0.0.1", 8081, timeout=180)
+        conn.request("POST", "/v1/messages", body=body, headers={
+            "Content-Type": "application/json",
+            "x-api-key": "dummy",
+            "anthropic-version": "2023-06-01",
+            "X-Session-Id": session_id,
+        })
+        resp = conn.getresponse()
+        response_body = json.loads(resp.read().decode("utf-8", errors="replace"))
+        conn.close()
+        assert resp.status == 200, f"/v1/messages HTTP {resp.status}: {response_body}"
+        assert response_body["content"], "haiku 在足够 max_tokens 下应返回正文"
+
+    after = _aggregate_status()["session"]
+    assert after["lookups"] >= before["lookups"] + 3, "三次 8081 请求必须进入 8080 会话查找"
+    assert after["hits"] >= before["hits"] + 2, "同一会话后两次请求必须命中 8080 粘性缓存"
 
 
 def test_accordion_card_structure():

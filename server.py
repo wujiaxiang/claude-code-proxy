@@ -4431,6 +4431,8 @@ async def create_message(request: MessagesRequest, raw_request: Request):
                 _fwd_headers["authorization"] = raw_request.headers["authorization"]
             if raw_request.headers.get("x-api-key"):
                 _fwd_headers["x-api-key"] = raw_request.headers["x-api-key"]
+            if raw_request.headers.get("x-session-id"):
+                _fwd_headers["x-session-id"] = raw_request.headers["x-session-id"]
             _is_stream = bool(body_json.get("stream", False))
             async with httpx.AsyncClient(timeout=httpx.Timeout(300.0, connect=10.0), trust_env=False) as client:
                 _req = client.build_request("POST", f"http://127.0.0.1:{_fwd_port}/v1/chat/completions", headers=_fwd_headers, content=openai_payload)
