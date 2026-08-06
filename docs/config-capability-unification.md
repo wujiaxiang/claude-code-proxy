@@ -1,6 +1,6 @@
 # 配置能力统一架构设计（P1/P2 待实施）
 
-> **状态**：P0 ✅ (588e83b) · **P1 ✅ 已实施**（见下方实施记录）· P2 待实施。
+> **状态**：P0 ✅ (588e83b) · **P1 ✅ 已实施** · **P2 ✅ 已实施**（见下方实施记录）。
 > **日期**：2026-08-05 · **设计**：Oracle 架构评审 · **记录**：主会话
 > 本文档是 P1/P2 阶段的实施蓝图，接手的会话以此为准。
 
@@ -149,15 +149,37 @@ Bug 1 修复：`agg-vm-add` 专属类名 + 锚点。核查 addAggPoolMember/addM
 
 **风险**：低。改动集中 dashboard 渲染与 JS，不改配置读写路径。
 
-### P2：架构收敛（Medium，1-2d）
+### P2：架构收敛（Medium，1-2d）✅ 已实施
 **目标**：校验与模型来源的单一事实源。**做之前先确认 P1 已稳定**。
 1. **ModelRegistry 内存索引**：热重载时构建 byPort/dangling/capabilities，dashboard 渲染改读 Registry（targets.json 结构不变）
 2. **`_get_target_models(label)` 统一接口**：四种 modelsSource 收敛，can_prune 与 `/api/targets/{label}/models` 共用
-3. **校验规则 JSON 描述**：`/api/config/schema` 声明式规则 + 前端 `mmValidate` 通用执行（可选，单人维护项目收益需重新评估）
-4. **错误 path 回显**：validate_targets 返回结构化 `{"path","msg"}`，前端按 path 高亮
+3. **校验规则 JSON 描述**：`/api/config/schema` 声明式规则 + 前端 `mmValidate` 通用执行（可选，单人维护项目收益需重新评估）——**本次未做，维持蓝图可选标记**
+4. **错误 path 回显**：validate_targets 返回结构化 `[{path,msg}]`，前端 `mmShowErrors` 按 `data-path` 高亮 `.field-error`
 
-**风险**：ModelRegistry 涉及 dashboard 渲染主路径，需 test_dashboard.py 全覆盖后再动。
-**验证**：全部现有测试 + 新增 `test_model_registry.py`（悬空检测/capabilities 派生/统一接口四 source 行为）。
+**实际交付（TDD + 浏览器视觉 QA 双验证）：**
+
+- **Wave 2（GREEN）**：
+  - `ModelRegistry` 类（构造纯函数式，读 cfg 构建 byPort/dangling/capabilities）；`_scan_dangling_refs` 抽 `_scan_dangling_refs_cfg(cfg)` 保无参 wrapper
+  - `_get_target_models(label)` + async 版 `_get_target_models_async`（async 上下文如 `dashboard()` 复用，避免事件循环 RuntimeError）；`_target_model_source` 辅助供 `can_prune` 复用
+  - `validate_targets` 返回结构化 `[{path, msg}]`（原返回字符串列表），6 处调用点适配，旧断言同步
+- **Wave 3**：`can_prune` + `/api/targets/{label}/models` 接线；前端 `data-path` 属性 + `mmShowErrors(path)` 按 path 高亮（`.field-error` CSS）；`test_dashboard.py` 加等价快照基线
+- **Wave 4（最高风险，隔离执行）**：`ModelRegistry` 接入 `_reload_targets()`（line 3545 后）+ `lifespan` 启动构建全局 `_MODEL_REGISTRY`（修复前向引用 `NameError`：类定义 line 8582 晚于导入期 `_load_vendor_targets` 调用）；dashboard `can_prune` 优先读 Registry.capabilities，回退等价逻辑。**targets.json 结构零变更，dashboard 输出逐字节不变**
+- **Wave 5**：真实浏览器视觉 QA（见下「实测验证」）
+
+**实测验证（TDD + 真实浏览器 cloudcli-browser MCP）：**
+
+- 后端契约：`test_model_registry.py` 3/3（悬空检测 / capabilities 派生 / 统一接口四 source 行为）；`test_targets_schema.py` 37/37（含 `_get_target_models` 四 source 契约 + `validate_targets` 结构化 `[{path,msg}]`）；`test_crack_tools.py` 3/3
+- dashboard 快照：`test_dashboard.py` 30/33（3 个 T8 快照 `registry_equivalence_models` / `dangling_banner` / `models_endpoint_shape` 全 PASS；3 项预存失败 `edit_modal_fallback_no_key` / `gemini_native_badge` / `model_whitelist_editor` 与 P2 无关）
+- **真实浏览器（cloudcli-browser + Playwright/Chromium，2026-08-06 启用）4 场景全验**：
+  1. dashboard 主页面渲染正常（深色主题、11 服务、分类栏、统计卡、无错位/空白）
+  2. `data-path` 锚点在真实 DOM 存在（聚合配置弹窗内 `poolDefaults.defaultRetries` 等输入框带 `data-path`）
+  3. **错误高亮真实触发**：聚合配置弹窗把 `poolDefaults.defaultRetries` 改为 `-1` 保存 → 弹窗底部红色错误 `poolDefaults.defaultRetries 必须为非负数字`，对应输入框加 `.field-error` 红框（证明 `mmShowErrors` 按 path 高亮链路完整）
+  4. 失败保护：校验失败时 `targets.json` 未被修改（md5 与备份一致）
+- 服务冒烟：restart 后 dashboard 200（165KB，13 `data-port`、48 卡片、9 个 `can_prune` 清理按钮）；热重载日志确认 Registry 重建（`移除端口 8094` → `新增端口 8094`）
+
+**风险**：低。ModelRegistry 涉及 dashboard 渲染主路径，已按蓝图 gate 先用 `test_dashboard` 快照基线锁定再动。
+
+**踩坑（与本次实施相关，下次会话复用）**：`cloudcli-browser` MCP 此前 `✘ Failed to connect` 是因 opencode.jsonc / .claude.json 的启动命令路径少写 `modules/browser-use/` 一层；Playwright 须独立目录安装后拷入 cloudcli 包 `node_modules/`。详见 `CT105-README.md`「浏览器自动化 QA 工具」节。
 
 ---
 
@@ -196,3 +218,6 @@ Bug 1 修复：`agg-vm-add` 专属类名 + 锚点。核查 addAggPoolMember/addM
 - `fd2c0bd` refactor(dashboard): 移除 8081 硬编码模型死名单
 - `cd1c9f4` feat(dashboard): 三个编辑 modal 统一升级 agg-* 视觉体系 + crack x-api-key 修复
 - **P1（本次）** feat(dashboard): 配置能力统一 P1 — 作用域提示 / mmMsg+mmInsertRow 共享函数 / 保存后局部刷新(无整页刷新) / 悬空引用警示条(/api/config/dangling)
+- **P2 Wave2** `c29a048` / `d06ddc9` / `566b639`: ModelRegistry 类 + `_get_target_models` 统一接口 + `validate_targets` 返回结构化 `[{path,msg}]`
+- **P2 Wave3** `c5eee9b`: can_prune + `/api/targets/{label}/models` 接线 + dashboard 快照基线 + 前端 `data-path` 高亮(`.field-error` CSS)
+- **P2 Wave4** `752ba85`: ModelRegistry 接入 `_reload_targets()` + `lifespan` 启动构建全局 `_MODEL_REGISTRY`；dashboard `can_prune` 改读 Registry（前向引用修复）
