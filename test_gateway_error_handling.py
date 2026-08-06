@@ -525,7 +525,7 @@ async def test_10_api_stream_proxy_path():
     global passed, failed
     try:
         result = subprocess.run(
-            ["grep", "-n", '\["headers_sent"\] = True', "server.py"],
+            ["grep", "-n", r'\["headers_sent"\] = True', "server.py"],
             capture_output=True, text=True, cwd=Path(__file__).parent
         )
         lines = result.stdout.strip().split('\n')

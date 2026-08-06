@@ -19,6 +19,7 @@
 from unittest.mock import patch, AsyncMock
 
 import litellm
+from litellm.exceptions import RateLimitError
 from fastapi.testclient import TestClient
 
 import server
@@ -46,7 +47,7 @@ NON_RATE_BODY = '{"error":{"message":"invalid api key","type":"authentication_er
 
 
 def _make_rate_limit_error():
-    return litellm.RateLimitError(
+    return RateLimitError(
         "ResourceExhausted: Worker local total request limit reached (32/32)",
         llm_provider="qclaw",
         model="some-model",
