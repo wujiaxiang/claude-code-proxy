@@ -222,8 +222,11 @@ class _ClientDisconnected(Exception):
     """客户端已断开（流式转发中 TCP 关闭），用于静默收尾。"""
 
 
-def _copilot_responses_usage_to_chat(usage: dict) -> dict:
-    """Responses usage → chat usage（流式 completed 事件用）。"""
+def _copilot_responses_usage_to_chat(usage: Optional[dict]) -> dict:
+    """Responses usage → chat usage（流式 completed 事件用）。
+
+    usage 允许为 None（上游 response 可能不带 usage 字段），函数体内已 `usage or {}` 兜底。
+    """
     return {
         "prompt_tokens": (usage or {}).get("input_tokens", 0),
         "completion_tokens": (usage or {}).get("output_tokens", 0),
@@ -338,7 +341,7 @@ async def _write_copilot_responses_stream(writer, resp, model: str, label: str) 
                     finish = "tool_calls"
                 else:
                     finish = _RESPONSES_FINISH_REASON_MAP.get(status, "stop")
-                usage = _copilot_responses_usage_to_chat(r.get("usage"))
+                usage = _copilot_responses_usage_to_chat(r.get("usage") or {})
                 await _send(_copilot_stream_chunk(model, {}, finish_reason=finish, usage=usage))
                 writer.write(b"data: [DONE]\n\n")
                 await writer.drain()

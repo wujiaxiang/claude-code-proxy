@@ -1672,7 +1672,7 @@ async def dashboard():
             # 上游是否支持 /models：优先读 ModelRegistry 单一事实源（P2），
             # 其 capabilities[port].can_prune 与 _target_model_source 判据一致（输出不变）。
             # 回退用 _target_model_source（注册表未就绪时的等价逻辑）。
-            can_prune=(_srv._MODEL_REGISTRY.capabilities.get(port, {}).get("can_prune")
+            can_prune=bool(_srv._MODEL_REGISTRY.capabilities.get(port, {}).get("can_prune")
                        if _srv._MODEL_REGISTRY is not None
                        else (_target_model_source(t) == "copilot" or t.get("hasModels") is True)),
         )

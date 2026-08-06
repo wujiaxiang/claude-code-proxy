@@ -115,8 +115,11 @@ def _gemini_to_openai_response(gemini_resp: dict, model: str) -> dict:
     }
 
 
-def _gemini_chunk_to_openai(gemini_chunk: dict, model: str) -> dict:
-    """Gemini 流式 chunk → OpenAI chat.completion.chunk。"""
+def _gemini_chunk_to_openai(gemini_chunk: dict, model: str) -> dict | None:
+    """Gemini 流式 chunk → OpenAI chat.completion.chunk。
+
+    无 candidates 的心跳/空帧返回 None，调用方按 `if oai_chunk:` 跳过（原语义）。
+    """
     candidates = gemini_chunk.get("candidates", []) or []
     if not candidates:
         return None
