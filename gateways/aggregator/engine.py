@@ -87,6 +87,7 @@ class MemberStats:
     degraded: int = 0
     latency_sum_ms: float = 0.0
     latency_count: int = 0
+    error_types: dict[str, int] = field(default_factory=dict)
 
     def as_dict(self) -> dict:
         avg = self.latency_sum_ms / self.latency_count if self.latency_count else 0.0
@@ -96,6 +97,7 @@ class MemberStats:
             "err": self.err,
             "degraded": self.degraded,
             "avg_latency_ms": avg,
+            "error_types": dict(self.error_types),
         }
 
 
@@ -404,7 +406,7 @@ class AggregatorEngine:
                 )
                 tried_ports.add(member.port)
                 self.trip(member.port, reason)
-                self.note_request(member, "err", latency_ms)
+                self.note_request(member, "err", latency_ms, error_type=reason)
                 last_error = RuntimeError(f"{reason} on port {member.port}")
                 continue
 
@@ -413,7 +415,7 @@ class AggregatorEngine:
                 #     （限流会自行恢复，trip 300s 会误伤共享该端口的其他虚拟模型/会话）
                 if status_code == 429:
                     tried_ports.add(member.port)
-                    self.note_request(member, "err", latency_ms)
+                    self.note_request(member, "err", latency_ms, error_type="429_rate_limit")
                     last_error = RuntimeError(f"429_rate_limit on port {member.port}")
                     continue
 
@@ -425,10 +427,10 @@ class AggregatorEngine:
                     # 重新选中同一端口，真实实现"同端点重试 1 次"语义
                     tried_ports.discard(member.port)
                     candidates_order.insert(0, member)
-                    self.note_request(member, "err", latency_ms)
+                    self.note_request(member, "err", latency_ms, error_type=f"{status_code}_transient")
                     continue
                 tried_ports.add(member.port)
-                self.note_request(member, "err", latency_ms)
+                self.note_request(member, "err", latency_ms, error_type="5xx_persistent")
                 last_error = RuntimeError(f"5xx_persistent on port {member.port}")
                 continue
 
@@ -442,7 +444,7 @@ class AggregatorEngine:
                     f"body_prefix={body_text[:200]!r}"
                 )
             tried_ports.add(member.port)
-            self.note_request(member, "err", latency_ms)
+            self.note_request(member, "err", latency_ms, error_type=classification)
             return member, result
 
         # 降级池：与默认池使用完全一致的 classify_failure 五分类语义
@@ -502,7 +504,7 @@ class AggregatorEngine:
                     )
                     fb_tried.add(member.port)
                     self.trip(member.port, reason)
-                    self.note_request(member, "err", latency_ms)
+                    self.note_request(member, "err", latency_ms, error_type=reason)
                     last_error = RuntimeError(f"{reason} on port {member.port}")
                     continue
 
@@ -510,7 +512,7 @@ class AggregatorEngine:
                     # B1. 429 账号级限流：立刻换端点，但绝不熔断
                     if status_code == 429:
                         fb_tried.add(member.port)
-                        self.note_request(member, "err", latency_ms)
+                        self.note_request(member, "err", latency_ms, error_type="429_rate_limit")
                         last_error = RuntimeError(f"429_rate_limit on port {member.port}")
                         continue
 
@@ -520,10 +522,10 @@ class AggregatorEngine:
                     if count == 1:
                         fb_tried.discard(member.port)
                         fb_candidates_order.insert(0, member)
-                        self.note_request(member, "err", latency_ms)
+                        self.note_request(member, "err", latency_ms, error_type=f"{status_code}_transient")
                         continue
                     fb_tried.add(member.port)
-                    self.note_request(member, "err", latency_ms)
+                    self.note_request(member, "err", latency_ms, error_type="5xx_persistent")
                     last_error = RuntimeError(f"5xx_persistent on port {member.port}")
                     continue
 
@@ -537,7 +539,7 @@ class AggregatorEngine:
                         f"body_prefix={body_text[:200]!r}"
                     )
                 fb_tried.add(member.port)
-                self.note_request(member, "err", latency_ms)
+                self.note_request(member, "err", latency_ms, error_type=classification)
                 return member, result
 
         raise AllPoolsExhausted(
@@ -575,7 +577,9 @@ class AggregatorEngine:
         except Exception:
             return ""
 
-    def note_request(self, member: PoolMember, outcome: str, latency_ms: float) -> None:
+    def note_request(
+        self, member: PoolMember, outcome: str, latency_ms: float, error_type: str | None = None
+    ) -> None:
         stats = self._stats.setdefault(member.key, MemberStats())
         stats.requests += 1
         if outcome == "ok":
@@ -584,6 +588,8 @@ class AggregatorEngine:
             stats.degraded += 1
         else:
             stats.err += 1
+            if error_type is not None:
+                stats.error_types[error_type] = stats.error_types.get(error_type, 0) + 1
         stats.latency_sum_ms += latency_ms
         stats.latency_count += 1
 

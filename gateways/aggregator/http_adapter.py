@@ -109,8 +109,6 @@ async def _handle_aggregate_request(reader, writer, target, method, path, raw_pa
     is_stream = "text/event-stream" in content_type
     if not is_stream:
         body_text = (await resp.aread()).decode("utf-8", errors="replace")
-        if engine.quota_error(body_text):
-            engine.trip(member.port, "quota_error")
         resp_headers = "".join(
             f"{k}: {v}\r\n" for k, v in resp.headers.items()
             if k.lower() not in _PROXY_STRIP_RESP_HEADERS
