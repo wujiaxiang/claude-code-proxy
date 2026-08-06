@@ -10,6 +10,7 @@ import os
 import socket
 import base64
 import asyncio
+import inspect
 import struct
 from urllib.parse import urlparse
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -3490,7 +3491,7 @@ def _load_vendor_targets():
     errors = _cfg.validate_targets(cfg)
     if errors:
         for e in errors:
-            logger.warning(f"targets.json 配置错误: {e}")
+            logger.warning(f"targets.json 配置错误: {e['path']}: {e['msg']}")
     _TARGETS = cfg.get("targets", [])
     _MODELS_CFG["models"] = cfg.get("models", [])
     _MODELS_CFG["modelDefaults"] = cfg.get("modelDefaults", {"defaultPort": 8082})
@@ -3538,8 +3539,9 @@ async def _reload_targets() -> list:
     cfg = _cfg.load_targets()
     errors = _cfg.validate_targets(cfg)
     if errors:
-        logger.error(f"配置校验失败，拒绝重载: {errors}")
-        return [f"❌ 校验失败: {errors}"]
+        summary = [f"{e['path']}: {e['msg']}" for e in errors]
+        logger.error(f"配置校验失败，拒绝重载: {summary}")
+        return [f"❌ 校验失败: {summary}"]
     _TARGETS = cfg.get("targets", [])
     _MODELS_CFG["models"] = cfg.get("models", [])
     _MODELS_CFG["modelDefaults"] = cfg.get("modelDefaults", {"defaultPort": 8082})
@@ -3759,6 +3761,77 @@ def _anthropic_port_models() -> List[dict]:
             "target": {"port": tgt.get("port"), "model": tgt.get("model")} if isinstance(tgt, dict) else {},
         })
     return out
+
+
+# ─── 统一模型列表接口（收敛四种 modelsSource）───
+
+_STATIC_SOURCE_BY_LABEL = {"codebuddy": "codebuddy", "qclaw": "qclaw", "trae-work": "trae-work"}
+
+
+def _static_model_source(target: dict) -> str:
+    """静态 models[] 的来源标记：label 前缀优先，否则回落 handler。"""
+    label = str(target.get("label") or "")
+    for prefix, source in _STATIC_SOURCE_BY_LABEL.items():
+        if label == prefix or label.startswith(prefix + "-"):
+            return source
+    return str(target.get("handler") or "passthrough")
+
+
+def _live_model_ids(target: dict) -> List[str]:
+    """copilot 上游实时模型 id 列表。
+
+    _fetch_live_models 是 async；测试以同步 MagicMock 替换它，故按返回值是否
+    awaitable 运行时判定，而非 iscoroutinefunction（mock 后函数对象已被替换）。
+    """
+    result = _fetch_live_models(target)
+    if inspect.isawaitable(result):
+        result = asyncio.run(result)
+    return [str(m) for m in (result or [])]
+
+
+def _get_target_models(label: str) -> List[dict]:
+    """统一接口：返回某 target 的模型列表，收敛四种 modelsSource。
+
+    返回 [{id, display_name, aliases, target, source}]，source 标记来源：
+    anthropic（8081 顶层 models[]）/ aggregator（virtualModels）/
+    copilot（上游实时拉取）/ codebuddy|qclaw|trae-work|<handler>（静态 models[]）。
+    label 不存在时返回 []。
+    """
+    target = next((t for t in _TARGETS if t.get("label") == label), None)
+    if target is None:
+        return []
+
+    if target.get("listenPort") == 8081 or label == "anthropic-compatible":
+        return [{**m, "source": "anthropic"} for m in _anthropic_port_models()]
+
+    handler = target.get("handler")
+    if handler == "aggregator":
+        return [
+            {"id": str(vid), "display_name": str(vid), "aliases": [], "target": {}, "source": "aggregator"}
+            for vid in (target.get("virtualModels") or {})
+        ]
+
+    if handler == "copilot":
+        return [
+            {"id": mid, "display_name": mid, "aliases": [], "target": {}, "source": "copilot"}
+            for mid in _live_model_ids(target)
+        ]
+
+    source = _static_model_source(target)
+    out: List[dict] = []
+    for m in (target.get("models") or []):
+        mid = str(m.get("id")) if isinstance(m, dict) else str(m)
+        if not mid:
+            continue
+        out.append({
+            "id": mid,
+            "display_name": (m.get("display_name") if isinstance(m, dict) else None) or mid,
+            "aliases": list(m.get("aliases") or []) if isinstance(m, dict) else [],
+            "target": {},
+            "source": source,
+        })
+    return out
+
 
 _ANTHROPIC_STATS: Dict[str, int] = {"totalRequests": 0, "passthroughOk": 0, "passthroughError": 0, "startedAt": datetime.now().isoformat()}
 
@@ -8301,7 +8374,7 @@ async def api_update_models(update: ModelsUpdate):
     return {"ok": True}
 
 
-def _scan_dangling_refs() -> List[dict]:
+def _scan_dangling_refs_cfg(cfg: dict) -> List[dict]:
     """扫描配置中的悬空引用（引用了不存在的端口 / 虚拟模型 / 模型名）。
 
     只读诊断，不修改任何配置。改名后引用方不联动是有意设计（见
@@ -8320,12 +8393,17 @@ def _scan_dangling_refs() -> List[dict]:
     （空 models[] 表示不限制透传，任何模型名都合法，不应误报）。
 
     返回 [{"path": ..., "msg": ...}]，path 形如 models[2].target 便于前端定位。
+
+    cfg 形如 {"targets": [...], "models": [...]}；无参入口 _scan_dangling_refs()
+    传入全局 _TARGETS / _MODELS_CFG 组装的 cfg，行为与参数化前完全一致。
     """
     items: List[dict] = []
+    targets = cfg.get("targets") or []
+    top_models = cfg.get("models") or []
     # 端口 → 该端口可被请求的模型名集合（None 表示不限制，不做模型级校验）
     port_models: Dict[int, Optional[set]] = {}
     port_labels: Dict[int, str] = {}
-    for t in _TARGETS:
+    for t in targets:
         port_num = t.get("listenPort")
         if port_num is None:
             continue
@@ -8362,14 +8440,14 @@ def _scan_dangling_refs() -> List[dict]:
             plabel = port_labels.get(port_i, str(port_i))
             items.append({"path": path, "msg": f"{what} 指向 {port_i}（{plabel}）的模型 {model}，但该端口未提供此模型"})
 
-    for idx, m in enumerate(_MODELS_CFG.get("models", []) or []):
+    for idx, m in enumerate(top_models):
         if not isinstance(m, dict):
             continue
         ref = m.get("target")
         if isinstance(ref, dict):
             _check(f"models[{idx}].target", ref, f"模型定义 {m.get('name') or idx}")
 
-    for t in _TARGETS:
+    for t in targets:
         if t.get("handler") != "aggregator":
             continue
         for vmid, vm in (t.get("virtualModels") or {}).items():
@@ -8382,6 +8460,88 @@ def _scan_dangling_refs() -> List[dict]:
 
     return items
 
+
+def _scan_dangling_refs() -> List[dict]:
+    """无参入口：扫描当前全局配置（_TARGETS / _MODELS_CFG）的悬空引用。
+
+    保留无参签名，`/api/config/dangling` 等既有调用点无需改动。
+    """
+    return _scan_dangling_refs_cfg({
+        "targets": _TARGETS,
+        "models": _MODELS_CFG.get("models", []) or [],
+    })
+
+
+# handler → modelsSource 的直接映射（handler 已经明确表达上游协议来源）
+_MODELS_SOURCE_BY_HANDLER: Dict[str, str] = {
+    "copilot": "copilot",
+    "aggregator": "aggregator",
+    "gemini-native": "gemini-native",
+    "qclaw": "qclaw",
+    "trae-work": "trae-work",
+}
+# handler=passthrough 时按 label 细分（label 是供应商身份，handler 只说明转发方式）
+_MODELS_SOURCE_BY_LABEL: Dict[str, str] = {
+    "codebuddy": "codebuddy",
+    "qclaw": "qclaw",
+    "trae-work": "trae-work",
+    "anthropic": "anthropic",
+    "anthropic-compatible": "anthropic",
+}
+_ANTHROPIC_ENTRY_PORT = 8081
+
+
+def _derive_models_source(target: dict) -> str:
+    """推导 target 的模型来源枚举值。
+
+    优先级：handler 直映射 > Anthropic 入口（8081 / anthropic* label）> label 细分 > passthrough。
+    """
+    handler = target.get("handler")
+    direct = _MODELS_SOURCE_BY_HANDLER.get(handler)
+    if direct:
+        return direct
+    label = target.get("label") or ""
+    if target.get("listenPort") == _ANTHROPIC_ENTRY_PORT:
+        return "anthropic"
+    return _MODELS_SOURCE_BY_LABEL.get(label, "passthrough")
+
+
+class ModelRegistry:
+    """targets 配置的只读内存索引（纯函数式：构建后不再读全局状态）。
+
+    三个属性：
+      byPort       — listenPort → {label, handler, category, models, target}
+      dangling     — 与 _scan_dangling_refs_cfg(cfg) 等价的悬空引用列表
+      capabilities — listenPort → {can_prune, modelsSource}
+
+    can_prune 与 dashboard 现有判据保持一致：显式 hasModels=true 或 handler=copilot
+    （只有 copilot 系上游提供 /models 列表，才谈得上"对照上游清理过期模型"）。
+    """
+
+    __slots__ = ("byPort", "dangling", "capabilities")
+
+    def __init__(self, cfg: dict) -> None:
+        targets = cfg.get("targets") or []
+        by_port: Dict[int, dict] = {}
+        caps: Dict[int, dict] = {}
+        for t in targets:
+            port = t.get("listenPort")
+            if port is None:
+                continue
+            by_port[port] = {
+                "label": t.get("label"),
+                "handler": t.get("handler"),
+                "category": t.get("category"),
+                "models": list(t.get("models") or []),
+                "target": t,
+            }
+            caps[port] = {
+                "can_prune": t.get("hasModels") is True or t.get("handler") == "copilot",
+                "modelsSource": _derive_models_source(t),
+            }
+        self.byPort = by_port
+        self.capabilities = caps
+        self.dangling = _scan_dangling_refs_cfg(cfg)
 
 @app.get("/api/config/dangling")
 async def api_get_dangling():
