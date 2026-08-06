@@ -668,6 +668,14 @@ async def lifespan(app):
         _AGGREGATOR_CONFIG_SIG = json.dumps(_agg_preinit, sort_keys=True, ensure_ascii=False)
         print(f"🚀 [aggregator] 聚合网关引擎预初始化（{len(_agg_preinit.get('virtualModels', {}))} 个虚拟模型）")
 
+    # P2: 启动即构建 ModelRegistry 单一事实源（lifespan 运行时，所有类已定义）
+    global _MODEL_REGISTRY
+    _MODEL_REGISTRY = ModelRegistry({
+        "targets": _TARGETS,
+        "modelDefaults": _MODELS_CFG.get("modelDefaults", {}),
+        "models": _MODELS_CFG.get("models", []),
+    })
+
     # ── 启动配置热重载 watcher ──
     watcher_task = asyncio.create_task(_config_watcher())
     aggregator_prober_task = asyncio.create_task(_aggregator_prober())
@@ -920,6 +928,7 @@ import config_store as _cfg
 # ─── 统一透传引擎配置（targets.json 驱动）───
 _VENDOR_RETRY_AFTER = int(os.environ.get("VENDOR_RETRY_AFTER_SECONDS", "3"))
 _TARGETS: list = []
+_MODEL_REGISTRY = None  # P2: ModelRegistry 内存索引，热重载时重建（dashboard 渲染消费的单一事实源）
 _SECRETS: dict = {}
 _TARGET_STATS: Dict[str, dict] = {}
 # 模型级统计：{ label: { model_name: {"requests": N, "ok": N, "err": N, "translated429": N} } }
@@ -3486,7 +3495,7 @@ def _rewrite_upstream_path(handler: str, raw_path: str, route_prefix: str) -> st
 
 def _load_vendor_targets():
     """加载 targets.json + secrets.json，规范化并初始化统计。"""
-    global _TARGETS, _SECRETS, _MODELS_CFG, COPILOT_GHE_TOKEN
+    global _TARGETS, _SECRETS, _MODELS_CFG, COPILOT_GHE_TOKEN, _MODEL_REGISTRY
     cfg = _cfg.load_targets()
     errors = _cfg.validate_targets(cfg)
     if errors:
@@ -3534,7 +3543,7 @@ _config_mtimes: Dict[str, float] = {}
 
 async def _reload_targets() -> list:
     """重载 targets.json / secrets.json，diff 端口并动态增删 server。"""
-    global _TARGETS, _SECRETS, _MODELS_CFG, COPILOT_GHE_TOKEN
+    global _TARGETS, _SECRETS, _MODELS_CFG, COPILOT_GHE_TOKEN, _MODEL_REGISTRY
     changes = []
     cfg = _cfg.load_targets()
     errors = _cfg.validate_targets(cfg)
@@ -3545,6 +3554,12 @@ async def _reload_targets() -> list:
     _TARGETS = cfg.get("targets", [])
     _MODELS_CFG["models"] = cfg.get("models", [])
     _MODELS_CFG["modelDefaults"] = cfg.get("modelDefaults", {"defaultPort": 8082})
+    # P2: 重建 ModelRegistry 单一事实源（dashboard 渲染改读它，targets.json 结构不变）
+    _MODEL_REGISTRY = ModelRegistry({
+        "targets": _TARGETS,
+        "modelDefaults": _MODELS_CFG.get("modelDefaults", {}),
+        "models": _MODELS_CFG.get("models", []),
+    })
     _SECRETS = _cfg.load_secrets()
     # 私密凭据热重载：COPILOT_GHE_TOKEN 同步 secrets.json copilot_token（dashboard 可编辑热生效）
     _copilot_secret = _SECRETS.get("copilot_token")
@@ -9359,10 +9374,12 @@ async def dashboard():
             label=t["label"],
             port=port,
             meta_badges=meta_badges,
-            # 上游是否支持 /models：走统一接口的 source 语义（copilot 系天然支持）
-            # + 配置驱动兜底（targets.json hasModels）。用 _target_model_source 而非
-            # _get_target_models：后者对 copilot 会同步拉取上游，在此 async 路径下会抛错。
-            can_prune=(_target_model_source(t) == "copilot" or t.get("hasModels") is True),
+            # 上游是否支持 /models：优先读 ModelRegistry 单一事实源（P2），
+            # 其 capabilities[port].can_prune 与 _target_model_source 判据一致（输出不变）。
+            # 回退用 _target_model_source（注册表未就绪时的等价逻辑）。
+            can_prune=(_MODEL_REGISTRY.capabilities.get(port, {}).get("can_prune")
+                       if _MODEL_REGISTRY is not None
+                       else (_target_model_source(t) == "copilot" or t.get("hasModels") is True)),
         )
         if category == "crack":
             crack_cards.append(card)
