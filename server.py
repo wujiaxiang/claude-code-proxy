@@ -24,6 +24,11 @@ from datetime import datetime
 from pathlib import Path
 import sys
 
+# 主模块别名：python server.py 运行时，延迟导入的 from server import X
+# 必须解析到已加载的 __main__，否则会重新执行整个 server.py（双份初始化）
+if __name__ == "__main__" and "server" not in sys.modules:
+    sys.modules["server"] = sys.modules["__main__"]
+
 # QClaw 网关符号（从 gateways/qclaw.py 拆分导入；内部对 server 模块为延迟导入，无循环依赖）
 from gateways.qclaw import (
     _QCLAW_ALLOWED_KEYS,
