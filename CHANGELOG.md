@@ -3,6 +3,11 @@
 ## [Unreleased]
 
 ### Added
+- **全量配置导出/导入（2026-08-07）**：`GET /api/config/export` + `POST /api/config/import`（dashboard「📦 导出配置 / 📥 导入配置」按钮），把三个 gitignored 配置源（targets.json / secrets.json / .env）打包成**单个 JSON**（`{version, exportedAt, targets, secrets, env}`），实现"从 GitHub 下载代码 → 导入一个配置文件 → 达到现有配置效果"的迁移诉求
+  - **导出**：`GET /api/config/export` 聚合三源返回（含完整私密凭据，前端提示妥善保管）；`env` 段仅含白名单运行配置键（`ENV_EXPORT_KEYS`：DEBUG/LOG_*/CACHE_*/COPILOT_*）
+  - **导入**：`POST /api/config/import` 校验 version + `validate_targets`（失败 422 且不写任何文件，原子性），成功写三文件 + `_reload_targets()`（端口 diff）+ `_refresh_secrets()` 即时生效；`env` 段用 `dotenv.set_key` 逐键写入保留其他键，需重启进程完全生效（响应 `restartRequired: true`）
+  - **物理文件保持分离**：热重载粒度（targets mtime 2s / secrets 即时 / env 仅启动读）与私密凭据隔离是刻意设计，导出/导入仅做快照级打包还原，不合并配置源
+  - 测试：test_dashboard.py 新增 5 用例（导出完整性/含真实凭据/导入往返+热重载+还原/拒绝坏版本/拒绝非法 targets）
 - **dashboard/ 子包拆分（2026-08-07）**：`dashboard/routes.py`（3235 行）按职责拆为装配入口 + 7 个子模块，逻辑逐字节不变、行为零变化，server.py 挂载点零改动（仍 `from dashboard.routes import dashboard_router`）
   - `dashboard/routes.py`（74 行）：定义 `dashboard_router` + import 子模块触发路由注册 + re-export
   - `dashboard/frontend.py`：`DASHBOARD_STYLE` + HTML 渲染辅助函数（`_html_escape`/`_get_lan_ip`/`_format_uptime`/`_model_details_html`/`_build_card_html`）+ `dashboard()` 页面

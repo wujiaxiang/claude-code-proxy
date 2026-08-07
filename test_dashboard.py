@@ -609,6 +609,156 @@ def test_api_aggregate_status_returns_tripped_at():
             assert isinstance(ms["error_types"], dict), f"{vm_id}/{mk}.error_types 应为 dict[str,int]"
 
 
+def test_config_export_complete():
+    """全量配置导出：单 JSON 含 targets/secrets/env 三段，且覆盖全部 11 个 target。"""
+    conn = http.client.HTTPConnection("127.0.0.1", 8081, timeout=15)
+    conn.request("GET", "/api/config/export")
+    resp = conn.getresponse()
+    body = resp.read().decode("utf-8", errors="replace")
+    conn.close()
+    assert resp.status == 200, f"导出 HTTP {resp.status}"
+    data = json.loads(body)
+    assert data.get("version") == 1, "导出应有 version=1"
+    assert data.get("exportedAt"), "导出应含 exportedAt"
+    # targets 段：完整配置对象（targets 数组 + modelDefaults）
+    assert isinstance(data.get("targets"), dict), "targets 段应为对象"
+    assert len(data["targets"].get("targets", [])) >= 9, \
+        f"targets 段应含全部 target（≥9），实际 {len(data['targets'].get('targets', []))}"
+    # secrets 段：完整凭据对象
+    assert isinstance(data.get("secrets"), dict), "secrets 段应为对象"
+    # env 段：含 COPILOT 运行配置键
+    assert isinstance(data.get("env"), dict), "env 段应为对象"
+    assert any(k.startswith("COPILOT_") for k in data["env"]), "env 段应含 COPILOT_* 键"
+
+
+def test_config_export_contains_secrets_values():
+    """导出必须含真实凭据值（迁移诉求：导入后即可用），不能是打码/空。"""
+    conn = http.client.HTTPConnection("127.0.0.1", 8081, timeout=15)
+    conn.request("GET", "/api/config/export")
+    resp = conn.getresponse()
+    body = resp.read().decode("utf-8", errors="replace")
+    conn.close()
+    assert resp.status == 200
+    data = json.loads(body)
+    secrets = data.get("secrets") or {}
+    # 至少一个 crack 网关 token 非空（copilot_token / codebuddy_token / qclaw_api_key 等）
+    non_empty = {k: v for k, v in secrets.items() if isinstance(v, str) and v}
+    assert non_empty, "secrets 段应含至少一个非空凭据"
+    # 导出内容不得是打码形态（不含 '...' 掩码且长度 > 10 的才算真值）
+    real = [v for v in non_empty.values() if len(v) > 10 and "..." not in v]
+    assert real, "secrets 段应含真实凭据值（长度>10 且无打码掩码）"
+
+
+def test_config_import_roundtrip():
+    """导入往返：导出 → 改 targets 一个字段 → 导入 → 验证文件与热重载生效 → 还原。"""
+    conn = http.client.HTTPConnection("127.0.0.1", 8081, timeout=15)
+    conn.request("GET", "/api/config/export")
+    resp = conn.getresponse()
+    data = json.loads(resp.read().decode("utf-8"))
+    conn.close()
+    assert resp.status == 200
+
+    # 备份当前磁盘 targets.json 原样，测试后还原
+    import os
+    from pathlib import Path
+    root = Path(__file__).parent
+    targets_path = root / "targets.json"
+    original = targets_path.read_text(encoding="utf-8") if targets_path.exists() else None
+
+    # 改第一个 target 的 enabled 取反（用可逆字段避免残留副作用）；提取到 try 外，
+    # 保证 finally 还原分支总能拿到绑定（即使 try 中途异常）
+    first = data["targets"]["targets"][0]
+    orig_enabled = first.get("enabled", True)
+
+    try:
+        first["enabled"] = not orig_enabled
+
+        payload = json.dumps(data).encode("utf-8")
+        conn = http.client.HTTPConnection("127.0.0.1", 8081, timeout=15)
+        conn.request("POST", "/api/config/import", body=payload,
+                     headers={"Content-Type": "application/json"})
+        resp = conn.getresponse()
+        body = resp.read().decode("utf-8", errors="replace")
+        conn.close()
+        assert resp.status == 200, f"导入 HTTP {resp.status}: {body[:300]}"
+        result = json.loads(body)
+        assert result.get("ok") is True
+        assert result.get("targetsCount", 0) >= 9, "导入应返回 target 数"
+        assert result.get("restartRequired") is True, "env 段导入应提示需重启"
+        assert result.get("envWritten", 0) >= 0
+
+        # 验证热重载生效：/api/targets 返回的 enabled 已翻转
+        conn = http.client.HTTPConnection("127.0.0.1", 8081, timeout=15)
+        conn.request("GET", "/api/targets")
+        resp = conn.getresponse()
+        targets = json.loads(resp.read().decode("utf-8"))
+        conn.close()
+        loaded = next(t for t in targets["targets"] if t["label"] == first["label"])
+        assert loaded["enabled"] == (not orig_enabled), \
+            f"热重载后 {first['label']} enabled 应为 {not orig_enabled}，实际 {loaded['enabled']}"
+
+        # 验证磁盘文件同步
+        disk = json.loads(targets_path.read_text(encoding="utf-8"))
+        disk_first = next(t for t in disk["targets"] if t["label"] == first["label"])
+        assert disk_first["enabled"] == (not orig_enabled), "targets.json 磁盘内容应已更新"
+    finally:
+        # 还原：恢复被翻转的 enabled 字段，再导入原样数据（保证测试幂等，不污染真实配置）
+        first["enabled"] = orig_enabled
+        conn = http.client.HTTPConnection("127.0.0.1", 8081, timeout=15)
+        conn.request("POST", "/api/config/import", body=json.dumps(data).encode("utf-8"),
+                     headers={"Content-Type": "application/json"})
+        resp = conn.getresponse()
+        conn.close()
+        assert resp.status == 200, f"还原导入失败 HTTP {resp.status}"
+
+
+def test_config_import_rejects_bad_version():
+    """导入应拒绝不支持的版本号（422），且不写任何文件。"""
+    from pathlib import Path
+    root = Path(__file__).parent
+    targets_path = root / "targets.json"
+    before = targets_path.read_text(encoding="utf-8") if targets_path.exists() else None
+    payload = json.dumps({
+        "version": 999,
+        "targets": {"targets": [], "modelDefaults": {"defaultPort": 8082}, "models": []},
+        "secrets": {},
+        "env": {},
+    }).encode("utf-8")
+    conn = http.client.HTTPConnection("127.0.0.1", 8081, timeout=15)
+    conn.request("POST", "/api/config/import", body=payload,
+                 headers={"Content-Type": "application/json"})
+    resp = conn.getresponse()
+    resp.read()
+    conn.close()
+    assert resp.status == 422, f"版本不匹配应 422，实际 {resp.status}"
+    after = targets_path.read_text(encoding="utf-8") if targets_path.exists() else None
+    assert before == after, "版本拒绝时不应改动 targets.json"
+
+
+def test_config_import_rejects_invalid_targets():
+    """导入应拒绝非法 targets（validate_targets 拦截，422 且不写文件）。"""
+    from pathlib import Path
+    root = Path(__file__).parent
+    targets_path = root / "targets.json"
+    before = targets_path.read_text(encoding="utf-8") if targets_path.exists() else None
+    # 构造非法 target：缺 label/listenPort/handler 必填字段
+    payload = json.dumps({
+        "version": 1,
+        "targets": {"targets": [{"label": "bad-no-port"}], "modelDefaults": {"defaultPort": 8082}, "models": []},
+        "secrets": {},
+        "env": {},
+    }).encode("utf-8")
+    conn = http.client.HTTPConnection("127.0.0.1", 8081, timeout=15)
+    conn.request("POST", "/api/config/import", body=payload,
+                 headers={"Content-Type": "application/json"})
+    resp = conn.getresponse()
+    resp.read()
+    conn.close()
+    assert resp.status == 422, f"非法 targets 应 422，实际 {resp.status}"
+    after = targets_path.read_text(encoding="utf-8") if targets_path.exists() else None
+    assert before == after, "校验失败时不应改动 targets.json"
+
+
 def main():
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     failed = 0

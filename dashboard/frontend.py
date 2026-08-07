@@ -1263,6 +1263,9 @@ async def dashboard():
     <div class="ov-side">
       <div class="ov-dots">{overview_dots}</div>
       <div class="ov-actions">
+        <button class="ov-btn" onclick="exportConfig()">📦 导出配置</button>
+        <button class="ov-btn" onclick="document.getElementById('import-file-input').click()">📥 导入配置</button>
+        <input type="file" id="import-file-input" accept=".json,application/json" style="display:none" onchange="importConfigFile(this)">
         <button class="ov-btn" onclick="doReload()">♻️ 重载配置</button>
         <button class="ov-btn ov-btn-primary" onclick="location.reload()">🔄 刷新状态</button>
       </div>
@@ -2316,6 +2319,80 @@ async function doReload() {{
     setOvMsg('❌ 重载异常: ' + e, 'danger');
     if (btn) {{ btn.disabled = false; btn.textContent = '♻️ 重载配置'; }}
   }}
+}}
+
+// ── 全量配置导出 / 导入 ──
+function exportConfig() {{
+  var btn = event.target;
+  if (btn) {{ btn.disabled = true; btn.textContent = '导出中...'; }}
+  fetch('/api/config/export', {{method: 'GET'}})
+    .then(function(resp) {{ return resp.ok ? resp.json() : Promise.reject(resp); }})
+    .then(function(data) {{
+      var blob = new Blob([JSON.stringify(data, null, 2)], {{type: 'application/json'}});
+      var url = URL.createObjectURL(blob);
+      var a = document.createElement('a');
+      a.href = url;
+      a.download = 'proxy-config-' + new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-') + '.json';
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+      setOvMsg('✅ 已导出完整配置（含全部私密凭据，请妥善保管）', 'success');
+    }})
+    .catch(function(err) {{
+      setOvMsg('❌ 导出失败: ' + err.status + ' ' + err.statusText, 'danger');
+    }})
+    .finally(function() {{
+      if (btn) {{ btn.disabled = false; btn.textContent = '📦 导出配置'; }}
+    }});
+}}
+
+function importConfigFile(input) {{
+  var file = input.files && input.files[0];
+  if (!file) return;
+  var reader = new FileReader();
+  reader.onload = function(e) {{
+    importConfigFromText(e.target.result);
+    input.value = '';
+  }};
+  reader.onerror = function() {{
+    setOvMsg('❌ 读取文件失败', 'danger');
+    input.value = '';
+  }};
+  reader.readAsText(file);
+}}
+
+function importConfigFromText(text) {{
+  var data;
+  try {{
+    data = JSON.parse(text);
+  }} catch (e) {{
+    setOvMsg('❌ 配置文件不是合法 JSON: ' + e.message, 'danger');
+    return;
+  }}
+  var label = (data && data.version !== undefined) ? ('v' + data.version + ' 配置') : '未知格式';
+  if (!confirm('⚠️ 导入 ' + label + ' 将覆盖当前 targets.json / secrets.json / .env（含全部私密凭据与端口配置）。\\n\\n此操作不可撤销，确定继续？')) return;
+  var btn = document.querySelector('.ov-actions .ov-btn-primary') || null;
+  fetch('/api/config/import', {{
+    method: 'POST',
+    headers: {{'Content-Type': 'application/json'}},
+    body: JSON.stringify(data),
+  }})
+    .then(function(resp) {{
+      return resp.json().then(function(r) {{ return {{ok: resp.ok, status: resp.status, body: r}}; }});
+    }})
+    .then(function(res) {{
+      if (res.ok) {{
+        setOvMsg('✅ 已导入 targets=' + res.body.targetsCount + ' secrets=' + res.body.secretsCount + ' env=' + res.body.envWritten + '（' + res.body.message + '）', 'success');
+        setTimeout(function() {{ location.reload(); }}, 1500);
+      }} else {{
+        var detail = typeof res.body.detail === 'string' ? res.body.detail : JSON.stringify(res.body.detail);
+        setOvMsg('❌ 导入失败 (' + res.status + '): ' + detail, 'danger');
+      }}
+    }})
+    .catch(function(err) {{
+      setOvMsg('❌ 导入异常: ' + err, 'danger');
+    }});
 }}
 
 // ── 初始化 ──

@@ -68,6 +68,7 @@ from dashboard import (
     api_aggregate,
     api_secrets,
     api_crack,
+    api_config,
     frontend,
 )
 
