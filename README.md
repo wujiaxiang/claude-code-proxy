@@ -29,7 +29,19 @@ A proxy server that exposes one Anthropic-compatible entry (8081) plus one OpenA
 3. **Create `targets.json`** (port/provider/category/handler/model config) and `secrets.json` (private tokens, gitignored).
    See [docs/architecture.md](docs/architecture.md) for the full schema.
 
-4. **Create `.env`** with global config only (`DEBUG`, `LOG_FILE`, `LOG_RETENTION_DAYS`, `LOG_ROTATE_WHEN`, `LOG_ROTATE_INTERVAL`).
+4. **(Optional) Add a top-level `server` section to `targets.json`** for global runtime settings. The whole section and any of its keys can be omitted, in which case defaults apply:
+
+   | Key | Default | Was |
+   |-----|---------|-----|
+   | `listenPort` | `8081` | `ANTHROPIC_PORT` |
+   | `preferredProvider` | `"openai"` | `PREFERRED_PROVIDER` (still consumed by model mapping) |
+   | `legacyModels` `{big, medium, small}` | `gpt-4.1` / `gpt-4.1` / `gpt-4.1-mini` | `BIG_MODEL` / `MEDIUM_MODEL` / `SMALL_MODEL` |
+   | `log` `{debug, file, retentionDays, rotateWhen, rotateInterval}` | `false` / `""` / `7` / `"midnight"` / `1` | `DEBUG` / `LOG_FILE` / `LOG_RETENTION_DAYS` / `LOG_ROTATE_WHEN` / `LOG_ROTATE_INTERVAL` |
+   | `cache` `{enabled, maxSize, ttlSeconds, maxItemSizeKb}` | `true` / `500` / `3600` / `100` | `CACHE_ENABLED` / `CACHE_MAX_SIZE` / `CACHE_TTL_SECONDS` / `CACHE_MAX_ITEM_SIZE_KB` |
+   | `copilot` `{gheHost, integrationId, bigModel, mediumModel, smallModel}` | `copilot-api.bmw.ghe.com` / `copilot-developer-cli` / `claude-sonnet-4.6` / `claude-sonnet-4.6` / `claude-haiku-4.5` | `COPILOT_GHE_HOST` / `COPILOT_INTEGRATION_ID` / `COPILOT_BIG\|MEDIUM\|SMALL_MODEL` |
+   | `qclaw` `{baseUrl}` | `https://mmgrcalltoken.3g.qq.com/aizone/v1` | `QCLAW_BASE_URL` |
+
+   > `.env` has been removed (backup `.env.bak`); its runtime config now lives in `targets.server`. Migrate an old `.env` with `scripts/migrate_env_to_targets.py`. Private tokens stay in `secrets.json`.
 
 5. **Run the server**:
    ```bash

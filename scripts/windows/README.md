@@ -48,7 +48,7 @@ wscript.exe .\scripts\windows\start_proxy.vbs
 
 ## 开发约定（本目录规则）
 
-- **改配置只改 `.env`**：VBS/BAT 是纯启动器，不设任何环境变量——所有配置来自项目根 `.env`。
+- **改配置改项目根 `targets.json`（运行配置在顶层 `server` 段）或 `secrets.json`（私密凭据）**：VBS/BAT 是纯启动器，不设任何环境变量——`.env` 已废弃删除（备份 `.env.bak`），所有配置来自这两个文件。
 - **计划任务 Action 路径必须指向本子目录**（`scripts/windows/` 移动过，路径会失效）。
 - **动态路径定位**：脚本内用 `ScriptFullName` / `$PSScriptRoot` 推导项目根，移动项目目录后只需更新计划任务路径，脚本本身不改。
 

@@ -78,6 +78,53 @@ Anthropic 协议：base_url = http://192.168.2.128:8081，api_key = "dummy"
 
 **secrets 优先级**：`secrets.json` > `apikeyEnv` 环境变量 > 客户端透传（free/paid）。
 
+### 顶层 `server` 段（主服务运行配置）
+
+`.env` 已废弃删除（备份 `.env.bak`），原非私密运行配置并入 `targets.json` 顶层 `server` 段。整段与任意子键均可省略，缺失时按默认补齐（用户 server 段与 `config_store.py` 的 `DEFAULT_SERVER_CONFIG` 做**一层深合并**：顶层子键缺失补默认，嵌套 dict 的键缺失补默认，但不递归）。旧部署用一次性脚本 `scripts/migrate_env_to_targets.py` 把旧 `.env` 迁进本段。
+
+```jsonc
+{
+  "server": {
+    "listenPort": 8081,                 // 原 ANTHROPIC_PORT，anthropic-compatible 入口端口
+    "preferredProvider": "openai",      // 原 PREFERRED_PROVIDER，仍被模型映射消费（控制默认 provider 归属）
+    "legacyModels": {                   // 原 BIG_MODEL/MEDIUM_MODEL/SMALL_MODEL，仍被模型映射消费
+      "big": "gpt-4.1",
+      "medium": "gpt-4.1",
+      "small": "gpt-4.1-mini"
+    },
+    "log": {                            // 原 DEBUG/LOG_FILE/LOG_RETENTION_DAYS/LOG_ROTATE_WHEN/LOG_ROTATE_INTERVAL
+      "debug": false,
+      "file": "",
+      "retentionDays": 7,
+      "rotateWhen": "midnight",
+      "rotateInterval": 1
+    },
+    "cache": {                          // 原 CACHE_ENABLED/CACHE_MAX_SIZE/CACHE_TTL_SECONDS/CACHE_MAX_ITEM_SIZE_KB
+      "enabled": true,
+      "maxSize": 500,
+      "ttlSeconds": 3600,
+      "maxItemSizeKb": 100
+    },
+    "copilot": {                        // 原 COPILOT_GHE_HOST/COPILOT_INTEGRATION_ID/COPILOT_BIG|MEDIUM|SMALL_MODEL
+      "gheHost": "copilot-api.bmw.ghe.com",
+      "integrationId": "copilot-developer-cli",
+      "bigModel": "claude-sonnet-4.6",
+      "mediumModel": "claude-sonnet-4.6",
+      "smallModel": "claude-haiku-4.5"
+    },
+    "qclaw": {                          // 原 QCLAW_BASE_URL（QCLAW_API_KEY 是私密凭据，留在 secrets.json）
+      "baseUrl": "https://mmgrcalltoken.3g.qq.com/aizone/v1"
+    }
+  }
+}
+```
+
+> `preferredProvider` 此前文档误标"已废弃无实际作用"，现更正：由 `server.preferredProvider` 承载并生效（被模型映射消费）。
+
+### 全量配置导出/导入（v2）
+
+`GET /api/config/export` / `POST /api/config/import` 把两个 gitignored 配置源打包成**单个 JSON**（v2 格式：`{version, exportedAt, targets, secrets}`，`version=2`）。运行配置已并入 `targets.server` 段，导出结构中**不再有独立 `env` 段**。导入校验 version + `validate_targets`（失败 422 且不写任何文件），成功写两文件 + `_reload_targets()`（端口 diff）+ `_refresh_secrets()` 即时生效。
+
 ### SSE 帧规范化（normalizeSse）
 
 部分上游返回的 SSE 帧不符合 OpenAI 协议，而 `passthrough` 是纯字节转发，畸形帧会原样传给客户端。开启 `normalizeSse` 后，代理对该 target 的流式响应逐帧清洗。
@@ -113,7 +160,7 @@ Anthropic 协议：base_url = http://192.168.2.128:8081，api_key = "dummy"
 
 > `normalizeSse` 为真时会自动启用逐帧处理链路（与 SSE 诊断日志共用）。诊断日志附带 `normalized=N` 表示本次改写的帧数。
 
-> **私密凭据收敛约定（2026-08-05）**：私密凭据唯一事实源是 `secrets.json`（dashboard 可热编辑、mtime 热重载 2s 生效）。`.env` **只放非私密运行配置**（`DEBUG`/`LOG_*`/`COPILOT_GHE_HOST`/`COPILOT_INTEGRATION_ID`/`COPILOT_*_MODEL` 等）。`apikeyEnv` 仅为兼容旧部署的兜底。已收敛：`COPILOT_GHE_TOKEN` 并入 `secrets.json` 的 `copilot_token`（同源，server.py 翻译层热重载同步），`CODEBUDDY_TOKEN` 冗余已删。
+> **配置来源约定**：配置文件只有两个——`targets.json`（运行配置 + Target 定义）与 `secrets.json`（私密凭据）。`.env` 已废弃删除（备份 `.env.bak`），原非私密运行配置并入了 `targets.json` 顶层 `server` 段。私密凭据唯一事实源是 `secrets.json`（dashboard 可热编辑、mtime 热重载 2s 生效）。`apikeyEnv` 仅为兼容旧部署的兜底。已收敛：`COPILOT_GHE_TOKEN` 并入 `secrets.json` 的 `copilot_token`（同源，server.py 翻译层热重载同步），`CODEBUDDY_TOKEN` 冗余已删。
 
 **热重载**：`targets.json` / `secrets.json` mtime 轮询（2s），修改后自动生效，无需重启。
 

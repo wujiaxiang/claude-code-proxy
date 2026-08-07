@@ -40,12 +40,13 @@ cd claude-code-proxy
 python3 -m venv .venv && .venv/bin/pip install -r requirements.txt   # 或 uv sync
 
 # 配置 targets.json（端口/供应商/分类/handler/模型）与 secrets.json（token）
-# .env 仅保留全局配置：DEBUG / LOG_FILE / LOG_RETENTION_DAYS / LOG_ROTATE_WHEN / LOG_ROTATE_INTERVAL
+# 运行配置（可选）写进 targets.json 顶层 server 段：listenPort / preferredProvider / legacyModels / log / cache / copilot / qclaw
+# .env 已废弃删除（备份 .env.bak），旧部署用 scripts/migrate_env_to_targets.py 迁移进 server 段
 
 .venv/bin/python server.py   # 启动 8081 + targets.json 定义的全部端口
 ```
 
-> 旧版 `PREFERRED_PROVIDER` 单 provider 切换机制已废弃——端口-供应商绑定由 `targets.json` 决定，不再由 `.env` 路由。
+> 端口-供应商绑定由 `targets.json` 决定。`preferredProvider` 现由 `targets.json` 顶层 `server.preferredProvider` 承载（默认 `openai`），仍被模型映射消费以决定默认 provider 归属。
 
 ## 客户端接入
 
@@ -166,7 +167,7 @@ Claude Code / Cline
 
 > **注：** Copilot provider 在两个端点上均使用 httpx 直连下游对应端点。`/v1/messages` → 下游 `/v1/messages`（Anthropic 原生 SSE），`/v1/chat/completions` → 下游 `/chat/completions`（OpenAI SSE）。完全绕过 LiteLLM，无协议翻译损耗。其他 provider 的 `/v1/messages` 仍走 LiteLLM 翻译。
 
-完整配置参考 `.env.example`
+完整配置参考 `targets.json`（顶层 `server` 段为运行配置，`targets` 数组为 Target 定义）与 `secrets.json`（私密凭据），schema 见 [docs/architecture.md](docs/architecture.md)
 
 ---
 

@@ -9,8 +9,7 @@
 项目根/
 ├── server.py              ← 代理主程序
 ├── .venv/                 ← 项目虚拟环境
-├── .env                   ← 全局配置（DEBUG/LOG_*，不含密钥）
-├── targets.json           ← 多端口架构配置（端口/供应商/分类/handler/模型）
+├── targets.json           ← 运行配置（顶层 server 段）+ 多端口 Target 定义（端口/供应商/分类/handler/模型）
 ├── secrets.json           ← 私密 token（dashboard 可编辑，不入库）
 └── scripts/windows/       ← Windows 启动脚本
     ├── start_proxy.vbs          ← 主启动器（计划任务登录触发）

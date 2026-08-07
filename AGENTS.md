@@ -23,7 +23,7 @@
 |------|------|------|
 | Linux LXC（本机） | `/root/shared-workspace/claude-code-proxy/` | 开发/测试主环境 |
 | Windows Server | `C:\Users\Administrator\claude-code-proxy-main\` | 生产部署（计划任务 `\ClaudeCodeProxy` 登录时触发 VBS） |
-| `.env` / `secrets.json` | 项目根 | 全局配置 / 私密 token（**gitignored**，dashboard 可热编辑） |
+| `targets.json` / `secrets.json` | 项目根 | 运行配置 + Target 定义 / 私密 token（`secrets.json` **gitignored**，dashboard 可热编辑；`.env` 已废弃删除，备份 `.env.bak`） |
 | `proxy.log` | 项目根 | 主运行日志（不含 codebuddy / trae-work 的网关细节，见 §2.1） |
 | `codebuddy.log` / `traework.log` | 项目根 | 网关独立日志（`propagate=False`，**不进 proxy.log**） |
 
@@ -46,7 +46,7 @@ tail -f /root/shared-workspace/claude-code-proxy/proxy.log
 # & ".\.venv\Scripts\python.exe" server.py
 ```
 
-> systemd 细节：`ExecStart=.venv/bin/python3 server.py`，`Restart=always`（kill -9 也会被自动拉起）、`RestartSec=10`，日志追加到 `proxy.log`。**DEBUG 默认关闭**（无 `debug.conf`、`.env` 不设 `DEBUG`），日志级别为 INFO，`logger.debug()` 不输出——网关独立日志（`codebuddy.log` / `traework.log`）的逐请求诊断也随之静默，仅 INFO 及以上（如热重写命中）仍记录。需要排查时临时开：`systemctl edit claude-code-proxy` 加 `Environment=DEBUG=true` → `systemctl restart` → **查完记得恢复**（DEBUG 会把每个请求体/SSE 统计写盘，长期开启徒增磁盘与噪音）。
+> systemd 细节：`ExecStart=.venv/bin/python3 server.py`，`Restart=always`（kill -9 也会被自动拉起）、`RestartSec=10`，日志追加到 `proxy.log`。**DEBUG 默认关闭**（无 `debug.conf`、`targets.json` 的 `server.log.debug` 为 `false`），日志级别为 INFO，`logger.debug()` 不输出——网关独立日志（`codebuddy.log` / `traework.log`）的逐请求诊断也随之静默，仅 INFO 及以上（如热重写命中）仍记录。需要排查时临时开：`systemctl edit claude-code-proxy` 加 `Environment=DEBUG=true` → `systemctl restart` → **查完记得恢复**（DEBUG 会把每个请求体/SSE 统计写盘，长期开启徒增磁盘与噪音）。
 
 > **注意**：代理进程跑在独立 mount namespace，`/tmp` 与 shell 隔离——跨进程共享状态（如 crack_daily 时间戳）放仓库内 `.cache/`，勿用 `/tmp`。
 
@@ -86,10 +86,19 @@ tail -f codebuddy.log                 # 查
 
 ## 3. 配置文件
 
-- **`.env`**（全局，gitignored）：**仅运行配置（非私密）**——`DEBUG` / `LOG_FILE` / `LOG_RETENTION_DAYS` / `LOG_ROTATE_WHEN` / `LOG_ROTATE_INTERVAL` / `COPILOT_GHE_HOST` / `COPILOT_INTEGRATION_ID` / `COPILOT_BIG|MEDIUM|SMALL_MODEL`。**已废弃**：`PREFERRED_PROVIDER`（多端口架构下不再控制路由，server.py 仍读取但无实际作用）。**私密凭据一律放 secrets.json**（2026-08-05 收敛）：`COPILOT_GHE_TOKEN` 已并入 secrets.json `copilot_token`，`CODEBUDDY_TOKEN` 冗余已删（target 走 secretRef）
+> **配置文件现在只有两个**：`targets.json`（运行配置 + Target 定义）+ `secrets.json`（私密凭据）。`.env` 已废弃删除（备份 `.env.bak`），原运行配置并入 `targets.json` 顶层 `server` 段。旧部署用一次性脚本 `scripts/migrate_env_to_targets.py` 把旧 `.env` 迁进 `server` 段。
+
+- **`targets.json` 顶层 `server` 段**（主服务运行配置，可选，缺失或子键缺失自动补默认）：承载原 `.env` 的非私密运行配置。字段（默认值见 `config_store.py` 的 `DEFAULT_SERVER_CONFIG`，用户 server 段与之做一层深合并）：
+  - `listenPort`（默认 `8081`）：原 `ANTHROPIC_PORT`，anthropic-compatible 入口端口
+  - `preferredProvider`（默认 `"openai"`）：原 `PREFERRED_PROVIDER`。**仍实际使用**——被模型映射消费，控制默认 provider 归属。（此前文档误标"已废弃无实际作用"，现更正：由 `server.preferredProvider` 承载并生效）
+  - `legacyModels`（`{big, medium, small}`，默认 `gpt-4.1 / gpt-4.1 / gpt-4.1-mini`）：原 `BIG_MODEL/MEDIUM_MODEL/SMALL_MODEL`，仍被模型映射消费
+  - `log`（`{debug, file, retentionDays, rotateWhen, rotateInterval}`，默认 `false / "" / 7 / "midnight" / 1`）：原 `DEBUG/LOG_FILE/LOG_RETENTION_DAYS/LOG_ROTATE_WHEN/LOG_ROTATE_INTERVAL`
+  - `cache`（`{enabled, maxSize, ttlSeconds, maxItemSizeKb}`，默认 `true / 500 / 3600 / 100`）：原 `CACHE_ENABLED/CACHE_MAX_SIZE/CACHE_TTL_SECONDS/CACHE_MAX_ITEM_SIZE_KB`
+  - `copilot`（`{gheHost, integrationId, bigModel, mediumModel, smallModel}`，默认 `copilot-api.bmw.ghe.com / copilot-developer-cli / claude-sonnet-4.6 / claude-sonnet-4.6 / claude-haiku-4.5`）：原 `COPILOT_GHE_HOST/COPILOT_INTEGRATION_ID/COPILOT_BIG|MEDIUM|SMALL_MODEL`
+  - `qclaw`（`{baseUrl}`，默认 `https://mmgrcalltoken.3g.qq.com/aizone/v1`）：原 `QCLAW_BASE_URL`（`QCLAW_API_KEY` 是私密凭据，留在 secrets.json）
 - **`targets.json`**（Target 定义，核心配置）：必填 `label / listenPort / category / handler / targetHost`；category ∈ `crack|free|paid|aggregate`；handler ∈ `passthrough|copilot|qclaw|gemini-native|trae-work|aggregator`；crack 类必须有 `crackTool`；label/端口不能冲突；`enabled=false` 跳过必填校验（预留位）。secrets 优先级：`secrets.json > apikeyEnv 环境变量 > 客户端透传`。**热重载**：mtime 轮询 2s，改完即生效（含端口动态增删）。可选行为开关：`cleanCodebuddyBody` / `cleanQclawBody` / `normalizeSse`（SSE 帧规范化，修不合规上游）/ `normalizeFinishReason`。完整 schema 见 [docs/architecture.md](docs/architecture.md)
 - **`secrets.json`**（私密 key/token，gitignored，dashboard 可热编辑）：**私密凭据唯一事实源**。破解工具提取的 key/token 写入此文件。当前字段：`copilot_token, copilot_personal_token, codebuddy_token, codebuddy_refresh_token, codebuddy_uid, codebuddy_nickname, trae_work_token, trae_work_refresh_token, trae_work_user_id, trae_work_bound_device_id, qclaw_api_key, qclaw_login_key, qclaw_guid, qclaw_user_id, qclaw_nickname, qclaw_openclaw_token, qclaw_device_token`。注：`copilot_token` 同时供 8082 企业 GHE target（secretRef）与 server.py 翻译层 `COPILOT_GHE_TOKEN`（同源 token，热重载同步）
-- **全量配置导出/导入**（`GET /api/config/export` + `POST /api/config/import`，dashboard「📦 导出配置 / 📥 导入配置」按钮）：三个 gitignored 配置源打包成**单个 JSON**（`{version, exportedAt, targets, secrets, env}`），实现"从 GitHub 下载代码 → 导入一个配置文件 → 达到现有配置效果"的迁移诉求。**物理文件保持分离**（热重载粒度 + 私密凭据隔离是刻意设计，勿合并）。导入校验 version + `validate_targets`（失败 422 且不写任何文件），成功则写三文件 + `_reload_targets()`（端口 diff）+ `_refresh_secrets()` 即时生效；`env` 段仅写白名单键（`ENV_EXPORT_KEYS`），需重启进程完全生效（响应 `restartRequired: true`）。导出含完整私密凭据，需妥善保管
+- **全量配置导出/导入**（`GET /api/config/export` + `POST /api/config/import`，dashboard「📦 导出配置 / 📥 导入配置」按钮）：两个 gitignored 配置源打包成**单个 JSON**（v2 格式：`{version, exportedAt, targets, secrets}`，`version=2`；运行配置已并入 `targets.server` 段，不再有独立 `env` 段），实现"从 GitHub 下载代码 → 导入一个配置文件 → 达到现有配置效果"的迁移诉求。**物理文件保持分离**（热重载粒度 + 私密凭据隔离是刻意设计，勿合并）。导入校验 version + `validate_targets`（失败 422 且不写任何文件），成功则写两文件 + `_reload_targets()`（端口 diff）+ `_refresh_secrets()` 即时生效。导出含完整私密凭据，需妥善保管
 
 
 ---
@@ -311,7 +320,7 @@ $env:Path = "C:\Program Files\QClaw\v0.2.33.617\resources\git\cmd;C:\Windows\Sys
 
 ## 13. Agent 行为准则
 
-1. **改配置改 `.env` / `targets.json`**，不要改 VBS 或硬编码环境变量。
+1. **改配置改 `targets.json`**（运行配置在顶层 `server` 段，Target 定义在 `targets` 数组）**或 `secrets.json`**（私密凭据），不要改 VBS 或硬编码环境变量。
 2. **新增功能先看 Provider 策略机制**（`_PROVIDER_STRATEGIES`）或 `CRACK_STATUS_HANDLERS` / `DAILY_HANDLERS` 注册表，遵循开闭原则。
 3. **QClaw 相关改动**注意三个约束：`User-Agent`、`trust_env=False`、body 清理。
 4. **改 dashboard** 注意 f-string 花括号转义三条规则（§7），改完 `python -c "import ast; ast.parse(open('server.py').read())"` 验证 + 重启代理截图确认。

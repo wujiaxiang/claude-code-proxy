@@ -3,10 +3,17 @@
 ## [Unreleased]
 
 ### Added
-- **全量配置导出/导入（2026-08-07）**：`GET /api/config/export` + `POST /api/config/import`（dashboard「📦 导出配置 / 📥 导入配置」按钮），把三个 gitignored 配置源（targets.json / secrets.json / .env）打包成**单个 JSON**（`{version, exportedAt, targets, secrets, env}`），实现"从 GitHub 下载代码 → 导入一个配置文件 → 达到现有配置效果"的迁移诉求
-  - **导出**：`GET /api/config/export` 聚合三源返回（含完整私密凭据，前端提示妥善保管）；`env` 段仅含白名单运行配置键（`ENV_EXPORT_KEYS`：DEBUG/LOG_*/CACHE_*/COPILOT_*）
-  - **导入**：`POST /api/config/import` 校验 version + `validate_targets`（失败 422 且不写任何文件，原子性），成功写三文件 + `_reload_targets()`（端口 diff）+ `_refresh_secrets()` 即时生效；`env` 段用 `dotenv.set_key` 逐键写入保留其他键，需重启进程完全生效（响应 `restartRequired: true`）
-  - **物理文件保持分离**：热重载粒度（targets mtime 2s / secrets 即时 / env 仅启动读）与私密凭据隔离是刻意设计，导出/导入仅做快照级打包还原，不合并配置源
+- **配置架构整合：`.env` 废弃 → `targets.json` 顶层 `server` 段（2026-08-07）**：配置文件从三个（targets.json / secrets.json / .env）收敛为两个（targets.json / secrets.json）。原 `.env` 的非私密运行配置整体并入 `targets.json` 顶层新增的 `server` 段，`.env` 已删除（备份 `.env.bak`）
+  - **`server` 段 schema**（`config_store.py` 的 `DEFAULT_SERVER_CONFIG`，用户段与默认做一层深合并）：`listenPort`（原 ANTHROPIC_PORT，默认 8081）/ `preferredProvider`（原 PREFERRED_PROVIDER，默认 openai，**仍被模型映射消费**，非死代码）/ `legacyModels{big,medium,small}`（原 BIG/MEDIUM/SMALL_MODEL）/ `log{debug,file,retentionDays,rotateWhen,rotateInterval}`（原 DEBUG/LOG_*）/ `cache{enabled,maxSize,ttlSeconds,maxItemSizeKb}`（原 CACHE_*）/ `copilot{gheHost,integrationId,bigModel,mediumModel,smallModel}`（原 COPILOT_*）/ `qclaw{baseUrl}`（原 QCLAW_BASE_URL）
+  - **迁移脚本**：`scripts/migrate_env_to_targets.py`（一次性，旧 `.env` → `targets.server` 段）
+  - **导出/导入升级到 v2**：`GET /api/config/export` / `POST /api/config/import` 结构改为 `{version, exportedAt, targets, secrets}`（`version=2`），移除独立 `env` 段（运行配置已在 `targets.server`）；导入校验 version + `validate_targets`（失败 422 不写盘），成功写两文件 + `_reload_targets()`（端口 diff）+ `_refresh_secrets()` 即时生效
+  - **死代码清理**：删除因配置整合而失效的 `.env` 加载/`ENV_EXPORT_KEYS` 写回等相关路径
+  - **8081 转发统一引擎**：8081 anthropic-compatible 入口与 target 端口共享同一 HTTP 转发引擎（`server_http.py`），去除重复分支
+  - **文档同步**：AGENTS.md §3 / README.md / README-zh.md / docs/architecture.md / docs/windows-deployment.md / scripts/windows/{README.md,start_proxy.bat} 去除 `.env` 作为配置源的引用，改述 `server` 段（`.env.bak`/迁移脚本/CHANGELOG 历史记录处保留）
+- **全量配置导出/导入（2026-08-07）**：`GET /api/config/export` + `POST /api/config/import`（dashboard「📦 导出配置 / 📥 导入配置」按钮），把两个 gitignored 配置源（targets.json / secrets.json）打包成**单个 JSON**（v2：`{version, exportedAt, targets, secrets}`），实现"从 GitHub 下载代码 → 导入一个配置文件 → 达到现有配置效果"的迁移诉求
+  - **导出**：`GET /api/config/export` 聚合两源返回（含完整私密凭据，前端提示妥善保管）
+  - **导入**：`POST /api/config/import` 校验 version + `validate_targets`（失败 422 且不写任何文件，原子性），成功写两文件 + `_reload_targets()`（端口 diff）+ `_refresh_secrets()` 即时生效
+  - **物理文件保持分离**：热重载粒度（targets mtime 2s / secrets 即时）与私密凭据隔离是刻意设计，导出/导入仅做快照级打包还原，不合并配置源
   - 测试：test_dashboard.py 新增 5 用例（导出完整性/含真实凭据/导入往返+热重载+还原/拒绝坏版本/拒绝非法 targets）
 - **dashboard/ 子包拆分（2026-08-07）**：`dashboard/routes.py`（3235 行）按职责拆为装配入口 + 7 个子模块，逻辑逐字节不变、行为零变化，server.py 挂载点零改动（仍 `from dashboard.routes import dashboard_router`）
   - `dashboard/routes.py`（74 行）：定义 `dashboard_router` + import 子模块触发路由注册 + re-export
