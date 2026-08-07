@@ -75,6 +75,50 @@ from gateways.gemini_native import (
 # Trae Work 网关符号（从 gateways/trae_work.py 拆分导入；内部对 server 模块为延迟导入，无循环依赖）
 from gateways.trae_work import _handle_traework
 
+
+# 模型注册表（从 gateways/models.py 下沉；内部对 server 模块为延迟导入，无循环依赖）
+from gateways.models import (
+    ModelRegistry,
+    _anthropic_port_models,
+    _build_models_list,
+    _derive_models_source,
+    _fetch_downstream_models,
+    _fetch_live_models,
+    _get_target_models,
+    _get_target_models_async,
+    _humanize_model_name,
+    _scan_dangling_refs,
+    _scan_dangling_refs_cfg,
+    _target_model_source,
+)
+import gateways.models as _gmodels  # 模型缓存状态（_DOWNSTREAM_MODELS_CACHE）归 gateways.models 模块所有，需模块属性实时读取
+
+# 翻译层符号（从 server.py 拆出至 gateways/translate.py；内部对 server 模块为延迟导入，
+# 模块级仅通过 PEP 562 惰性引用 provider 策略函数，无循环依赖）
+from gateways.translate import (
+    _PROVIDER_STRATEGIES,
+    _close_json_fragment,
+    _convert_oai_to_anthropic,
+    _default_provider,
+    _estimate_messages_tokens,
+    _estimate_text_tokens,
+    _extract_text_from_content,
+    _litellm_oai_stream,
+    _map_model_name,
+    clean_gemini_schema,
+)
+
+# 错误翻译层（从 gateways/errors.py 下沉；内部对 server 模块为延迟导入，无循环依赖）
+from gateways.errors import (
+    _is_auth_expired_error,
+    _is_rate_limit_error,
+    _VENDOR_ERROR_MAPS,
+    _VENDOR_ERROR_PATTERNS,
+    _VENDOR_RETRY_AFTER,
+    _map_upstream_error,
+    _vendor_body_retryable,
+)
+
 # 破解网关公共能力（额度/签到/刷新状态查询 + tc 解密）
 try:
     import crack_common
@@ -107,118 +151,6 @@ logger = logging.getLogger(__name__)
 # Can be monkeypatched in tests for fast timeout simulation
 _TARGET_HTTPX_TIMEOUT = httpx.Timeout(300.0, connect=10.0)
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# 本地 token 估算（tiktoken）— 上游 QClaw 网关不返回 usage，需自行估算
-# ══════════════════════════════════════════════════════════════════════════════
-import tiktoken as _tiktoken
-
-# 缓存 tokenizer 实例（每个 encoding 只加载一次）
-_TIKTOKEN_CACHE: Dict[str, "_tiktoken.Encoding"] = {}
-
-
-def _get_tokenizer(model_name: str) -> "_tiktoken.Encoding":
-    """根据模型名选合适的 tokenizer。
-
-    QClaw 透传模型（DeepSeek/GLM/Kimi/MiniMax）以及 Claude 都用 cl100k_base 做近似估算——
-    这是经验上最接近的通用 tokenizer，估算误差通常在 ±10% 内，足够给 Claude Code 显示用量。
-    """
-    cache_key = "cl100k_base"
-    if cache_key not in _TIKTOKEN_CACHE:
-        try:
-            _TIKTOKEN_CACHE[cache_key] = _tiktoken.get_encoding(cache_key)
-        except Exception as _e:
-            logger.warning(f"Failed to load tiktoken encoding {cache_key}: {_e}")
-            _TIKTOKEN_CACHE[cache_key] = None  # type: ignore
-    return _TIKTOKEN_CACHE[cache_key]
-
-
-def _extract_text_from_content(content: Any) -> str:
-    """从 messages 的 content 字段（可能是 str / list[dict]）抽出纯文本用于估算。"""
-    if content is None:
-        return ""
-    if isinstance(content, str):
-        return content
-    if isinstance(content, list):
-        parts: List[str] = []
-        for block in content:
-            if isinstance(block, dict):
-                t = block.get("type")
-                if t == "text":
-                    parts.append(block.get("text", ""))
-                elif t == "thinking":
-                    parts.append(block.get("thinking", ""))
-                elif t == "tool_use":
-                    # 工具调用：序列化 input + name
-                    try:
-                        parts.append(block.get("name", ""))
-                        parts.append(json.dumps(block.get("input", {}), ensure_ascii=False))
-                    except Exception:
-                        pass
-                elif t == "tool_result":
-                    # 工具结果：递归抽 text
-                    parts.append(_extract_text_from_content(block.get("content", "")))
-            elif isinstance(block, str):
-                parts.append(block)
-        return "\n".join(parts)
-    try:
-        return json.dumps(content, ensure_ascii=False)
-    except Exception:
-        return str(content)
-
-
-def _estimate_messages_tokens(messages: List[Any], model: str = "", system: Any = None, tools: Optional[List[Any]] = None) -> int:
-    """估算 Anthropic/OpenAI messages 的输入 token 数。
-
-    估算规则（参考 OpenAI 官方公式）：
-        tokens = sum(每条 message: 4 + role + text) + 3 (priming)
-    system / tools 单独累加。
-    """
-    enc = _get_tokenizer(model)
-    if enc is None:
-        # fallback：粗略按 4 字符 / token 估算
-        total_chars = 0
-        for m in messages:
-            total_chars += len(_extract_text_from_content(getattr(m, "content", None) if not isinstance(m, dict) else m.get("content")))
-        if system:
-            total_chars += len(_extract_text_from_content(system))
-        return max(1, total_chars // 4)
-
-    total = 3  # priming
-    if system:
-        sys_text = _extract_text_from_content(system)
-        total += 4 + len(enc.encode(sys_text))
-    if tools:
-        for tool in tools:
-            try:
-                # tool 可能是 Pydantic 对象或 dict
-                if hasattr(tool, "model_dump"):
-                    tool_dict = tool.model_dump()
-                else:
-                    tool_dict = tool
-                total += 4 + len(enc.encode(json.dumps(tool_dict, ensure_ascii=False)))
-            except Exception:
-                pass
-    for m in messages:
-        # m 可能是 dict 或 Pydantic Message
-        if isinstance(m, dict):
-            role = m.get("role", "")
-            content = m.get("content")
-        else:
-            role = getattr(m, "role", "")
-            content = getattr(m, "content", None)
-        text = _extract_text_from_content(content)
-        total += 4 + len(enc.encode(role)) + len(enc.encode(text))
-    return total
-
-
-def _estimate_text_tokens(text: str, model: str = "") -> int:
-    """估算单段文本的 token 数（用于 output_tokens）。"""
-    if not text:
-        return 0
-    enc = _get_tokenizer(model)
-    if enc is None:
-        return max(1, len(text) // 4)
-    return len(enc.encode(text))
 
 def _cleanup_old_log_files(log_file: str, retention_days: int):
     if not log_file or retention_days <= 0:
@@ -421,111 +353,6 @@ async def _reset_litellm_clients():
         logger.warning(f"Failed to reload openai adapter: {_e}")
 
 
-def _is_auth_expired_error(exc: Exception) -> bool:
-    """判断是否为 QClaw 网关 upstream auth 过期 (9002)。"""
-    msg = str(exc).lower()
-    return "9002" in msg or "该功能暂不可用" in msg
-
-
-# 限流/资源耗尽错误特征：优先按 litellm 异常类型判断，兜底按消息特征匹配，
-# 避免把真正的 5xx / 鉴权失败误判为 429。
-_RATE_LIMIT_ERROR_KEYWORDS = (
-    "ResourceExhausted",
-    "Worker local total request limit reached",
-    "rate_limit_error",
-    "RateLimitError",
-)
-
-
-def _is_rate_limit_error(exc: Exception) -> bool:
-    """识别 LiteLLM 抛出的限流类异常（含 qclaw 的 ResourceExhausted / Worker local ...）。
-
-    命中后调用方应返回 HTTP 429 + Retry-After，让下游客户端（如 opencode）自动重试。
-    关键字复用 _VENDOR_ERROR_MAPS，保持单点维护。
-    """
-    from litellm.exceptions import RateLimitError as _LiteLLMRateLimitError  # litellm.RateLimitError 的同一个类，走公开导出路径
-    if isinstance(exc, (_LiteLLMRateLimitError, getattr(litellm, "RouterRateLimitError", ()))):
-        return True
-    text = str(exc)
-    if not text:
-        return False
-    return any(k in text for k, _s, _t, _d in _VENDOR_ERROR_MAPS)
-
-
-def _convert_oai_to_anthropic(oai_data: dict, request, original_model: str):  # type: ignore
-    """将 OpenAI chat completion 响应转换为 Anthropic messages 格式. 简化版."""
-    choice = oai_data.get("choices", [{}])[0]
-    msg = choice.get("message", {})
-    content_blocks = []
-
-    # reasoning_content -> thinking block
-    if msg.get("reasoning_content"):
-        content_blocks.append({
-            "type": "thinking",
-            "thinking": msg["reasoning_content"],
-        })
-
-    # content -> text block
-    if msg.get("content"):
-        content_blocks.append({
-            "type": "text",
-            "text": msg["content"],
-        })
-
-    # tool_calls -> tool_use blocks
-    for tc in msg.get("tool_calls", []):
-        func = tc.get("function", {})
-        try:
-            inp = json.loads(func.get("arguments", "{}"))
-        except (json.JSONDecodeError, TypeError):
-            inp = {}
-        content_blocks.append({
-            "type": "tool_use",
-            "id": tc.get("id", f"toolu_{uuid.uuid4().hex[:12]}"),
-            "name": func.get("name", ""),
-            "input": inp,
-        })
-
-    # usage — QClaw 网关不返回 usage，缺失时用 tiktoken 本地估算
-    usage = oai_data.get("usage") or {}
-    prompt_tokens = usage.get("prompt_tokens") or 0
-    completion_tokens = usage.get("completion_tokens") or 0
-    if prompt_tokens == 0 or completion_tokens == 0:
-        # 估算 input：从 request.messages + system + tools
-        try:
-            req_msgs = getattr(request, "messages", []) or []
-            req_system = getattr(request, "system", None)
-            req_tools = getattr(request, "tools", None)
-            est_in = _estimate_messages_tokens(req_msgs, original_model, req_system, req_tools)
-            if prompt_tokens == 0:
-                prompt_tokens = est_in
-        except Exception as _e:
-            logger.debug(f"tiktoken input estimate failed: {_e}")
-        # 估算 output：从响应 content_blocks 抽文本
-        if completion_tokens == 0:
-            try:
-                out_text = _extract_text_from_content(content_blocks)
-                completion_tokens = _estimate_text_tokens(out_text, original_model)
-            except Exception as _e:
-                logger.debug(f"tiktoken output estimate failed: {_e}")
-
-    # 用 model_validate 而非关键字构造：content/stop_reason 是运行时 dict/动态字符串，
-    # 交给 Pydantic 校验与关键字构造完全等价，且避免静态类型层的字面量不匹配。
-    return MessagesResponse.model_validate({
-        "id": f"msg_{uuid.uuid4().hex[:12]}",
-        "type": "message",
-        "role": "assistant",
-        "model": original_model,
-        "content": content_blocks or [{"type": "text", "text": ""}],
-        "stop_reason": choice.get("finish_reason") or "stop",
-        "stop_sequence": None,
-        "usage": Usage(
-            input_tokens=prompt_tokens,
-            output_tokens=completion_tokens,
-        ),
-    })
-
-
 @asynccontextmanager
 async def lifespan(app):
     # 网关抓包：CAPTURE_GATEWAY=true 时激活
@@ -554,7 +381,7 @@ async def lifespan(app):
     if PREFERRED_PROVIDER in ("copilot", "openai"):
         try:
             await _fetch_downstream_models()
-            logger.info(f"startup: preloaded {len(_DOWNSTREAM_MODELS_CACHE or [])} downstream models")
+            logger.info(f"startup: preloaded {len(_gmodels._DOWNSTREAM_MODELS_CACHE or [])} downstream models")
         except Exception as _me:
             logger.warning(f"startup: failed to preload downstream models: {_me}")
 
@@ -753,7 +580,6 @@ SMALL_MODEL = os.environ.get("SMALL_MODEL", "gpt-4.1-mini")
 import config_store as _cfg
 
 # ─── 统一透传引擎配置（targets.json 驱动）───
-_VENDOR_RETRY_AFTER = int(os.environ.get("VENDOR_RETRY_AFTER_SECONDS", "3"))
 _TARGETS: list = []
 _MODEL_REGISTRY = None  # P2: ModelRegistry 内存索引，热重载时重建（dashboard 渲染消费的单一事实源）
 _SECRETS: dict = {}
@@ -775,53 +601,6 @@ def _bump_model_stats(label: str, model: str, outcome: str):
     if outcome in s:
         s[outcome] += 1
 
-_VENDOR_ERROR_PATTERNS = [
-    re.compile(r'"ResourceExhausted"'),
-    re.compile(r'Worker local total request limit reached', re.IGNORECASE),
-    re.compile(r'"(error_)?code"\s*:\s*"?(rate_limit_exceeded|too_many_requests)"?', re.IGNORECASE),
-    re.compile(r'"type"\s*:\s*"rate_limit_error"', re.IGNORECASE),
-]
-
-# ─── 上游错误码映射表（数据驱动，新增网关只需追加一行）───
-# 透传网关遇到下列「字段特征」（子串匹配，大小写敏感）即把上游错误体
-# 标准化为 (目标 HTTP 状态码, SSE error type)，让下游客户端（opencode 等）
-# 按标准错误重试/降级，而不是把伪成功/5xx 透传导致 UnknownError。
-# 字段特征, 目标状态码, SSE error type, 说明
-_VENDOR_ERROR_MAPS = [
-    ("ResourceExhausted", 429, "rate_limit_error", "qclaw/nvidia/openrouter 资源耗尽（并发限制）"),
-    ("Worker local total request limit reached", 429, "rate_limit_error", "nvidia/openrouter 本地并发已满"),
-    ("rate_limit_exceeded", 429, "rate_limit_error", "OpenAI 标准限流码"),
-    ("too_many_requests", 429, "rate_limit_error", "OpenAI 标准限流码"),
-    ("RateLimitError", 429, "rate_limit_error", "litellm 限流异常类名"),
-    ("rate-limited", 429, "rate_limit_error", "openrouter 免费池上游限流（temporarily rate-limited upstream）"),
-]
-
-
-def _map_upstream_error(body_text: str):
-    """根据错误映射表把上游错误体转成 (http_status, sse_error_type)。
-
-    匹配顺序：
-    1. 先按 _VENDOR_ERROR_MAPS 做子串匹配——覆盖无标准 error 信封的格式，如：
-       - openrouter: {"code":502,"message":"Upstream error from Nvidia: ResourceExhausted: ..."}
-       - nvidia:     裸字符串 "ResourceExhausted: Worker local total request limit reached (32/32)"
-    2. 回退到标准 OpenAI error 信封 {"error":{...}} 含 _VENDOR_ERROR_PATTERNS 特征。
-    返回 None 表示不是可识别的限流/错误信封。
-    """
-    if not body_text:
-        return None
-    for _keyword, _status, _err_type, _desc in _VENDOR_ERROR_MAPS:
-        if _keyword in body_text:
-            return (_status, _err_type)
-    if re.search(r'"error"\s*:', body_text):
-        if any(p.search(body_text) for p in _VENDOR_ERROR_PATTERNS):
-            return (429, "rate_limit_error")
-    return None
-
-
-def _vendor_body_retryable(body_text: str) -> bool:
-    """判断上游错误体是否应被转成可重试的标准错误（429）。"""
-    return _map_upstream_error(body_text) is not None
-
 
 # ─── HTTP 代理共享工具函数（所有端口统一用，不要各写各的） ───
 
@@ -831,340 +610,18 @@ def _vendor_body_retryable(body_text: str) -> bool:
 #   客户端对"已解压的明文"再解压一次 → 报 "incorrect header check"（openrouter 实测）
 _PROXY_STRIP_RESP_HEADERS = frozenset(("transfer-encoding", "connection", "content-length", "content-encoding"))
 
-async def _parse_http_request(reader):
-    """统一 HTTP 请求解析。
-    返回 (method, path, raw_path, headers, body)，请求无效时全返回 None。
-    """
-    try:
-        req_line = await asyncio.wait_for(reader.readline(), timeout=30)
-        if not req_line:
-            return None, None, None, None, None
-        parts = req_line.decode("utf-8", errors="replace").strip().split(" ", 2)
-        method = parts[0] if len(parts) > 0 else "GET"
-        raw_path = parts[1] if len(parts) > 1 else "/"
-
-        headers = {}
-        while True:
-            line = await asyncio.wait_for(reader.readline(), timeout=10)
-            line_str = line.decode("utf-8", errors="replace").strip()
-            if not line_str:
-                break
-            if ":" in line_str:
-                k, v = line_str.split(":", 1)
-                headers[k.strip().lower()] = v.strip()
-
-        content_len = int(headers.get("content-length", 0))
-        body = b""
-        if content_len > 0:
-            # reader.read(n) 可能返回少于 n 字节，必须循环读满
-            while len(body) < content_len:
-                remaining = content_len - len(body)
-                chunk = await asyncio.wait_for(reader.read(remaining), timeout=30)
-                if not chunk:
-                    break
-                body += chunk
-        elif headers.get("transfer-encoding", "").lower() == "chunked":
-            # 处理分块编码（OpenCode 等客户端可能使用）
-            while True:
-                line = await asyncio.wait_for(reader.readline(), timeout=30)
-                chunk_size_str = line.decode("utf-8", errors="replace").strip()
-                if not chunk_size_str:
-                    continue
-                try:
-                    chunk_size = int(chunk_size_str, 16)
-                except ValueError:
-                    break
-                if chunk_size == 0:
-                    break
-                # reader.read(n) 同上的问题，必须循环读满
-                chunk_data = b""
-                while len(chunk_data) < chunk_size:
-                    remaining = chunk_size - len(chunk_data)
-                    part = await asyncio.wait_for(reader.read(remaining), timeout=30)
-                    if not part:
-                        break
-                    chunk_data += part
-                body += chunk_data
-                await asyncio.wait_for(reader.readline(), timeout=10)  # 吃掉 \r\n
-
-        parsed = urlparse(raw_path)
-        return method, parsed.path, raw_path, headers, body
-    except asyncio.TimeoutError:
-        logger.warning("_parse_http_request timeout reading request")
-        return None, None, None, None, None
-
-
-async def _write_error_response(writer, status, message, *, content_type="application/json", retry_after=None):
-    """统一错误响应回写，带日志。"""
-    body = json.dumps({"error": {"type": "proxy_error", "message": message}}, ensure_ascii=False)
-    status_text = {429: "Too Many Requests", 502: "Bad Gateway", 503: "Service Unavailable", 504: "Gateway Timeout"}.get(status, "Error")
-    header_lines = f"HTTP/1.1 {status} {status_text}\r\nContent-Type: {content_type}\r\nContent-Length: {len(body.encode())}\r\n"
-    if retry_after is not None:
-        header_lines += f"Retry-After: {retry_after}\r\n"
-    header_lines += "\r\n"
-    logger.warning(f"_write_error_response: {status} — {message}")
-    try:
-        writer.write(header_lines.encode() + body.encode())
-        await writer.drain()
-    except Exception:
-        pass
-    try:
-        writer.close()
-    except Exception:
-        pass
-
-
-class _SseLineBuffer:
-    """SSE 行缓冲：按 \\n 切完整行，处理跨 TCP chunk 粘包。
-
-    背景：SSE 帧可能被 TCP 任意切断（一个 data: {...} JSON 跨两个 chunk）。
-    纯字节透传时无所谓，但一旦要逐帧改写就必须先重组成完整行，否则会切坏 JSON。
-    """
-    __slots__ = ("_buf",)
-
-    def __init__(self):
-        self._buf = b""
-
-    def feed(self, chunk: bytes) -> list:
-        """喂入原始字节，返回本次能切出的完整行（每行含末尾 \\n）。不完整的尾部留在缓冲区。"""
-        self._buf += chunk
-        lines = []
-        while True:
-            idx = self._buf.find(b"\n")
-            if idx == -1:
-                break
-            lines.append(self._buf[:idx + 1])
-            self._buf = self._buf[idx + 1:]
-        return lines
-
-    def flush(self) -> bytes:
-        """流结束时吐出残留（无末尾 \\n 的最后一行）。正常 SSE 不应有残留，防御性处理。"""
-        rest, self._buf = self._buf, b""
-        return rest
-
-
-async def _write_response(writer, resp, *, stats=None, write_state=None, log_sse=False, _label="", normalize_sse=False, normalize_finish_reason=True):
-    """统一从 httpx 响应回写到 writer。
-    自动区分流式/非流式，非 200 自动记录日志。
-    返回 (status_code, body_bytes) — body_bytes=None 表示流式已写完。
-    write_state: 可选的可变字典，用于跟踪 headers_sent 状态（流式场景下避免二次写状态行）
-    log_sse: 可选，流式透传时解析 SSE 记录 finish_reason 诊断日志（用于排查上游
-      content_filter 拦截等"200 但内容异常"场景）。开启后走行缓冲逐帧处理。
-    normalize_sse: 可选，规范化上游不合规 SSE 帧（需 log_sse=True 才生效）。
-      由 targets.json 的 normalizeSse 驱动，当前用于 codebuddy——修复上游思考帧
-      夹带空 content 导致客户端思考链逐 token 换行的问题。
-    normalize_finish_reason: normalize_sse 的子选项，把 finish_reason:"" 归一成 null。
-    """
-    status, body_bytes, is_stream = None, None, False
-    try:
-        status = resp.status_code
-        reason = resp.reason_phrase or "OK"
-        content_type = resp.headers.get("content-type", "")
-        is_stream = "text/event-stream" in content_type
-
-        # ── 日志：非 200 记录响应前 300 字符 ──
-        if status >= 400:
-            logger.warning(f"[{resp.url.host if hasattr(resp, 'url') else 'upstream'}] "
-                           f"HTTP {status} {reason} | content-type: {content_type}")
-
-        if is_stream:
-            writer.write(f"HTTP/1.1 {status} {reason}\r\n".encode())
-            for k, v in resp.headers.items():
-                if k.lower() not in _PROXY_STRIP_RESP_HEADERS:
-                    writer.write(f"{k}: {v}\r\n".encode())
-            writer.write(b"\r\n")
-            # 标记 headers 已写入（流式场景：状态行+headers 已发送到 writer 缓冲区）
-            if write_state is not None:
-                write_state["headers_sent"] = True
-            if log_sse:
-                # codebuddy SSE 诊断日志（2026-08-05）：定位上游 content_filter 拦截
-                # （透传下客户端收到 200 空 SSE 无法感知原因）。
-                # normalize_sse=True 时额外做帧规范化（修上游夹带空 content 导致的
-                # 思考链逐 token 换行，见 _normalize_codebuddy_sse_line）。
-                # 用行缓冲重组跨 chunk 的半截帧——改写模式下必须，否则会切坏 JSON。
-                saw_filter = False
-                saw_finish = set()
-                data_lines = 0
-                normalized_lines = 0
-                line_buf = _SseLineBuffer()
-
-                def _diagnose(text_line: str):
-                    """诊断统计——必须基于改写【前】的原始行，否则规范化自身的 bug
-                    会掩盖上游真实异常。返回是否为有效 data 行。"""
-                    nonlocal saw_filter, data_lines
-                    if not text_line.startswith("data:"):
-                        return
-                    data_str = text_line[5:].strip()
-                    if not data_str or data_str == "[DONE]":
-                        return
-                    data_lines += 1
-                    try:
-                        obj = json.loads(data_str)
-                        for choice in obj.get("choices", []) or []:
-                            fr = choice.get("finish_reason")
-                            if fr:
-                                saw_finish.add(fr)
-                                if fr == "content_filter":
-                                    saw_filter = True
-                    except (json.JSONDecodeError, AttributeError):
-                        pass
-
-                def _process(raw_line: bytes) -> bytes:
-                    """先诊断原始行，再按需规范化。任何异常都退回原样透传，绝不吞帧。"""
-                    nonlocal normalized_lines
-                    try:
-                        _diagnose(raw_line.decode("utf-8", errors="replace"))
-                    except Exception:
-                        pass
-                    if not normalize_sse:
-                        return raw_line
-                    try:
-                        out_line = _normalize_codebuddy_sse_line(
-                            raw_line, finish_reason_to_null=normalize_finish_reason
-                        )
-                        if out_line is not raw_line:
-                            normalized_lines += 1
-                        return out_line
-                    except Exception:
-                        return raw_line  # 双保险：规范化不应抛，再兜一层
-
-                async for chunk in resp.aiter_bytes():
-                    out = bytearray()
-                    for raw_line in line_buf.feed(chunk):
-                        out += _process(raw_line)
-                    if out:
-                        writer.write(bytes(out))
-                        await writer.drain()
-                # 流结束：吐残留（无末尾 \n 的最后一行，正常 SSE 不应出现）
-                tail = line_buf.flush()
-                if tail:
-                    writer.write(_process(tail))
-                    await writer.drain()
-
-                _gw_logger = codebuddy_logger if _label == "codebuddy" else (traework_logger if _label == "trae-work" else logger)
-                _norm_note = f" normalized={normalized_lines}" if normalize_sse else ""
-                if saw_filter:
-                    _gw_logger.warning(f"[{_label}] SSE content_filter 透传: "
-                                       f"data_lines={data_lines} finish_reasons={sorted(saw_finish)}{_norm_note}")
-                else:
-                    _gw_logger.debug(f"[{_label}] SSE 透传完成: data_lines={data_lines} "
-                                     f"finish_reasons={sorted(saw_finish) or '无'}{_norm_note}")
-            else:
-                async for chunk in resp.aiter_bytes():
-                    writer.write(chunk)
-                    await writer.drain()
-            if stats:
-                stats["passthroughOk"] += 1
-            return status, None
-
-        body_bytes = await resp.aread()
-        body_text = body_bytes.decode("utf-8", errors="replace")
-        if status >= 400:
-            logger.warning(f"[{resp.url.host if hasattr(resp, 'url') else 'upstream'}] "
-                           f"HTTP {status} body: {body_text[:300]}")
-
-        resp_headers = "".join(
-            f"{k}: {v}\r\n" for k, v in resp.headers.items()
-            if k.lower() not in _PROXY_STRIP_RESP_HEADERS
-        )
-        writer.write(f"HTTP/1.1 {status} {reason}\r\n{resp_headers}Content-Length: {len(body_bytes)}\r\n\r\n".encode())
-        writer.write(body_bytes)
-        await writer.drain()
-        if stats:
-            stats["passthroughOk"] += 1
-        return status, body_bytes
-    except Exception:
-        if status is not None and status >= 400 and body_bytes:
-            logger.exception(f"Error writing {status} response to client")
-        raise
-    finally:
-        try:
-            writer.close()
-        except Exception:
-            pass
-
-
-# HTTP 标准状态码 → 原因短语映射（用于状态行改写，覆盖 400-599 常见码）
-_HTTP_STATUS_REASON = {
-    400: "Bad Request",
-    401: "Unauthorized",
-    402: "Payment Required",
-    403: "Forbidden",
-    404: "Not Found",
-    405: "Method Not Allowed",
-    406: "Not Acceptable",
-    407: "Proxy Authentication Required",
-    408: "Request Timeout",
-    409: "Conflict",
-    410: "Gone",
-    411: "Length Required",
-    412: "Precondition Failed",
-    413: "Payload Too Large",
-    414: "URI Too Long",
-    415: "Unsupported Media Type",
-    416: "Range Not Satisfiable",
-    417: "Expectation Failed",
-    418: "I'm a teapot",
-    421: "Misdirected Request",
-    422: "Unprocessable Entity",
-    423: "Locked",
-    424: "Failed Dependency",
-    425: "Too Early",
-    426: "Upgrade Required",
-    428: "Precondition Required",
-    429: "Too Many Requests",
-    431: "Request Header Fields Too Large",
-    451: "Unavailable For Legal Reasons",
-    500: "Internal Server Error",
-    501: "Not Implemented",
-    502: "Bad Gateway",
-    503: "Service Unavailable",
-    504: "Gateway Timeout",
-    505: "HTTP Version Not Supported",
-    506: "Variant Also Negotiates",
-    507: "Insufficient Storage",
-    508: "Loop Detected",
-    510: "Not Extended",
-    511: "Network Authentication Required",
-}
-
-
-def _get_status_reason(status: int) -> str:
-    """获取 HTTP 状态码对应的标准原因短语，未知码返回 'Unknown Status'。"""
-    return _HTTP_STATUS_REASON.get(status, "Unknown Status")
-
-
-async def _write_response_with_status_override(writer, resp, effective_status: int, *, stats=None):
-    """
-    非流式响应状态码改写：保持上游原始 body 字节完全一致，仅改写状态行。
-    用于检测到"上游 200 但 body 嵌错误码"的场景。
-    """
-    try:
-        # 复用 _write_response 的头部剥离逻辑
-        resp_headers = "".join(
-            f"{k}: {v}\r\n" for k, v in resp.headers.items()
-            if k.lower() not in _PROXY_STRIP_RESP_HEADERS
-        )
-        # 读取原始 body 字节（resp 已在调用方 aread() 过，这里直接用 resp.content 或重新 aread）
-        # 注意：调用方已执行 await resp.aread()，所以 resp.content 可用
-        body_bytes = resp.content if hasattr(resp, "content") and resp.content is not None else await resp.aread()
-
-        reason = _get_status_reason(effective_status)
-        # 写状态行 + 头部 + Content-Length + body（body 字节级保持原样）
-        writer.write(f"HTTP/1.1 {effective_status} {reason}\r\n{resp_headers}Content-Length: {len(body_bytes)}\r\n\r\n".encode())
-        writer.write(body_bytes)
-        await writer.drain()
-        if stats:
-            stats["passthroughError"] += 1
-        return effective_status, body_bytes
-    except Exception:
-        logger.exception(f"Error writing status-overridden response ({effective_status}) to client")
-        raise
-    finally:
-        try:
-            writer.close()
-        except Exception:
-            pass
+# HTTP 转发引擎核心工具（已下沉至 server_http.py，行为零变化）。
+# 此处 re-export，保证 server.py 内部及 gateways/* 的
+# `from server import _write_response` 等延迟导入继续有效（零改动网关层）。
+from server_http import (
+    _parse_http_request,
+    _write_error_response,
+    _SseLineBuffer,
+    _write_response,
+    _HTTP_STATUS_REASON,
+    _get_status_reason,
+    _write_response_with_status_override,
+)
 
 
 def _resolve_auth(headers: dict, target: Optional[dict] = None, provider: Optional[str] = None) -> dict:
@@ -1567,160 +1024,6 @@ def _crack_env_check(target: dict) -> dict:
 # ─── 8081 Anthropic 协议端口（对内透传 8082，模型列表隔离） ───
 
 _ANTHROPIC_PORT = int(os.environ.get("ANTHROPIC_PORT", "8081"))
-
-
-def _anthropic_port_models() -> List[dict]:
-    """8081 Anthropic 端口模型列表——动态来自 targets.json 顶层 models[]。
-
-    与 dashboard「模型定义」编辑视图同一数据源（_MODELS_CFG["models"]）：
-    监控视图展示什么，编辑视图就改什么，杜绝"展示但不可用"的歧义。
-    取代硬编码常量（曾含 claude-opus-4-20250514 等不可用死名单——那些模型
-    名无法被 _resolve_model_alias 命中，只会在客户端模型列表里误导用户）。
-
-    返回 [{id, display_name, aliases, target}]：id=name 主模型名，aliases 为其
-    别名（均可被 _resolve_model_alias 命中），target 为下游端口+真实模型。
-    """
-    out: List[dict] = []
-    for m in _MODELS_CFG.get("models", []):
-        if not isinstance(m, dict) or not m.get("name"):
-            continue
-        name = str(m["name"])
-        aliases = [str(a) for a in (m.get("aliases") or []) if isinstance(a, str)]
-        tgt = m.get("target")
-        out.append({
-            "id": name,
-            "display_name": _humanize_model_name(name),
-            "aliases": aliases,
-            "target": {"port": tgt.get("port"), "model": tgt.get("model")} if isinstance(tgt, dict) else {},
-        })
-    return out
-
-
-# ─── 统一模型列表接口（收敛四种 modelsSource）───
-
-_STATIC_SOURCE_BY_LABEL = {"codebuddy": "codebuddy", "qclaw": "qclaw", "trae-work": "trae-work"}
-
-
-def _static_model_source(target: dict) -> str:
-    """静态 models[] 的来源标记：label 前缀优先，否则回落 handler。"""
-    label = str(target.get("label") or "")
-    for prefix, source in _STATIC_SOURCE_BY_LABEL.items():
-        if label == prefix or label.startswith(prefix + "-"):
-            return source
-    return str(target.get("handler") or "passthrough")
-
-
-def _live_model_ids(target: dict) -> List[str]:
-    """copilot 上游实时模型 id 列表。
-
-    _fetch_live_models 是 async；测试以同步 MagicMock 替换它，故按返回值是否
-    awaitable 运行时判定，而非 iscoroutinefunction（mock 后函数对象已被替换）。
-    """
-    result = _fetch_live_models(target)
-    if inspect.isawaitable(result):
-        result = asyncio.run(result)
-    return [str(m) for m in (result or [])]
-
-
-def _target_model_source(target: dict) -> str:
-    """target 的模型来源标记，与 _get_target_models 的分派规则同源。
-
-    纯配置推断，不触发任何上游请求 —— 因此可在 async 的 dashboard 渲染路径里
-    安全调用（_get_target_models 对 copilot 会 asyncio.run 拉取上游，在运行中的
-    事件循环里会抛 RuntimeError，且每张卡片一次网络往返）。
-    """
-    label = str(target.get("label") or "")
-    if target.get("listenPort") == 8081 or label == "anthropic-compatible":
-        return "anthropic"
-    handler = target.get("handler")
-    if handler == "aggregator":
-        return "aggregator"
-    if handler == "copilot":
-        return "copilot"
-    return _static_model_source(target)
-
-
-def _build_target_models(target: dict, source: str, live_ids: List[str]) -> List[dict]:
-    """按 source 装配模型列表。copilot 的上游 id 由调用方注入。
-
-    唯一实现，_get_target_models（同步）与 _get_target_models_async（async 路径）
-    共用；copilot 的上游拉取方式是二者唯一的差异，故作为参数传入而非在此分支。
-    """
-    if source == "anthropic":
-        return [{**m, "source": "anthropic"} for m in _anthropic_port_models()]
-
-    if source == "aggregator":
-        return [
-            {"id": str(vid), "display_name": str(vid), "aliases": [], "target": {}, "source": "aggregator"}
-            for vid in (target.get("virtualModels") or {})
-        ]
-
-    if source == "copilot":
-        # enabled 取自 targets.json 白名单：上游返回的是全量模型，而面板只展示
-        # 已开启的那些。一律 True 会把被关掉的模型重新显示出来（copilot 曾由 4 变 44）。
-        local_enabled = {
-            str(m.get("id")): m.get("enabled", True)
-            for m in (target.get("models") or []) if isinstance(m, dict) and m.get("id")
-        }
-        return [
-            {"id": mid, "display_name": _humanize_model_name(mid), "aliases": [],
-             "enabled": local_enabled.get(mid, True), "target": {}, "source": "copilot"}
-            for mid in live_ids
-        ]
-
-    out: List[dict] = []
-    for m in (target.get("models") or []):
-        mid = str(m.get("id")) if isinstance(m, dict) else str(m)
-        if not mid:
-            continue
-        out.append({
-            "id": mid,
-            # 无显式 display_name 时回落 _humanize_model_name，与 _anthropic_port_models
-            # 及 _model_details_html 的既有渲染保持一致（回落成裸 id 会改变面板显示名）。
-            "display_name": (m.get("display_name") if isinstance(m, dict) else None) or _humanize_model_name(mid),
-            "aliases": list(m.get("aliases") or []) if isinstance(m, dict) else [],
-            # enabled 是模型白名单开关，必须原样带出：dashboard 只渲染 enabled 的模型，
-            # 缺字段会被 _model_details_html 默认成 True，把已关闭的模型重新显示出来。
-            "enabled": m.get("enabled", True) if isinstance(m, dict) else True,
-            "target": {},
-            "source": source,
-        })
-    return out
-
-
-def _get_target_models(label: str) -> List[dict]:
-    """统一接口（同步）：返回某 target 的模型列表，收敛四种 modelsSource。
-
-    返回 [{id, display_name, aliases, enabled, target, source}]，source 标记来源：
-    anthropic（8081 顶层 models[]）/ aggregator（virtualModels）/
-    copilot（上游实时拉取）/ codebuddy|qclaw|trae-work|<handler>（静态 models[]）。
-    label 不存在时返回 []。
-
-    注意：copilot target 会同步拉取上游（asyncio.run），故不可在运行中的事件
-    循环里调用——async 路径请用 _get_target_models_async。
-    """
-    target = next((t for t in _TARGETS if t.get("label") == label), None)
-    if target is None:
-        return []
-    source = _target_model_source(target)
-    live_ids = _live_model_ids(target) if source == "copilot" else []
-    return _build_target_models(target, source, live_ids)
-
-
-async def _get_target_models_async(label: str) -> List[dict]:
-    """统一接口（async）：与 _get_target_models 同结果，copilot 走 await 拉取。
-
-    async 端点（FastAPI 路由）必须用这个版本：同步版对 copilot 会
-    asyncio.run() 到运行中的事件循环上，直接抛 RuntimeError。
-    """
-    target = next((t for t in _TARGETS if t.get("label") == label), None)
-    if target is None:
-        return []
-    source = _target_model_source(target)
-    live_ids: List[str] = []
-    if source == "copilot":
-        live_ids = [str(m) for m in (await _fetch_live_models(target) or [])]
-    return _build_target_models(target, source, live_ids)
 
 
 # 值混合 int 计数与 str 时间戳，故不加值类型约束（与 _TARGET_STATS 同风格）
@@ -2414,67 +1717,6 @@ async def _vendor_server(host, port, target):
     return server
 
 
-# ─── Provider 策略（开闭原则：新增 provider 只需在此注册） ───
-
-def _default_provider(req, litellm_req, _orig):
-    """标准 OpenAI"""
-    litellm_req["api_key"] = OPENAI_API_KEY
-    if OPENAI_BASE_URL:
-        litellm_req["api_base"] = OPENAI_BASE_URL
-        logger.debug(f"OpenAI: base={OPENAI_BASE_URL}")
-    else:
-        logger.debug(f"OpenAI: default")
-    return None  # 继续走 LiteLLM
-
-def _anthropic_provider(req, litellm_req, _orig):
-    """Anthropic / 自定义 Anthropic API"""
-    litellm_req["api_key"] = ANTHROPIC_API_KEY
-    if ANTHROPIC_BASE_URL:
-        litellm_req["api_base"] = ANTHROPIC_BASE_URL
-        logger.debug(f"Anthropic: base={ANTHROPIC_BASE_URL}")
-    else:
-        logger.debug(f"Anthropic: default")
-    return None  # 继续走 LiteLLM
-
-
-
-_PROVIDER_STRATEGIES = {
-    "openai": _default_provider,
-    "qclaw": _qclaw_provider,
-
-    "anthropic": _anthropic_provider,
-    "gemini": _gemini_provider,
-    "gemini-openai": _gemini_provider,
-    "copilot": _copilot_provider,
-}
-
-def _map_model_name(model: str) -> str:
-    """把任意模型名按当前 PREFERRED_PROVIDER 映射到 LiteLLM 可用的带前缀名称。
-    copilot provider 请用 _copilot_model_name() 代替。"""
-    clean = model
-    for prefix in ("anthropic/", "openai/", "gemini/", "qclaw/", "copilot/"):
-        if clean.startswith(prefix):
-            clean = clean[len(prefix):]
-            break
-    c = clean.lower()
-    if "opus" in c:
-        target = BIG_MODEL
-    elif "sonnet" in c:
-        target = MEDIUM_MODEL
-    elif "haiku" in c:
-        target = SMALL_MODEL
-    else:
-        target = clean  # 已经是目标 provider 的模型名，直接用
-    # 加 provider 前缀
-    if PREFERRED_PROVIDER == "anthropic":
-        return f"anthropic/{target}"
-    elif PREFERRED_PROVIDER in ("gemini", "gemini-openai"):
-        return f"gemini/{target}"
-    elif PREFERRED_PROVIDER in ("qclaw", "copilot"):
-        return target  # qclaw/copilot 靠 api_base 路由，不需要前缀（model 在 provider 策略里覆盖）
-    else:  # openai / default
-        return f"openai/{target}"
-
 # List of OpenAI models
 OPENAI_MODELS = [
     "o3-mini",
@@ -2493,34 +1735,6 @@ OPENAI_MODELS = [
 
 # List of Gemini models
 GEMINI_MODELS = ["gemini-2.5-flash", "gemini-2.5-pro"]
-
-
-# Helper function to clean schema for Gemini
-def clean_gemini_schema(schema: Any) -> Any:
-    """Recursively removes unsupported fields from a JSON schema for Gemini."""
-    if isinstance(schema, dict):
-        # Remove specific keys unsupported by Gemini tool parameters
-        schema.pop("additionalProperties", None)
-        schema.pop("default", None)
-
-        # Check for unsupported 'format' in string types
-        if schema.get("type") == "string" and "format" in schema:
-            allowed_formats = {"enum", "date-time"}
-            if schema["format"] not in allowed_formats:
-                logger.debug(
-                    f"Removing unsupported format '{schema['format']}' for string type in Gemini schema."
-                )
-                schema.pop("format")
-
-        # Recursively clean nested schemas (properties, items, etc.)
-        for key, value in list(
-            schema.items()
-        ):  # Use list() to allow modification during iteration
-            schema[key] = clean_gemini_schema(value)
-    elif isinstance(schema, list):
-        # Recursively clean items in a list
-        return [clean_gemini_schema(item) for item in schema]
-    return schema
 
 
 # Models for Anthropic API requests
@@ -2906,54 +2120,6 @@ def parse_tool_result_content(content):
         return str(content)
     except:
         return "Unparseable content"
-
-
-def _close_json_fragment(fragment: str) -> str:
-    """Best-effort close for streaming tool arguments JSON fragments."""
-    if not isinstance(fragment, str) or not fragment:
-        return ""
-    try:
-        json.loads(fragment)
-        return ""
-    except Exception:
-        pass
-
-    stack = []
-    in_string = False
-    escaped = False
-
-    for ch in fragment:
-        if in_string:
-            if escaped:
-                escaped = False
-            elif ch == "\\":
-                escaped = True
-            elif ch == '"':
-                in_string = False
-            continue
-
-        if ch == '"':
-            in_string = True
-        elif ch == "{":
-            stack.append("}")
-        elif ch == "[":
-            stack.append("]")
-        elif ch in ("}", "]") and stack and ch == stack[-1]:
-            stack.pop()
-
-    suffix = ""
-    if in_string:
-        suffix += '"'
-    if stack:
-        suffix += "".join(reversed(stack))
-
-    if not suffix:
-        return ""
-    try:
-        json.loads(fragment + suffix)
-        return suffix
-    except Exception:
-        return ""
 
 
 def _sanitize_for_log(obj, max_str_len: int = 2000):
@@ -3592,27 +2758,6 @@ def convert_litellm_to_anthropic(
 # ══════════════════════════════════════════════════════════════════════════════
 # OpenAI 兼容端点：/v1/chat/completions  → 统一走 LiteLLM
 # ══════════════════════════════════════════════════════════════════════════════
-
-async def _litellm_oai_stream(response_generator):
-    """把 LiteLLM 流式输出转成 OpenAI SSE 格式（bytes）"""
-    try:
-        async for chunk in response_generator:
-            try:
-                yield f"data: {json.dumps(chunk.model_dump())}\n\n".encode()
-            except Exception:
-                pass
-    except Exception as e:
-        # 流中途上游抛限流异常（headers 已发送，无法改状态码）：
-        # 发出 SSE error 事件让客户端感知，而不是伪成功 [DONE]。
-        if _is_rate_limit_error(e):
-            logger.warning(f"🕐 LiteLLM stream rate-limited (SSE error event): {e}")
-            err = {"error": {"type": "rate_limit_error", "message": str(e)}}
-            yield f"data: {json.dumps(err)}\n\n".encode()
-        else:
-            # 非限流异常保持原行为：向上抛出中断流（由框架处理）
-            raise
-    yield b"data: [DONE]\n\n"
-
 
 @app.post("/v1/chat/completions")
 async def openai_chat_completions(raw_request: Request):
@@ -4922,165 +4067,6 @@ async def count_tokens(request: TokenCountRequest, raw_request: Request):
         raise HTTPException(status_code=500, detail=f"Error counting tokens: {str(e)}")
 
 
-# ── 下游模型列表缓存（避免每次 /v1/models 都请求上游）──
-_DOWNSTREAM_MODELS_CACHE: Optional[List[dict]] = None
-_DOWNSTREAM_MODELS_CACHE_TIME: float = 0
-_MODELS_CACHE_TTL: float = 300.0  # 5 分钟
-
-
-async def _fetch_downstream_models() -> List[dict]:
-    """从下游网关拉取模型列表，按下游 endpoint 区分 provider 拉取方式。
-
-    - copilot / openai / qclaw：直连下游 /models（OpenAI 格式）
-    - 返回统一格式的 model dict 列表
-    """
-    global _DOWNSTREAM_MODELS_CACHE, _DOWNSTREAM_MODELS_CACHE_TIME
-    now = time.time()
-    if _DOWNSTREAM_MODELS_CACHE and (now - _DOWNSTREAM_MODELS_CACHE_TIME) < _MODELS_CACHE_TTL:
-        return _DOWNSTREAM_MODELS_CACHE
-
-    downstream = []
-    try:
-        if PREFERRED_PROVIDER == "copilot":
-            async with httpx.AsyncClient(timeout=httpx.Timeout(10.0), trust_env=False) as client:
-                resp = await client.get(
-                    f"{COPILOT_API_BASE}/models",
-                    headers={
-                        "Authorization": f"Bearer {COPILOT_GHE_TOKEN}",
-                        "Copilot-Integration-Id": COPILOT_INTEGRATION_ID,
-                    },
-                )
-                if resp.status_code == 200:
-                    data = resp.json()
-                    for m in data.get("data", []):
-                        caps = m.get("capabilities", {}) or {}
-                        family = caps.get("family", m.get("id", ""))
-                        limits = caps.get("limits", {}) or {}
-                        supports = caps.get("supports", {}) or {}
-                        endpoints = m.get("supported_endpoints", [])
-                        downstream.append({
-                            "id": m["id"],
-                            "object": "model",
-                            "created": 1700000000,
-                            "owned_by": m.get("vendor", "copilot"),
-                            "display_name": m.get("name", m["id"]),
-                            "description": m.get("id", ""),
-                            # 扩展字段 — 透传给了解下游能力的客户端
-                            "context_window": limits.get("max_context_window_tokens"),
-                            "max_output_tokens": limits.get("max_output_tokens"),
-                            "supports_tools": supports.get("tool_calls", False),
-                            "supports_vision": supports.get("vision", False),
-                            "supports_streaming": supports.get("streaming", False),
-                            "supports_thinking": supports.get("adaptive_thinking", False),
-                            "supports_reasoning_effort": supports.get("reasoning_effort", []),
-                            "supported_endpoints": endpoints,
-                            "model_family": family,
-                            "tokenizer": caps.get("tokenizer"),
-                            "preview": m.get("preview", False),
-                        })
-        elif PREFERRED_PROVIDER in ("openai",):
-            # OpenAI 上游
-            base = OPENAI_BASE_URL or "https://api.openai.com/v1"
-            url = base.rstrip("/") + "/models"
-            async with httpx.AsyncClient(timeout=httpx.Timeout(10.0), trust_env=False) as client:
-                resp = await client.get(url, headers={"Authorization": f"Bearer {OPENAI_API_KEY}"})
-                if resp.status_code == 200:
-                    data = resp.json()
-                    for m in data.get("data", []):
-                        downstream.append({
-                            "id": m["id"],
-                            "object": "model",
-                            "created": m.get("created", 1700000000),
-                            "owned_by": m.get("owned_by", "openai"),
-                            "display_name": m.get("id", ""),
-                        })
-
-        if downstream:
-            logger.debug(f"Fetched {len(downstream)} downstream models from {PREFERRED_PROVIDER}")
-            _DOWNSTREAM_MODELS_CACHE = downstream
-            _DOWNSTREAM_MODELS_CACHE_TIME = now
-    except Exception as e:
-        logger.warning(f"Failed to fetch downstream models: {e}")
-        if _DOWNSTREAM_MODELS_CACHE:
-            return _DOWNSTREAM_MODELS_CACHE  # 用过期缓存兜底
-
-    return downstream
-
-
-def _build_models_list(include_aliases: bool = True) -> List[dict]:
-    """构建模型列表，同时兼容 OpenAI 和 Anthropic 两套规范。
-
-    - copilot/openai provider：从下游 /models 拉取 + Claude Code 别名
-    - 其他 provider：硬编码列表 + 别名
-    - include_aliases=True：加 Anthropic 别名（8081 Anthropic 端口用）
-    - include_aliases=False：只返回真实下游模型（8082 OpenAI 端口用）
-
-    OpenAI 客户端读 object/owned_by，Anthropic 客户端读 type/display_name，
-    两套字段都塞进去，各取所需。
-    """
-    models: List[dict] = []
-
-    # ── 翻译链路别名（仅 8081 Anthropic 端口需要）──
-    # 动态来自 targets.json 顶层 models[]（name + aliases 均可被 _resolve_model_alias 命中），
-    # 与 dashboard「模型定义」编辑视图同源；不再硬编码（曾含 claude-*-4-20250514 死名单）。
-    if include_aliases:
-        for _m in _MODELS_CFG.get("models", []):
-            if not isinstance(_m, dict) or not _m.get("name"):
-                continue
-            _names = [str(_m["name"])] + [str(a) for a in (_m.get("aliases") or []) if isinstance(a, str)]
-            for _mid in _names:
-                models.append({
-                    "id": _mid,
-                    "object": "model",
-                    "type": "model",
-                    "created": 1700000000,
-                    "owned_by": "anthropic",
-                    "display_name": _humanize_model_name(_m["name"]),
-                })
-
-    # ── 能用下游 /models 的 provider：直接用缓存的列表（异步预拉取在 startup 完成）──
-    _downstream = _DOWNSTREAM_MODELS_CACHE or []
-    if _downstream:
-        for dm in _downstream:
-            entry = dict(dm)
-            entry.setdefault("type", "model")
-            models.append(entry)
-        return models
-
-    # ── 无下游缓存的 fallback（qclaw / gemini / anthropic 等）──
-    _passthrough_models = []
-    if PREFERRED_PROVIDER in ("qclaw",):
-        _passthrough_models = [
-            ("modelroute", "QClaw Model Route"),
-            ("pool-deepseek-v4-pro", "DeepSeek V4 Pro"),
-            ("pool-deepseek-v4-flash", "DeepSeek V4 Flash"),
-            ("pool-glm-5.2", "GLM 5.2"),
-            ("pool-glm-5.1", "GLM 5.1"),
-            ("pool-kimi-k2.7-code-highspeed", "Kimi K2.7 Code"),
-            ("pool-kimi-k2.6", "Kimi K2.6"),
-            ("pool-minimax-m3", "MiniMax M3"),
-            ("pool-minimax-m2.7", "MiniMax M2.7"),
-        ]
-    elif PREFERRED_PROVIDER == "copilot":
-        _passthrough_models = [
-            (COPILOT_BIG_MODEL, "Copilot Big"),
-            (COPILOT_MEDIUM_MODEL, "Copilot Medium"),
-            (COPILOT_SMALL_MODEL, "Copilot Small"),
-        ]
-
-    for mid, display in _passthrough_models:
-        models.append({
-            "id": mid,
-            "object": "model",
-            "type": "model",
-            "created": 1700000000,
-            "owned_by": "qclaw" if mid.startswith("pool") or mid == "modelroute" else "copilot",
-            "display_name": display,
-        })
-
-    return models
-
-
 @app.get("/v1/models")
 @app.get("/api/v1/models")
 @app.get("/openai/v1/models")
@@ -5111,278 +4097,6 @@ async def list_ollama_tags():
 @app.get("/")
 async def root():
     return {"message": "Anthropic Proxy for LiteLLM"}
-
-
-_WORD_FIXES = {
-    # Model families / brands
-    'glm': 'GLM', 'deepseek': 'DeepSeek', 'minimax': 'MiniMax', 'kimi': 'Kimi',
-    'hunyuan': 'Hunyuan', 'qwen': 'Qwen', 'nemotron': 'Nemotron', 'llama': 'Llama',
-    'gpt': 'GPT', 'claude': 'Claude', 'mai': 'Mai', 'hy3': 'Hy3',
-    # Descriptors / suffixes
-    'codex': 'Codex', 'pro': 'Pro', 'flash': 'Flash', 'mini': 'Mini',
-    'ultra': 'Ultra', 'super': 'Super', 'turbo': 'Turbo', 'coder': 'Coder',
-    'thinking': 'Thinking', 'instruct': 'Instruct', 'chat': 'Chat',
-    'modelroute': 'Model Route', 'default': 'Default',
-    'image': 'Image', 'art': 'Art', 'text': 'Text', 'embedding': 'Embedding',
-    'small': 'Small', 'large': 'Large', 'picker': 'Picker',
-    'compaction': 'Compaction', 'trajectory': 'Trajectory',
-    'maverick': 'Maverick', 'oss': 'OSS', 'sonnet': 'Sonnet',
-    'haiku': 'Haiku', 'opus': 'Opus', 'night': 'Night',
-    'volc': 'Volc', 'highspeed': 'HighSpeed',
-}
-
-
-def _humanize_model_name(mid):
-    """模型 id → 人类可读名。
-
-    规则：去 'pool-' / 'provider/' 前缀、':free' 尾缀转 '(free)'，
-    '-'/'_' 转空格，已知品牌词做专名修正，版本号保持原样。
-    """
-    s = str(mid)
-    # Strip provider/ prefix (e.g., nvidia/nemotron → nemotron)
-    if '/' in s:
-        s = s.split('/')[-1]
-    # Strip pool- prefix (e.g., pool-deepseek-v4-pro → deepseek-v4-pro)
-    if s.startswith('pool-'):
-        s = s[5:]
-    # Handle :free suffix
-    free_note = ''
-    if s.endswith(':free'):
-        s = s[:-5]
-        free_note = ' (free)'
-    # Replace separators with space
-    s = s.replace('-', ' ').replace('_', ' ')
-    # Apply word fixes
-    words = []
-    for w in s.split():
-        w_lower = w.lower()
-        if w_lower in _WORD_FIXES:
-            words.append(_WORD_FIXES[w_lower])
-        elif w and w[0].isdigit():
-            # Version-like: uppercase trailing letter-suffixes (e.g., "550b" → "550B", "a55b" → "A55B", "4v" → "4V")
-            result = w.upper() if any(c.isalpha() for c in w[-3:]) else w
-            words.append(result)
-        else:
-            words.append(w[0].upper() + w[1:] if w else w)
-    return ' '.join(words) + free_note
-
-def _scan_dangling_refs_cfg(cfg: dict) -> List[dict]:
-    """扫描配置中的悬空引用（引用了不存在的端口 / 虚拟模型 / 模型名）。
-
-    只读诊断，不修改任何配置。改名后引用方不联动是有意设计（见
-    docs/config-capability-unification.md §5「明确不做的事」第 4 条：不做自动改名
-    联动），本函数负责把"引用断了"这件事显式暴露到 dashboard 顶部警示条，
-    而不是让用户在请求失败时才发现。
-
-    检查两类引用：
-      1. 顶层 models[].target → {port, model}：端口是否存在、该端口是否提供此模型
-      2. aggregator.virtualModels[vm].defaultPool/fallbackPool[] → {port, model}：同上
-
-    端口集合含所有 enabled target 的 listenPort；聚合网关（8080）的"模型"为其
-    virtualModels 的 key（agg:xxx），故链式聚合引用也能正确校验。
-
-    模型名校验采取保守策略：仅当该端口**显式配置了非空白名单**时才判定模型悬空
-    （空 models[] 表示不限制透传，任何模型名都合法，不应误报）。
-
-    返回 [{"path": ..., "msg": ...}]，path 形如 models[2].target 便于前端定位。
-
-    cfg 形如 {"targets": [...], "models": [...]}；无参入口 _scan_dangling_refs()
-    传入全局 _TARGETS / _MODELS_CFG 组装的 cfg，行为与参数化前完全一致。
-    """
-    items: List[dict] = []
-    targets = cfg.get("targets") or []
-    top_models = cfg.get("models") or []
-    # 端口 → 该端口可被请求的模型名集合（None 表示不限制，不做模型级校验）
-    port_models: Dict[int, Optional[set]] = {}
-    port_labels: Dict[int, str] = {}
-    for t in targets:
-        port_num = t.get("listenPort")
-        if port_num is None:
-            continue
-        port_labels[port_num] = t.get("label") or t.get("name") or str(port_num)
-        if t.get("handler") == "aggregator":
-            port_models[port_num] = set((t.get("virtualModels") or {}).keys())
-            continue
-        names = set()
-        for m in (t.get("models") or []):
-            if isinstance(m, dict):
-                mid = m.get("id") or m.get("name")
-                if mid:
-                    names.add(mid)
-            elif isinstance(m, str):
-                names.add(m)
-        # 空白名单 = 不限制透传，模型级校验跳过（None 而非空集合，避免全量误报）
-        port_models[port_num] = names or None
-
-    def _check(path: str, ref: dict, what: str) -> None:
-        port = ref.get("port")
-        model = ref.get("model")
-        if port is None:
-            return
-        try:
-            port_i = int(port)
-        except (TypeError, ValueError):
-            items.append({"path": path, "msg": f"{what} 的端口 {port!r} 不是合法端口号"})
-            return
-        if port_i not in port_models:
-            items.append({"path": path, "msg": f"{what} 指向端口 {port_i}，但该端口未在 targets.json 中定义（或已禁用）"})
-            return
-        known = port_models[port_i]
-        if model and known is not None and model not in known:
-            plabel = port_labels.get(port_i, str(port_i))
-            items.append({"path": path, "msg": f"{what} 指向 {port_i}（{plabel}）的模型 {model}，但该端口未提供此模型"})
-
-    for idx, m in enumerate(top_models):
-        if not isinstance(m, dict):
-            continue
-        ref = m.get("target")
-        if isinstance(ref, dict):
-            _check(f"models[{idx}].target", ref, f"模型定义 {m.get('name') or idx}")
-
-    for t in targets:
-        if t.get("handler") != "aggregator":
-            continue
-        for vmid, vm in (t.get("virtualModels") or {}).items():
-            if not isinstance(vm, dict):
-                continue
-            for pool_key in ("defaultPool", "fallbackPool"):
-                for i, mem in enumerate(vm.get(pool_key) or []):
-                    if isinstance(mem, dict):
-                        _check(f"virtualModels.{vmid}.{pool_key}[{i}]", mem, f"虚拟模型 {vmid} 的{'默认池' if pool_key == 'defaultPool' else '降级池'}成员")
-
-    return items
-
-
-def _scan_dangling_refs() -> List[dict]:
-    """无参入口：扫描当前全局配置（_TARGETS / _MODELS_CFG）的悬空引用。
-
-    保留无参签名，`/api/config/dangling` 等既有调用点无需改动。
-    """
-    return _scan_dangling_refs_cfg({
-        "targets": _TARGETS,
-        "models": _MODELS_CFG.get("models", []) or [],
-    })
-
-
-# handler → modelsSource 的直接映射（handler 已经明确表达上游协议来源）
-_MODELS_SOURCE_BY_HANDLER: Dict[str, str] = {
-    "copilot": "copilot",
-    "aggregator": "aggregator",
-    "gemini-native": "gemini-native",
-    "qclaw": "qclaw",
-    "trae-work": "trae-work",
-}
-# handler=passthrough 时按 label 细分（label 是供应商身份，handler 只说明转发方式）
-_MODELS_SOURCE_BY_LABEL: Dict[str, str] = {
-    "codebuddy": "codebuddy",
-    "qclaw": "qclaw",
-    "trae-work": "trae-work",
-    "anthropic": "anthropic",
-    "anthropic-compatible": "anthropic",
-}
-_ANTHROPIC_ENTRY_PORT = 8081
-
-
-def _derive_models_source(target: dict) -> str:
-    """推导 target 的模型来源枚举值。
-
-    优先级：handler 直映射 > Anthropic 入口（8081 / anthropic* label）> label 细分 > passthrough。
-    """
-    handler = target.get("handler") or ""  # 缺 handler 时用 "" 查表，与 None 同样查不到，结果等价
-    direct = _MODELS_SOURCE_BY_HANDLER.get(handler)
-    if direct:
-        return direct
-    label = target.get("label") or ""
-    if target.get("listenPort") == _ANTHROPIC_ENTRY_PORT:
-        return "anthropic"
-    return _MODELS_SOURCE_BY_LABEL.get(label, "passthrough")
-
-
-class ModelRegistry:
-    """targets 配置的只读内存索引（纯函数式：构建后不再读全局状态）。
-
-    三个属性：
-      byPort       — listenPort → {label, handler, category, models, target}
-      dangling     — 与 _scan_dangling_refs_cfg(cfg) 等价的悬空引用列表
-      capabilities — listenPort → {can_prune, modelsSource}
-
-    can_prune 与 dashboard 现有判据保持一致：显式 hasModels=true 或 handler=copilot
-    （只有 copilot 系上游提供 /models 列表，才谈得上"对照上游清理过期模型"）。
-    """
-
-    __slots__ = ("byPort", "dangling", "capabilities")
-
-    def __init__(self, cfg: dict) -> None:
-        targets = cfg.get("targets") or []
-        by_port: Dict[int, dict] = {}
-        caps: Dict[int, dict] = {}
-        for t in targets:
-            port = t.get("listenPort")
-            if port is None:
-                continue
-            by_port[port] = {
-                "label": t.get("label"),
-                "handler": t.get("handler"),
-                "category": t.get("category"),
-                "models": list(t.get("models") or []),
-                "target": t,
-            }
-            caps[port] = {
-                "can_prune": t.get("hasModels") is True or t.get("handler") == "copilot",
-                "modelsSource": _derive_models_source(t),
-            }
-        self.byPort = by_port
-        self.capabilities = caps
-        self.dangling = _scan_dangling_refs_cfg(cfg)
-async def _fetch_live_models(target: dict):
-    """从下游网关拉取真实模型列表（OpenAI 格式，data[].id）。
-
-    编辑弹框用：与 copilot 一致，展示下游真实可用模型。
-    返回模型 id 列表；拉取失败（无 key/超时/非 200）返回 None，调用方降级。
-    gemini-native handler：走 Google 原生 /v1beta/models，解析 models[].name。
-    """
-    host = target.get("targetHost") or ""
-    if not host:
-        return None
-    protocol = target.get("targetProtocol", "https")
-    port = target.get("targetPort", 443)
-    prefix = target.get("routePrefix", "")
-    url = f"{protocol}://{host}:{port}{prefix}/models"
-    headers = {}
-    secret = _cfg.resolve_secret(target, _SECRETS)
-    if secret:
-        headers["Authorization"] = f"Bearer {secret}"
-    for k, v in (target.get("extraHeaders") or {}).items():
-        headers[k] = v
-    is_gemini_native = target.get("handler") == "gemini-native"
-    if is_gemini_native:
-        headers.pop("Authorization", None)
-        if secret:
-            headers["x-goog-api-key"] = secret
-        url = f"{_GEMINI_NATIVE_BASE}/models"
-    try:
-        async with httpx.AsyncClient(timeout=httpx.Timeout(8.0), trust_env=False) as c:
-            resp = await c.get(url, headers=headers)
-            if resp.status_code != 200:
-                return None
-            data = resp.json()
-            ids = []
-            if is_gemini_native:
-                for m in (data.get("models", []) or []):
-                    nm = m.get("name", "") if isinstance(m, dict) else ""
-                    if nm.startswith("models/"):
-                        ids.append(nm[len("models/"):])
-            else:
-                items = data.get("data", []) if isinstance(data, dict) else []
-                for m in items:
-                    if isinstance(m, dict) and m.get("id"):
-                        ids.append(m["id"])
-                    elif isinstance(m, str):
-                        ids.append(m)
-            return ids or None
-    except Exception as e:
-        logger.debug(f"_fetch_live_models {url} failed: {e}")
-        return None
 
 
 # ─── 统一管理面板（dashboard 包）─────────────────────────────────────
@@ -5498,3 +4212,5 @@ if __name__ == "__main__":
 
     # Configure uvicorn to run with minimal logs
     uvicorn.run(app, host="0.0.0.0", port=port, log_level="error")
+
+
