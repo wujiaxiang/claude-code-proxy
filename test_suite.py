@@ -24,6 +24,10 @@ import os
 import sys
 import time
 
+# 应用配置现在由 targets.json server 段承载（.env 已废弃）；env 仅作 CI 快捷覆盖
+import config_store as _cfg
+_test_server_cfg = _cfg.load_targets().get("server", _cfg.DEFAULT_SERVER_CONFIG)
+
 # ─── 配置 ───
 PROXY = os.environ.get("PROXY_HOST", "127.0.0.1")
 PORT = int(os.environ.get("PROXY_PORT", "8082"))
@@ -31,12 +35,12 @@ TIMEOUT = 60
 
 # ─── 8082 固定为 copilot target（横向扩展模式）───
 # 模型名：Anthropic 别名经 copilot target 的 modelMapping 映射
-_PROVIDER = os.environ.get("PREFERRED_PROVIDER", "copilot").lower()
+_PROVIDER = os.environ.get("PREFERRED_PROVIDER", str(_test_server_cfg["preferredProvider"])).lower()
 if _PROVIDER == "qclaw":
     # 直接打 8085（qclaw 端口）时用 pool-* 模型
-    OAI_MODEL_BIG = os.environ.get("BIG_MODEL", "pool-glm-5.2")
-    OAI_MODEL_MED = os.environ.get("MEDIUM_MODEL", "pool-deepseek-v4-pro")
-    OAI_MODEL_SMALL = os.environ.get("SMALL_MODEL", "pool-deepseek-v4-flash")
+    OAI_MODEL_BIG = os.environ.get("BIG_MODEL", _test_server_cfg["legacyModels"]["big"])
+    OAI_MODEL_MED = os.environ.get("MEDIUM_MODEL", _test_server_cfg["legacyModels"]["medium"])
+    OAI_MODEL_SMALL = os.environ.get("SMALL_MODEL", _test_server_cfg["legacyModels"]["small"])
 else:
     # 默认：8082 = copilot，经 modelMapping 映射
     OAI_MODEL_BIG = "opus"
