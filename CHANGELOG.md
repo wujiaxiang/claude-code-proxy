@@ -3,6 +3,13 @@
 ## [Unreleased]
 
 ### Added
+- **dashboard/ 子包拆分（2026-08-07）**：`dashboard/routes.py`（3235 行）按职责拆为装配入口 + 7 个子模块，逻辑逐字节不变、行为零变化，server.py 挂载点零改动（仍 `from dashboard.routes import dashboard_router`）
+  - `dashboard/routes.py`（74 行）：定义 `dashboard_router` + import 子模块触发路由注册 + re-export
+  - `dashboard/frontend.py`：`DASHBOARD_STYLE` + HTML 渲染辅助函数（`_html_escape`/`_get_lan_ip`/`_format_uptime`/`_model_details_html`/`_build_card_html`）+ `dashboard()` 页面
+  - `dashboard/schemas.py`：5 个 Pydantic 请求体模型（`ModelsUpdate`/`AggregateConfigUpdate`/`TargetUpdate`/`SecretUpdate`/`SecretBulkUpdate`）
+  - `dashboard/api_*.py` ×5：18 个 `/api/*` 路由按业务分组（targets/models/aggregate/secrets/crack）
+  - 热重载全局沿用 `import server as _srv` + `_srv.X` 访问；`test_targets_schema.py::test_api_targets_shape` 扫描范围扩展至 dashboard/ 子包
+
 - **配置能力统一 P1**（依据 `docs/config-capability-unification.md` §4）：三个编辑 modal 共享基础设施 + 用户可感知的"改动=生效"反馈
   - **作用域提示**：每个 modal 顶部新增 `mm-scope` 条，明示「本页改什么、不改什么」——models-modal 影响 8081、agg-modal 影响 8080 聚合、model-modal 仅影响该端口白名单
   - **保存成功反馈升级**：三个 save 函数统一 `mmMsg()` 提示，并追加「已保存 N 个 X → Y 卡片已更新」

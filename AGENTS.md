@@ -9,7 +9,7 @@
 
 **claude-code-proxy** 是一个 FastAPI 代理服务，让 Anthropic 客户端（如 Claude Code）能用多种后端（OpenAI / Gemini / Copilot Enterprise / QClaw / CodeBuddy / Trae Work）。
 
-- **主入口**：`server.py`（框架层 + 入口，~4200 行，已下沉 HTTP 引擎/翻译层/模型注册表/错误翻译到 `server_http.py` 与 `gateways/*`）+ 网关实现层（`gateways/`）+ 管理面板层（`dashboard/`）。**配置驱动**——所有端口/供应商/模型由 `targets.json` 定义，改配置不动 server.py；改具体网关注辑进 `gateways/<网关>.py`，改 dashboard 进 `dashboard/routes.py`
+- **主入口**：`server.py`（框架层 + 入口，~4200 行，已下沉 HTTP 引擎/翻译层/模型注册表/错误翻译到 `server_http.py` 与 `gateways/*`）+ 网关实现层（`gateways/`）+ 管理面板层（`dashboard/`）。**配置驱动**——所有端口/供应商/模型由 `targets.json` 定义，改配置不动 server.py；改具体网关注辑进 `gateways/<网关>.py`，改 dashboard 进 `dashboard/<子模块>.py`
 - **依赖**：Python 3.10+ / fastapi / uvicorn / httpx / litellm / python-dotenv / tiktoken / pydantic（虚拟环境 `.venv/`，Windows 用 `.venv\Scripts\python.exe`）
 - **配置模块**：`config_store.py`（targets.json 加载/迁移/校验、secrets.json 读写、热重载）
 
@@ -170,7 +170,7 @@ tail -f codebuddy.log                 # 查
 
 ## 7. 代码结构（多模块）
 
-> 从单文件（原 server.py 10996 行）逐步拆分。当前为四层架构：框架层（server.py + server_http.py）/ 网关实现层（gateways/）/ 管理面板层（dashboard/routes.py）/ 破解层（crack_*.py）。行号随版本漂移，实际位置用 `grep` 定位，不建议依赖行号。
+> 从单文件（原 server.py 10996 行）逐步拆分。当前为四层架构：框架层（server.py + server_http.py）/ 网关实现层（gateways/）/ 管理面板层（dashboard/ 子包）/ 破解层（crack_*.py）。行号随版本漂移，实际位置用 `grep` 定位，不建议依赖行号。
 
 ### 目录结构
 
@@ -188,8 +188,14 @@ tail -f codebuddy.log                 # 查
 - **gateways/aggregator/engine.py**：聚合网关纯引擎逻辑（`AggregatorEngine`，路由 / 会话粘性 / 熔断 / 降级）
 - **gateways/aggregator/http_adapter.py**：聚合网关 HTTP 适配（`_handle_aggregate_request`/`_aggregator_prober`）
   - ⚠️ `_AGGREGATOR_ENGINE` 全局通过 `import server as _srv` + `_srv._AGGREGATOR_ENGINE` 模块属性共享
-- **dashboard/routes.py**（~3200 行）：管理面板全套（`DASHBOARD_STYLE` + HTML 渲染 + 18 个 `/api/*` 路由，FastAPI `APIRouter`，server.py 里 `app.include_router(dashboard_router)` 挂载）；改 dashboard 进这里
-  - ⚠️ **当前最大单一文件**，下一步瘦身头号目标（HTML 渲染 / 各 `/api/*` 路由可按卡片拆分到 `dashboard/` 子模块）
+- **dashboard/routes.py**（~74 行）：管理面板**装配入口**（定义 `dashboard_router` + import dashboard/ 子模块触发路由注册 + re-export）；server.py 仍 `from dashboard.routes import dashboard_router` 挂载，调用点零改动
+- **dashboard/frontend.py**（~2750 行）：前端渲染层（`DASHBOARD_STYLE` + `_html_escape`/`_get_lan_ip`/`_format_uptime`/`_model_details_html`/`_build_card_html` + `dashboard()` 页面路由）
+- **dashboard/schemas.py**：Pydantic 请求体模型（`ModelsUpdate`/`AggregateConfigUpdate`/`TargetUpdate`/`SecretUpdate`/`SecretBulkUpdate`）
+- **dashboard/api_targets.py**：`api_targets`/`api_update_target`/`api_target_mapping`/`api_prune_models`/`api_target_models_html`
+- **dashboard/api_models.py**：`api_get_models`/`api_update_models`/`api_get_dangling`
+- **dashboard/api_aggregate.py**：`api_get_aggregate_config`/`api_update_aggregate_config`/`api_aggregate_status`
+- **dashboard/api_secrets.py**：`api_update_secret`/`api_update_secret_bulk`
+- **dashboard/api_crack.py**：`api_crack_status`/`api_crack_schema`/`api_recrack`/`api_reload`
 - **config_store.py**（~360 行）：`targets.json` 加载/迁移/校验、secrets.json 读写、热重载（独立模块）
 
 ### 跨模块约定（新增，拆分后必须遵守）

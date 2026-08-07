@@ -328,9 +328,15 @@ import inspect as _inspect
 
 
 def test_api_targets_shape():
-    """通过 inspect 源码确认 /api/targets GET 路由已定义（server.py 或拆分后的 dashboard/routes.py）。"""
+    """通过 inspect 源码确认 /api/targets GET 路由已定义（server.py 或 dashboard 子包）。"""
     found = False
-    for fname in ("server.py", "dashboard/routes.py"):
+    # 扫描 server.py + dashboard/ 全部 .py（路由已拆分到 dashboard/api_*.py）
+    fnames = ["server.py", "dashboard/routes.py"]
+    dash_dir = Path(__file__).parent / "dashboard"
+    if dash_dir.is_dir():
+        fnames += sorted(str(p.relative_to(Path(__file__).parent))
+                         for p in dash_dir.glob("*.py") if p.name != "routes.py")
+    for fname in fnames:
         path = Path(__file__).parent / fname
         if not path.exists():
             continue
@@ -339,7 +345,7 @@ def test_api_targets_shape():
         for node in _ast.walk(tree):
             if isinstance(node, (_ast.FunctionDef, _ast.AsyncFunctionDef)):
                 for decorator in node.decorator_list:
-                    # 找 @app.get(...) 装饰器
+                    # 找 @app.get(...) / @dashboard_router.get(...) 装饰器
                     if isinstance(decorator, _ast.Call) and isinstance(decorator.func, _ast.Attribute):
                         if decorator.func.attr == "get":
                             for arg in decorator.args:
@@ -348,7 +354,7 @@ def test_api_targets_shape():
                                     break
         if found:
             break
-    assert found, "server.py 或 dashboard/routes.py 中应有 /api/targets GET 路由"
+    assert found, "server.py 或 dashboard/ 子包中应有 /api/targets GET 路由"
 
 
 def test_targets_json_top_level_object():
