@@ -4,7 +4,7 @@ import logging
 from logging.handlers import TimedRotatingFileHandler
 import json
 from pydantic import BaseModel, Field, field_validator, model_validator
-from typing import List, Dict, Any, Optional, Union, Literal
+from typing import AsyncIterator, Callable, List, Dict, Any, Optional, Union, Literal
 import httpx
 import os
 import socket
@@ -18,7 +18,6 @@ from fastapi.responses import HTMLResponse
 import litellm
 import uuid
 import time
-from dotenv import load_dotenv
 import re
 from datetime import datetime
 from pathlib import Path
@@ -125,21 +124,24 @@ try:
 except Exception:
     crack_common = None
 
-# Load environment variables from .env file
-load_dotenv()
+# ─── 配置事实源：targets.json（server 段承载主服务运行配置，.env 已废弃）───
+# 必须在日志初始化（下方 DEBUG/LOG_*）与所有 _SERVER_CFG 消费点之前完成加载。
+import config_store as _cfg
+_CFG = _cfg.load_targets()
+_SERVER_CFG = _CFG.get("server", _cfg.DEFAULT_SERVER_CONFIG)
 
 # Debug mode
-DEBUG = os.environ.get("DEBUG", "False").lower() == "true"
-LOG_FILE = os.environ.get("LOG_FILE", "")  # 非空则同时输出到文件
-LOG_RETENTION_DAYS = int(os.environ.get("LOG_RETENTION_DAYS", "7"))
-LOG_ROTATE_WHEN = os.environ.get("LOG_ROTATE_WHEN", "midnight")
-LOG_ROTATE_INTERVAL = int(os.environ.get("LOG_ROTATE_INTERVAL", "1"))
+DEBUG = bool(_SERVER_CFG["log"]["debug"])
+LOG_FILE = _SERVER_CFG["log"]["file"]  # 非空则同时输出到文件
+LOG_RETENTION_DAYS = int(_SERVER_CFG["log"]["retentionDays"])
+LOG_ROTATE_WHEN = _SERVER_CFG["log"]["rotateWhen"]
+LOG_ROTATE_INTERVAL = int(_SERVER_CFG["log"]["rotateInterval"])
 
 # Response cache configuration
-CACHE_ENABLED = os.environ.get("CACHE_ENABLED", "True").lower() == "true"
-CACHE_MAX_SIZE = int(os.environ.get("CACHE_MAX_SIZE", "500"))
-CACHE_TTL_SECONDS = int(os.environ.get("CACHE_TTL_SECONDS", "3600"))
-CACHE_MAX_ITEM_SIZE_KB = int(os.environ.get("CACHE_MAX_ITEM_SIZE_KB", "100"))
+CACHE_ENABLED = bool(_SERVER_CFG["cache"]["enabled"])
+CACHE_MAX_SIZE = int(_SERVER_CFG["cache"]["maxSize"])
+CACHE_TTL_SECONDS = int(_SERVER_CFG["cache"]["ttlSeconds"])
+CACHE_MAX_ITEM_SIZE_KB = int(_SERVER_CFG["cache"]["maxItemSizeKb"])
 
 # Configure logging
 _log_level = logging.DEBUG if DEBUG else logging.INFO
@@ -494,7 +496,7 @@ USE_VERTEX_AUTH = os.environ.get("USE_VERTEX_AUTH", "False").lower() == "true"
 
 # ─── QClaw 上游直连配置 ───
 # 上游 LLM 接口（OpenAI 兼容），从 QClaw 客户端本地存储解密 API Key
-QCLAW_BASE_URL = os.environ.get("QCLAW_BASE_URL", "https://mmgrcalltoken.3g.qq.com/aizone/v1")
+QCLAW_BASE_URL = _SERVER_CFG["qclaw"]["baseUrl"]
 
 
 QCLAW_API_KEY = _decrypt_qclaw_api_key()
@@ -507,19 +509,19 @@ else:
 # COPILOT_GHE_TOKEN：私密凭据，已收敛到 secrets.json copilot_token 字段（唯一事实源，
 # 与 8082 企业 GHE target 的 secretRef 同源）。模块加载时从 env 读一次作初始兜底；
 # _load_vendor_targets() / _reload_targets() / _refresh_secrets() 热重载时从 secrets.json
-# 覆盖（dashboard 可编辑、热生效）。其余 COPILOT_* 为纯配置，留在 .env。
+# 覆盖（dashboard 可编辑、热生效）。其余 COPILOT_* 为纯配置，读 targets.json server 段。
 COPILOT_GHE_TOKEN = os.environ.get("COPILOT_GHE_TOKEN", "")
-COPILOT_GHE_HOST = os.environ.get("COPILOT_GHE_HOST", "copilot-api.bmw.ghe.com")
-COPILOT_INTEGRATION_ID = os.environ.get("COPILOT_INTEGRATION_ID", "copilot-developer-cli")
+COPILOT_GHE_HOST = _SERVER_CFG["copilot"]["gheHost"]
+COPILOT_INTEGRATION_ID = _SERVER_CFG["copilot"]["integrationId"]
 # api_base for LiteLLM（不含路径，LiteLLM 会追加 /chat/completions）
 COPILOT_API_BASE = f"https://{COPILOT_GHE_HOST}"
 # Copilot 模型映射（opus→big, sonnet→medium, haiku→small）
-COPILOT_BIG_MODEL    = os.environ.get("COPILOT_BIG_MODEL",    "claude-sonnet-4.6")
-COPILOT_MEDIUM_MODEL = os.environ.get("COPILOT_MEDIUM_MODEL", "claude-sonnet-4.6")
-COPILOT_SMALL_MODEL  = os.environ.get("COPILOT_SMALL_MODEL",  "claude-haiku-4.5")
+COPILOT_BIG_MODEL    = _SERVER_CFG["copilot"]["bigModel"]
+COPILOT_MEDIUM_MODEL = _SERVER_CFG["copilot"]["mediumModel"]
+COPILOT_SMALL_MODEL  = _SERVER_CFG["copilot"]["smallModel"]
 
 # Get preferred provider
-PREFERRED_PROVIDER = os.environ.get("PREFERRED_PROVIDER", "openai").lower()
+PREFERRED_PROVIDER = str(_SERVER_CFG["preferredProvider"]).lower()
 valid_providers = ("openai", "anthropic", "qclaw", "gemini", "gemini-openai", "copilot")
 if PREFERRED_PROVIDER not in valid_providers:
     print(f"Warning: Unknown PREFERRED_PROVIDER '{PREFERRED_PROVIDER}', falling back to 'openai'")
@@ -571,13 +573,10 @@ if PREFERRED_PROVIDER == "copilot":
     litellm.register_model(_copilot_models)
     print("🤖 Copilot models registered in LiteLLM")
 
-# Get model mapping configuration from environment
-# Default to latest OpenAI models if not set
-BIG_MODEL = os.environ.get("BIG_MODEL", "gpt-4.1")
-MEDIUM_MODEL = os.environ.get("MEDIUM_MODEL", os.environ.get("BIG_MODEL", "gpt-4.1"))
-SMALL_MODEL = os.environ.get("SMALL_MODEL", "gpt-4.1-mini")
-
-import config_store as _cfg
+# Get model mapping configuration from targets.json server 段（legacyModels）
+BIG_MODEL = _SERVER_CFG["legacyModels"]["big"]
+MEDIUM_MODEL = _SERVER_CFG["legacyModels"]["medium"]
+SMALL_MODEL = _SERVER_CFG["legacyModels"]["small"]
 
 # ─── 统一透传引擎配置（targets.json 驱动）───
 _TARGETS: list = []
@@ -1023,270 +1022,11 @@ def _crack_env_check(target: dict) -> dict:
 
 # ─── 8081 Anthropic 协议端口（对内透传 8082，模型列表隔离） ───
 
-_ANTHROPIC_PORT = int(os.environ.get("ANTHROPIC_PORT", "8081"))
+_ANTHROPIC_PORT = int(_SERVER_CFG["listenPort"])
 
 
 # 值混合 int 计数与 str 时间戳，故不加值类型约束（与 _TARGET_STATS 同风格）
 _ANTHROPIC_STATS: dict = {"totalRequests": 0, "passthroughOk": 0, "passthroughError": 0, "startedAt": datetime.now().isoformat()}
-
-
-# ─── 8082 OpenAI 协议端口（asyncio TCP，纯透传 + 多 provider 路由）───
-
-_OPENAI_PORT = int(os.environ.get("OPENAI_PORT", "8082"))
-_OPENAI_STATS: dict = {"totalRequests": 0, "passthroughOk": 0, "passthroughError": 0, "startedAt": datetime.now().isoformat()}
-
-
-def _choose_openai_upstream(body_json: dict):
-    """根据 PREFERRED_PROVIDER 选择上游 URL 和鉴权 headers"""
-    provider = PREFERRED_PROVIDER
-    if provider == "copilot":
-        return (
-            f"https://{COPILOT_GHE_HOST}/chat/completions",
-            {
-                "Authorization": f"Bearer {COPILOT_GHE_TOKEN}",
-                "Copilot-Integration-Id": COPILOT_INTEGRATION_ID,
-                "Content-Type": "application/json",
-            },
-        )
-    elif provider in ("qclaw",):
-        return (
-            f"{QCLAW_BASE_URL}/chat/completions",
-            {
-                "Authorization": f"Bearer {QCLAW_API_KEY}",
-                "Content-Type": "application/json",
-                "User-Agent": "OpenAI/JS 6.39.1",
-            },
-        )
-    elif provider == "openai":
-        base = OPENAI_BASE_URL or "https://api.openai.com/v1"
-        return (
-            f"{base.rstrip('/')}/chat/completions",
-            {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"},
-        )
-    else:
-        # 兜底走 copilot
-        return (
-            f"https://{COPILOT_GHE_HOST}/chat/completions",
-            {
-                "Authorization": f"Bearer {COPILOT_GHE_TOKEN}",
-                "Copilot-Integration-Id": COPILOT_INTEGRATION_ID,
-                "Content-Type": "application/json",
-            },
-        )
-
-
-async def _handle_openai_proxy_request(reader, writer):
-    """8082 OpenAI 端口：固定为 copilot target（经统一透传引擎）。
-    保留为兼容入口：若 8082 未在 targets.json 中配置，则此函数兜底转发。
-    """
-    copilot_target = next((t for t in _TARGETS if t["listenPort"] == _OPENAI_PORT), None)
-    if copilot_target:
-        await _handle_target_request(reader, writer, copilot_target)
-        return
-    # 兜底：无 target 配置时保持旧行为（透传 + 基本自检）
-    try:
-        method, path, raw_path, headers, body = await _parse_http_request(reader)
-        if method is None:
-            return
-        if path == "/__proxy_info__":
-            payload = json.dumps({
-                "label": "claude-code-openai", "listenPort": _OPENAI_PORT,
-                "targetHost": "unconfigured", "targetPort": 443, "targetProtocol": "https",
-                "models": [], "retryAfterSeconds": 0, "errorPatterns": [],
-                "startedAt": _OPENAI_STATS["startedAt"],
-            })
-            writer.write(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: %d\r\n\r\n%s" % (len(payload.encode()), payload.encode()))
-            await writer.drain(); writer.close(); return
-        await _write_error_response(writer, 503, "8082 target not configured in targets.json")
-    except Exception:
-        _OPENAI_STATS["passthroughError"] += 1
-        try:
-            await _write_error_response(writer, 503, "OpenAI proxy error")
-        except Exception:
-            pass
-
-
-async def _openai_server(host="0.0.0.0", port=8082):
-    srv = await asyncio.start_server(_handle_openai_proxy_request, host=host, port=port)
-    print(f"🔀 [claude-code-openai] 0.0.0.0:{port} -> {PREFERRED_PROVIDER} upstream (multi-provider routing)")
-    return srv
-
-
-async def _handle_anthropic_proxy_request(reader, writer):
-    """8081 Anthropic 专用端口：/v1/messages 翻译成 OpenAI 格式后内部请求 8082，其余透传"""
-    try:
-        req_line = await asyncio.wait_for(reader.readline(), timeout=30)
-        if not req_line:
-            writer.close(); return
-        parts = req_line.decode("utf-8", errors="replace").strip().split(" ", 2)
-        method = parts[0] if len(parts) > 0 else "GET"
-        raw_path = parts[1] if len(parts) > 1 else "/"
-
-        headers = {}
-        while True:
-            line = await asyncio.wait_for(reader.readline(), timeout=10)
-            line_str = line.decode("utf-8", errors="replace").strip()
-            if not line_str: break
-            if ":" in line_str:
-                k, v = line_str.split(":", 1)
-                headers[k.strip().lower()] = v.strip()
-
-        content_len = int(headers.get("content-length", 0))
-        body = b""
-        if content_len > 0:
-            body = await asyncio.wait_for(reader.read(content_len), timeout=30)
-
-        parsed = urlparse(raw_path)
-        path = parsed.path
-
-        # ── 自检端点 ──
-        if path == "/__proxy_info__":
-            import json as _json
-            payload = _json.dumps({
-                "label": "claude-code-anthropic", "listenPort": _ANTHROPIC_PORT,
-                "targetHost": "127.0.0.1", "targetPort": 8082, "targetProtocol": "http",
-                "models": [m["id"] for m in _anthropic_port_models()],
-                "retryAfterSeconds": 0, "errorPatterns": [],
-                "startedAt": _ANTHROPIC_STATS["startedAt"],
-            })
-            writer.write(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: %d\r\n\r\n%s" % (len(payload.encode()), payload.encode()))
-            await writer.drain(); writer.close(); return
-
-        if path == "/__proxy_stats__":
-            import json as _json
-            payload = _json.dumps({"label": "claude-code-anthropic", "listenPort": _ANTHROPIC_PORT, **_ANTHROPIC_STATS})
-            writer.write(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: %d\r\n\r\n%s" % (len(payload.encode()), payload.encode()))
-            await writer.drain(); writer.close(); return
-
-        # ── /v1/models 拦截：只返回 Anthropic 模型（动态来自 targets.json models[]）──
-        if path == "/v1/models" and method == "GET":
-            import json as _json
-            filtered = _anthropic_port_models()
-            for m in filtered:
-                m.setdefault("object", "model")
-                m.setdefault("type", "model")
-                m.setdefault("created", 1700000000)
-                m.setdefault("owned_by", "anthropic")
-            payload = _json.dumps({"data": filtered, "object": "list", "has_more": False})
-            writer.write(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: %d\r\n\r\n%s" % (len(payload.encode()), payload.encode()))
-            await writer.drain(); writer.close(); return
-
-        _ANTHROPIC_STATS["totalRequests"] += 1
-
-        # ── /v1/messages：Anthropic→OpenAI 翻译，内部请求 8082 ──
-        if path == "/v1/messages" and method == "POST":
-            from anthropic_convert import convert_anthropic_request_to_openai, convert_openai_response_to_anthropic
-            try:
-                anthropic_body = json.loads(body.decode("utf-8"))
-            except Exception:
-                writer.write(b"HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\n\r\n{\"error\":\"invalid json\"}")
-                await writer.drain(); writer.close(); return
-
-            original_model = anthropic_body.get("model", "unknown")
-            is_stream = anthropic_body.get("stream", False)
-            openai_body = convert_anthropic_request_to_openai(anthropic_body)
-
-            # 8081 转发目标映射：models[] 命中则用配置的端口+模型（支持聚合 agg:xxx → 8080），未命中回退 modelDefaults.defaultPort
-            mapped = _cfg._resolve_model_alias(_MODELS_CFG, original_model)
-            if mapped:
-                fwd_port = int(mapped["port"])
-                openai_body["model"] = mapped["model"]
-            else:
-                fwd_port = int(_MODELS_CFG["modelDefaults"].get("defaultPort", 8082))
-
-            openai_payload = json.dumps(openai_body).encode("utf-8")
-
-            fwd_headers = {
-                "content-type": "application/json",
-                "host": f"127.0.0.1:{fwd_port}",
-                "content-length": str(len(openai_payload)),
-            }
-            if headers.get("authorization"):
-                fwd_headers["authorization"] = headers["authorization"]
-            if headers.get("x-api-key"):
-                fwd_headers["x-api-key"] = headers["x-api-key"]
-
-            upstream_url = f"http://127.0.0.1:{fwd_port}/v1/chat/completions"
-
-            async with httpx.AsyncClient(timeout=httpx.Timeout(300.0, connect=10.0), trust_env=False) as client:
-                req = client.build_request("POST", upstream_url, headers=fwd_headers, content=openai_payload)
-                resp = await client.send(req, stream=is_stream)
-
-                if is_stream:
-                    _ANTHROPIC_STATS["passthroughOk"] += 1
-                    writer.write(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: keep-alive\r\n\r\n")
-                    async for chunk in resp.aiter_bytes():
-                        writer.write(chunk)
-                        await writer.drain()
-                    writer.write(b"data: [DONE]\n\n")
-                    await writer.drain()
-                    writer.close(); return
-
-                body_bytes = await resp.aread()
-                try:
-                    openai_resp = json.loads(body_bytes.decode("utf-8"))
-                except Exception:
-                    _ANTHROPIC_STATS["passthroughError"] += 1
-                    writer.write(b"HTTP/1.1 502 Bad Gateway\r\n\r\n")
-                    await writer.drain(); writer.close(); return
-
-                if resp.status_code >= 400:
-                    _ANTHROPIC_STATS["passthroughOk"] += 1
-                    content_len = len(body_bytes)
-                    writer.write(f"HTTP/1.1 {resp.status_code} {resp.reason_phrase or 'Error'}\r\nContent-Type: application/json\r\nContent-Length: {content_len}\r\n\r\n".encode())
-                    writer.write(body_bytes)
-                    await writer.drain(); writer.close(); return
-
-                anthropic_resp = convert_openai_response_to_anthropic(openai_resp, original_model)
-                resp_payload = json.dumps(anthropic_resp).encode("utf-8")
-                _ANTHROPIC_STATS["passthroughOk"] += 1
-                _bump_model_stats("anthropic", original_model, "ok")
-                writer.write(f"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {len(resp_payload)}\r\n\r\n".encode())
-                writer.write(resp_payload)
-                await writer.drain()
-                writer.close(); return
-            return
-
-        # ── 其余请求：透传到默认转发端口 ──
-        fwd_port = int(_MODELS_CFG["modelDefaults"].get("defaultPort", 8082))
-        upstream_url = f"http://127.0.0.1:{fwd_port}{raw_path}"
-        fwd_headers = {k: v for k, v in headers.items() if k not in ("host", "connection")}
-        fwd_headers["host"] = f"127.0.0.1:{fwd_port}"
-
-        async with httpx.AsyncClient(timeout=httpx.Timeout(300.0, connect=10.0), trust_env=False) as client:
-            req = client.build_request(method, upstream_url, headers=fwd_headers, content=body if body else None)
-            resp = await client.send(req, stream=True)
-
-            content_type = resp.headers.get("content-type", "")
-            is_stream = "text/event-stream" in content_type
-            if is_stream:
-                writer.write(f"HTTP/1.1 {resp.status_code} {resp.reason_phrase or 'OK'}\r\n".encode())
-                for k, v in resp.headers.items():
-                    if k.lower() not in _PROXY_STRIP_RESP_HEADERS:
-                        writer.write(f"{k}: {v}\r\n".encode())
-                writer.write(b"\r\n")
-                async for chunk in resp.aiter_bytes():
-                    writer.write(chunk)
-                    await writer.drain()
-                _ANTHROPIC_STATS["passthroughOk"] += 1
-                writer.close(); return
-
-            body_bytes = await resp.aread()
-            _ANTHROPIC_STATS["passthroughOk"] += 1
-            resp_headers = "".join(f"{k}: {v}\r\n" for k, v in resp.headers.items() if k.lower() not in _PROXY_STRIP_RESP_HEADERS)
-            writer.write(f"HTTP/1.1 {resp.status_code} {resp.reason_phrase or 'OK'}\r\n{resp_headers}Content-Length: {len(body_bytes)}\r\n\r\n".encode())
-            writer.write(body_bytes)
-            await writer.drain()
-    except Exception:
-        _ANTHROPIC_STATS["passthroughError"] += 1
-        try: writer.close()
-        except: pass
-
-
-async def _anthropic_server(host="0.0.0.0", port=8081):
-    srv = await asyncio.start_server(_handle_anthropic_proxy_request, host=host, port=port)
-    print(f"🔀 [claude-code-anthropic] 0.0.0.0:{port} -> http://127.0.0.1:{int(_MODELS_CFG['modelDefaults'].get('defaultPort', 8082))} (Anthropic protocol, /v1/models isolated)")
-    return srv
 
 
 async def _handle_target_request(reader, writer, target):  # pyright: ignore[reportGeneralTypeIssues] - 统一透传引擎分支路径多，pyright 放弃分析；拆分会改变转发/统计行为，故仅抑制该诊断
@@ -3542,6 +3282,82 @@ async def handle_qclaw_streaming(qclaw_response, display_model: str):
     yield f"event: message_stop\ndata: {json.dumps({'type': 'message_stop'})}\n\n".encode()
 
 
+# ─── Copilot /v1/messages 上游重试（分支 B 流式/非流式共享）───
+
+# 触发重试的传输层异常：连接建立失败 / 读取中断 / 上游提前断开协议。
+_COPILOT_RETRY_EXCEPTIONS = (httpx.ConnectError, httpx.ReadError, httpx.RemoteProtocolError)
+
+_COPILOT_MESSAGES_MAX_ATTEMPTS = 3
+_COPILOT_MESSAGES_BACKOFF = 0.5
+
+
+def _copilot_status_retryable(status_code: int) -> bool:
+    """上游 HTTP 状态码是否值得重试。
+
+    与 gateways.errors 的分类族对齐（`_vendor_body_retryable` 按错误体特征判限流，
+    此处按状态码判服务端故障）：5xx 是上游瞬时故障，重试有意义；4xx 是请求本身的
+    问题，重试只会得到同样的拒绝。429（`_is_rate_limit_error` 覆盖的限流类）在本
+    路径由上游以 4xx 返回，不重试——盲目重试稳定限流只是浪费 backoff。
+    """
+    return status_code >= 500
+
+
+class _CopilotAttemptFailed(Exception):
+    """`attempt_fn` 主动声明"这次尝试失败了，按 reason 重试"。
+
+    与传输层异常（`_COPILOT_RETRY_EXCEPTIONS`）在骨架里等价处理，区别只是前者由
+    调用方按业务判据（如 `_copilot_status_retryable`）抛出，后者由 httpx 抛出。
+    """
+
+    def __init__(self, reason: str) -> None:
+        super().__init__(reason)
+        self.reason = reason
+
+
+async def _retry_copilot_messages_request(
+    client_factory: Callable[[], httpx.AsyncClient],
+    attempt_fn: Callable[[httpx.AsyncClient, int], AsyncIterator[bytes]],
+    max_attempts: int = _COPILOT_MESSAGES_MAX_ATTEMPTS,
+    backoff: float = _COPILOT_MESSAGES_BACKOFF,
+) -> AsyncIterator[bytes]:
+    """Copilot /v1/messages 上游请求的共享重试骨架（流式与非流式复用）。
+
+    `attempt_fn(client, attempt_index)` 是一个异步生成器：它在给定客户端上发一次
+    请求，产出的字节被原样转发给下游（流式路径逐 chunk 透传，非流式路径不产出字节
+    而把响应经闭包交回调用方）。它通过抛 `_CopilotAttemptFailed(reason)` 声明本次
+    失败需要重试；正常结束即视为终结，骨架停止重试。
+
+    骨架负责两个调用点原本各写一遍的三件事：
+      1. 重试前 backoff（首次不 sleep）；
+      2. 每次尝试用完即 `aclose()` 客户端（成功、失败、异常都走）；
+      3. 捕获传输层异常（`_COPILOT_RETRY_EXCEPTIONS`）转为失败理由继续下一次。
+
+    尝试全部耗尽时抛 `_CopilotAttemptFailed`，`reason` 为最后一次的失败理由，
+    由调用方翻译成各自协议下的错误（流式 → JSON 错误帧；非流式 → HTTP 502）。
+    """
+    last_err = "no attempt made"
+    for attempt_index in range(max_attempts):
+        if attempt_index > 0:
+            await asyncio.sleep(backoff)
+        client = client_factory()
+        try:
+            async for chunk in attempt_fn(client, attempt_index):
+                yield chunk
+            return
+        except _CopilotAttemptFailed as e:
+            last_err = e.reason
+        except _COPILOT_RETRY_EXCEPTIONS as e:
+            last_err = str(e)
+        finally:
+            await client.aclose()
+    raise _CopilotAttemptFailed(last_err)
+
+
+def _copilot_messages_client() -> httpx.AsyncClient:
+    """分支 B 上游客户端：长响应超时 300s、连接 10s，`trust_env=False` 绕开系统代理。"""
+    return httpx.AsyncClient(timeout=httpx.Timeout(300.0, connect=10.0), trust_env=False)
+
+
 @app.post("/v1/messages")
 async def create_message(request: MessagesRequest, raw_request: Request):
     request_id = _request_id_from_headers(raw_request)
@@ -3603,11 +3419,20 @@ async def create_message(request: MessagesRequest, raw_request: Request):
                 _resp = await client.send(_req, stream=_is_stream)
                 if _is_stream:
                     async def _models_stream():
+                        # 用 _SseLineBuffer 重组跨 chunk 半截帧后再透传（只重组不改写内容）：
+                        # 下游本地端口已按 normalizeSse 处理过字段，此处不再清洗（避免双重处理），
+                        # 但转发本地端口同样可能被 TCP 切帧，重组保证客户端收到的始终是完整 SSE 行。
+                        line_buf = _SseLineBuffer()
                         try:
                             async for chunk in _resp.aiter_bytes():
-                                yield chunk
+                                for line in line_buf.feed(chunk):
+                                    yield line
                         finally:
                             await _resp.aclose()
+                        # 流结束吐残留（无末尾 \n 的最后一行，正常 SSE 不应出现，防御性透传）
+                        tail = line_buf.flush()
+                        if tail:
+                            yield tail
                         yield b"data: [DONE]\n\n"
                     return StreamingResponse(_models_stream(), media_type="text/event-stream")
                 _body_bytes = await _resp.aread()
@@ -3616,6 +3441,24 @@ async def create_message(request: MessagesRequest, raw_request: Request):
                 except Exception:
                     return JSONResponse(content={"error": {"type": "proxy_error", "message": "upstream invalid response"}}, status_code=502)
                 if _resp.status_code >= 400:
+                    # 与 _handle_target_request 统一：先经 _map_upstream_error 识别限流特征
+                    # （翻译为标准 429 + rate_limit_error，让客户端按标准错误重试/降级），
+                    # 未命中再原样透传上游错误体与状态码。
+                    mapped_err = _map_upstream_error(_body_bytes.decode("utf-8", "replace"))
+                    if mapped_err is not None:
+                        _tgt_status, _err_type = mapped_err
+                        logger.info(f"[/v1/messages] translated HTTP {_resp.status_code} → {_tgt_status} ({_err_type})")
+                        return JSONResponse(
+                            content={
+                                "error": {
+                                    "type": _err_type,
+                                    "message": "Upstream temporarily over capacity.",
+                                    "original_status": _resp.status_code,
+                                }
+                            },
+                            status_code=_tgt_status,
+                            headers={"Retry-After": str(_VENDOR_RETRY_AFTER)},
+                        )
                     return JSONResponse(content=_openai_resp, status_code=_resp.status_code)
                 _anthropic_resp = convert_openai_response_to_anthropic(_openai_resp, original_model)
                 return JSONResponse(content=_anthropic_resp, status_code=_resp.status_code)
@@ -3647,48 +3490,56 @@ async def create_message(request: MessagesRequest, raw_request: Request):
             )
 
             if copilot_msgs_body.get("stream"):
-                async def copilot_messages_stream():
-                    last_err = None
-                    for attempt in range(3):
-                        if attempt > 0:
-                            await asyncio.sleep(0.5)
-                        client = httpx.AsyncClient(timeout=httpx.Timeout(300.0, connect=10.0), trust_env=False)
-                        try:
-                            async with client.stream("POST", copilot_msgs_url, json=copilot_msgs_body, headers=copilot_headers) as resp:
-                                if resp.status_code >= 500:
-                                    await resp.aread()
-                                    last_err = f"upstream {resp.status_code}"
-                                    continue
-                                async for chunk in resp.aiter_bytes():
-                                    yield chunk
-                                return
-                        except (httpx.ConnectError, httpx.ReadError, httpx.RemoteProtocolError) as e:
-                            last_err = str(e)
-                            continue
-                        finally:
-                            await client.aclose()
-                    yield json.dumps({"error": {"type": "proxy_error", "message": f"copilot /v1/messages upstream unavailable: {last_err}"}}).encode()
+                async def _copilot_stream_attempt(client: httpx.AsyncClient, _attempt: int) -> AsyncIterator[bytes]:
+                    """一次流式尝试：5xx 读干上游后声明失败重试，否则逐 chunk 原样透传。"""
+                    async with client.stream("POST", copilot_msgs_url, json=copilot_msgs_body, headers=copilot_headers) as resp:
+                        if _copilot_status_retryable(resp.status_code):
+                            # 必须读干，否则连接无法干净复用/关闭
+                            await resp.aread()
+                            raise _CopilotAttemptFailed(f"upstream {resp.status_code}")
+                        async for chunk in resp.aiter_bytes():
+                            yield chunk
+
+                async def copilot_messages_stream() -> AsyncIterator[bytes]:
+                    try:
+                        async for chunk in _retry_copilot_messages_request(
+                            _copilot_messages_client, _copilot_stream_attempt
+                        ):
+                            yield chunk
+                    except _CopilotAttemptFailed as e:
+                        # 流式头已发出，无法再改状态码：以裸 JSON 错误对象收尾（现状行为）
+                        yield json.dumps({"error": {"type": "proxy_error", "message": f"copilot /v1/messages upstream unavailable: {e.reason}"}}).encode()
+
                 return StreamingResponse(copilot_messages_stream(), media_type="text/event-stream")
             else:
-                last_err = None
-                for attempt in range(3):
-                    if attempt > 0:
-                        await asyncio.sleep(0.5)
-                    try:
-                        async with httpx.AsyncClient(timeout=httpx.Timeout(300.0, connect=10.0), trust_env=False) as client:
-                            resp = await client.post(copilot_msgs_url, json=copilot_msgs_body, headers=copilot_headers)
-                            if resp.status_code >= 500 and attempt < 2:
-                                last_err = f"upstream {resp.status_code}"
-                                continue
-                            resp_data = resp.json()
-                            # 还原 Claude Code 原始模型名
-                            if isinstance(resp_data, dict) and "model" in resp_data:
-                                resp_data["model"] = original_model
-                            return JSONResponse(content=resp_data, status_code=resp.status_code)
-                    except (httpx.ConnectError, httpx.ReadError, httpx.RemoteProtocolError) as e:
-                        last_err = str(e)
-                        continue
-                raise HTTPException(status_code=502, detail=f"copilot /v1/messages upstream unavailable: {last_err}")
+                # 非流式无字节可产出：成功的响应经闭包交回，由本作用域翻译为 JSONResponse
+                final_resp: Dict[str, httpx.Response] = {}
+
+                async def _copilot_post_attempt(client: httpx.AsyncClient, attempt_index: int) -> AsyncIterator[bytes]:
+                    """一次非流式尝试：5xx 且还有剩余次数则重试；最后一次直接回传上游响应。"""
+                    resp = await client.post(copilot_msgs_url, json=copilot_msgs_body, headers=copilot_headers)
+                    if _copilot_status_retryable(resp.status_code) and attempt_index < _COPILOT_MESSAGES_MAX_ATTEMPTS - 1:
+                        raise _CopilotAttemptFailed(f"upstream {resp.status_code}")
+                    final_resp["resp"] = resp
+                    # 非流式不向下游产出字节，交回响应即算本次尝试终结；
+                    # 空序列上的 yield 只为满足骨架的异步生成器契约（循环体永不执行）
+                    for _no_bytes in ():
+                        yield _no_bytes
+
+                try:
+                    async for _ in _retry_copilot_messages_request(
+                        _copilot_messages_client, _copilot_post_attempt
+                    ):
+                        pass
+                except _CopilotAttemptFailed as e:
+                    raise HTTPException(status_code=502, detail=f"copilot /v1/messages upstream unavailable: {e.reason}")
+
+                resp = final_resp["resp"]
+                resp_data = resp.json()
+                # 还原 Claude Code 原始模型名
+                if isinstance(resp_data, dict) and "model" in resp_data:
+                    resp_data["model"] = original_model
+                return JSONResponse(content=resp_data, status_code=resp.status_code)
 
         # Convert Anthropic request to LiteLLM format
         litellm_request = convert_anthropic_to_litellm(request)
