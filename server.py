@@ -751,6 +751,10 @@ _HANDLER_PATH_MAP = {
         "/v1/models": "/models",
         "/v1/responses": "/responses",
     },
+    "deepseek": {
+        "/v1/chat/completions": "/chat/completions",
+        "/v1/models": "/models",
+    },
 }
 
 
