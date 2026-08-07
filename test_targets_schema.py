@@ -673,5 +673,42 @@ def test_get_target_models_aggregator():
         restore()
 
 
+# ─── P2: DeepSeek handler 进入 VALID_HANDLERS（RED：handler="deepseek" 尚未注册）───
+def test_validate_deepseek_handler():
+    """handler="deepseek" 的合法 target 应通过 validate_targets（返回 []）。
+
+    当前 VALID_HANDLERS = ("passthrough", "copilot", "qclaw",
+    "gemini-native", "trae-work", "aggregator") 不含 "deepseek"，
+    所以 validate_targets 会报 targets[0].handler 非法 → 返回非空错误列表
+    → 断言 == [] 失败 → RED。后续任务需在 config_store 注册该 handler。
+    """
+    target = {"label": "deepseek", "listenPort": 8095, "category": "free",
+              "handler": "deepseek", "targetHost": "api.deepseek.com",
+              "targetPort": 443, "targetProtocol": "https", "enabled": True}
+    cfg = {"targets": [target]}
+    errors = validate_targets(cfg)
+    assert errors == [], f"deepseek handler 应被接受，实际报错: {errors}"
+    print("PASS test_validate_deepseek_handler: deepseek handler accepted by validate_targets")
+
+
+# ─── P3: DeepSeek 直连网关路径重写（RED：_HANDLER_PATH_MAP 尚未含 "deepseek" 键）───
+def test_deepseek_path_rewrite():
+    """deepseek handler 应把 /v1 前缀重写为 DeepSeek 上游路径（无 /v1）。
+
+    DeepSeek 上游 API 是 https://api.deepseek.com（无 /v1 前缀），
+    端点 POST /chat/completions、GET /models。
+    当前 _HANDLER_PATH_MAP 无 "deepseek" 键，_rewrite_upstream_path 走
+    routePrefix 空分支返回原样 /v1/chat/completions → 与期望不等 → RED。
+    """
+    import server as _srv
+    got_chat = _srv._rewrite_upstream_path("deepseek", "/v1/chat/completions", "")
+    assert got_chat == "/chat/completions", \
+        f"deepseek /v1/chat/completions 应重写为 /chat/completions，实际: {got_chat!r}"
+    got_models = _srv._rewrite_upstream_path("deepseek", "/v1/models", "")
+    assert got_models == "/models", \
+        f"deepseek /v1/models 应重写为 /models，实际: {got_models!r}"
+    print("PASS test_deepseek_path_rewrite: deepseek path rewrite correct")
+
+
 if __name__ == "__main__":
     main()
