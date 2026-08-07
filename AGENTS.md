@@ -9,7 +9,7 @@
 
 **claude-code-proxy** 是一个 FastAPI 代理服务，让 Anthropic 客户端（如 Claude Code）能用多种后端（OpenAI / Gemini / Copilot Enterprise / QClaw / CodeBuddy / Trae Work）。
 
-- **主入口**：`server.py`（框架层 + 入口，~5500 行）多模块架构：框架层（server.py）+ 网关实现层（`gateways/`）+ 管理面板层（`dashboard/`）。**配置驱动**——所有端口/供应商/模型由 `targets.json` 定义，改配置不动 server.py；改具体网关注辑进 `gateways/<网关>.py`，改 dashboard 进 `dashboard/routes.py`
+- **主入口**：`server.py`（框架层 + 入口，~4200 行，已下沉 HTTP 引擎/翻译层/模型注册表/错误翻译到 `server_http.py` 与 `gateways/*`）+ 网关实现层（`gateways/`）+ 管理面板层（`dashboard/`）。**配置驱动**——所有端口/供应商/模型由 `targets.json` 定义，改配置不动 server.py；改具体网关注辑进 `gateways/<网关>.py`，改 dashboard 进 `dashboard/routes.py`
 - **依赖**：Python 3.10+ / fastapi / uvicorn / httpx / litellm / python-dotenv / tiktoken / pydantic（虚拟环境 `.venv/`，Windows 用 `.venv\Scripts\python.exe`）
 - **配置模块**：`config_store.py`（targets.json 加载/迁移/校验、secrets.json 读写、热重载）
 
@@ -170,12 +170,16 @@ tail -f codebuddy.log                 # 查
 
 ## 7. 代码结构（多模块）
 
-> 2026-08-06 从单文件拆分（原 server.py 10996 行）。三层架构：框架层（server.py）/ 网关实现层（gateways/）/ 管理面板层（dashboard/）。行号随版本漂移，实际位置用 `grep` 定位，不建议依赖行号。
+> 从单文件（原 server.py 10996 行）逐步拆分。当前为四层架构：框架层（server.py + server_http.py）/ 网关实现层（gateways/）/ 管理面板层（dashboard/routes.py）/ 破解层（crack_*.py）。行号随版本漂移，实际位置用 `grep` 定位，不建议依赖行号。
 
 ### 目录结构
 
-- **server.py**（框架层 + 入口，~5500 行）：连接池、日志基础设施、HTTP 转发引擎核心工具（`_parse_http_request`/`_write_response`/`_SseLineBuffer`）、路径重写（`_HANDLER_PATH_MAP`）、Provider 策略注册表（`_PROVIDER_STRATEGIES`）、Anthropic Pydantic 模型、Anthropic↔LiteLLM 翻译层、核心 API 端点（`/v1/chat/completions`、`/v1/messages`）、ModelRegistry、配置热重载、多端口分发核心（`_handle_target_request`/`_vendor_server`）、catch_all 兜底
+- **server.py**（框架层 + 入口，~4200 行）：连接池、日志基础设施、路径重写（`_HANDLER_PATH_MAP`）、Anthropic Pydantic 模型、核心 API 端点（`/v1/chat/completions`、`/v1/messages`）、配置热重载、多端口分发核心（`_handle_target_request`/`_vendor_server`）、catch_all 兜底。已下沉的部分：HTTP 引擎→`server_http.py`、翻译层→`gateways/translate.py`、模型注册表→`gateways/models.py`、错误翻译→`gateways/errors.py`（server.py 顶部 re-export 这些符号，历史调用点零改动）
   - ⚠️ 顶部有主模块别名代码（`if __name__ == "__main__" and "server" not in sys.modules: sys.modules["server"] = sys.modules["__main__"]`），**禁止删除**（防止 gateways/dashboard 的延迟 import 触发 server 双加载）
+- **server_http.py**（~370 行）：HTTP 转发引擎核心工具（`_parse_http_request`/`_write_response`/`_SseLineBuffer`/`_write_error_response`/`_write_response_with_status_override`）。server.py 通过 re-export 保持 `from server import _write_response` 对 gateways/* 继续有效
+- **gateways/translate.py**（~370 行）：翻译层——`_PROVIDER_STRATEGIES` 全族 + OAI↔Anthropic 转换（`_convert_oai_to_anthropic`）+ token 估算族 + `_close_json_fragment`/`clean_gemini_schema`。provider 策略字典用 PEP 562 惰性引用避免循环导入
+- **gateways/models.py**（~680 行）：模型注册表全族（`_get_target_models`/`_build_models_list`/`_fetch_downstream_models`/`_fetch_live_models`/`_scan_dangling_refs`/`ModelRegistry` 等）。跨模块依赖：函数内 `from server import X` 延迟导入 + `import server as _srv` 访问热重载全局（`_TARGETS`/`_SECRETS`/`_MODELS_CFG`）；`_DOWNSTREAM_MODELS_CACHE` 归本模块所有，server.py 经 `import gateways.models as _gmodels` 实时读取
+- **gateways/errors.py**（~100 行）：错误翻译族（`_map_upstream_error`/`_vendor_body_retryable`/`_is_rate_limit_error`/`_is_auth_expired_error` + `_VENDOR_ERROR_MAPS`/`_VENDOR_ERROR_PATTERNS`/`_VENDOR_RETRY_AFTER`）
 - **gateways/qclaw.py**：QClaw 解密 + body 清洗 + 透传（`_qclaw_provider`）；改 QClaw 逻辑进这里
 - **gateways/codebuddy.py**：CodeBuddy body 清洗 + 流聚合 + SSE 规范化；改 CodeBuddy 逻辑进这里
 - **gateways/trae_work.py**：Trae Work 协议转换 + DSML 解析器族（含 5 套工具调用文本标记解析器，最大网关）；改 Trae Work 逻辑进这里
@@ -184,8 +188,9 @@ tail -f codebuddy.log                 # 查
 - **gateways/aggregator/engine.py**：聚合网关纯引擎逻辑（`AggregatorEngine`，路由 / 会话粘性 / 熔断 / 降级）
 - **gateways/aggregator/http_adapter.py**：聚合网关 HTTP 适配（`_handle_aggregate_request`/`_aggregator_prober`）
   - ⚠️ `_AGGREGATOR_ENGINE` 全局通过 `import server as _srv` + `_srv._AGGREGATOR_ENGINE` 模块属性共享
-- **dashboard/routes.py**：管理面板全套（`DASHBOARD_STYLE` + HTML 渲染 + 18 个 `/api/*` 路由，FastAPI `APIRouter`，server.py 里 `app.include_router(dashboard_router)` 挂载）；改 dashboard 进这里
-- **config_store.py**：`targets.json` 加载/迁移/校验、secrets.json 读写、热重载（独立模块，未拆分）
+- **dashboard/routes.py**（~3200 行）：管理面板全套（`DASHBOARD_STYLE` + HTML 渲染 + 18 个 `/api/*` 路由，FastAPI `APIRouter`，server.py 里 `app.include_router(dashboard_router)` 挂载）；改 dashboard 进这里
+  - ⚠️ **当前最大单一文件**，下一步瘦身头号目标（HTML 渲染 / 各 `/api/*` 路由可按卡片拆分到 `dashboard/` 子模块）
+- **config_store.py**（~360 行）：`targets.json` 加载/迁移/校验、secrets.json 读写、热重载（独立模块）
 
 ### 跨模块约定（新增，拆分后必须遵守）
 
