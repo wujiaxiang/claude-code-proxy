@@ -1,6 +1,6 @@
 # DESIGN.md — LLM Gateway Dashboard
 
-> 本项目 UI 为 FastAPI 服务端渲染单页（`server.py` 内嵌 HTML/CSS/JS，非 React）。
+> 本项目 UI 为 FastAPI 服务端渲染单页（`dashboard/frontend.py` 内嵌 HTML/CSS/JS，非 React）。
 > 本文档是 dashboard 的设计契约：所有颜色、字体、间距、组件模式必须追溯到此文件。
 
 ## 1. 设计定位
