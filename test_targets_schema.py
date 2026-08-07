@@ -253,6 +253,142 @@ def test_validate_targets_model_path():
         f"应有 path 指向 models[1]，实际 paths={sorted(_paths(errors))}"
 
 
+# ─── 顶层 server 段 schema ───
+def _load_cfg_with(raw: dict) -> dict:
+    """把 raw 写入临时 JSON 后 load_targets（绝不碰仓库 targets.json）。"""
+    with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
+        json.dump(raw, f)
+        p = Path(f.name)
+    try:
+        return config_store.load_targets(p)
+    finally:
+        p.unlink(missing_ok=True)
+
+
+def test_server_section_defaults_when_absent():
+    """缺失 server 段 → load_targets 返回完整默认（7 顶层键 + 关键默认值）。"""
+    cfg = _load_cfg_with({"targets": [], "modelDefaults": {"defaultPort": 8082}, "models": []})
+    srv = cfg["server"]
+    assert set(srv) == set(config_store.DEFAULT_SERVER_CONFIG), \
+        f"server 顶层键应与 DEFAULT_SERVER_CONFIG 一致，实际 {sorted(srv)}"
+    assert len(srv) == 7, f"server 应有 7 个顶层键，实际 {len(srv)}: {sorted(srv)}"
+    assert srv["listenPort"] == 8081, srv["listenPort"]
+    assert srv["preferredProvider"] == "openai", srv["preferredProvider"]
+    assert srv["log"]["file"] == "", repr(srv["log"]["file"])
+    assert srv["log"]["debug"] is False, srv["log"]["debug"]
+    assert srv["copilot"]["gheHost"] == "copilot-api.bmw.ghe.com", srv["copilot"]["gheHost"]
+    assert "mmgrcalltoken" in srv["qclaw"]["baseUrl"], srv["qclaw"]["baseUrl"]
+    assert srv["cache"]["enabled"] is True and srv["cache"]["maxSize"] == 500, srv["cache"]
+    assert srv["legacyModels"] == {"big": "gpt-4.1", "medium": "gpt-4.1", "small": "gpt-4.1-mini"}, \
+        srv["legacyModels"]
+
+
+def test_server_section_deep_merge_log():
+    """部分 server.log → 只覆盖 debug，其余 log 子键全默认，其他顶层段也全默认。"""
+    cfg = _load_cfg_with({"targets": [], "server": {"log": {"debug": True}}})
+    srv = cfg["server"]
+    assert srv["log"]["debug"] is True, srv["log"]
+    assert srv["log"]["file"] == "", srv["log"]
+    assert srv["log"]["retentionDays"] == 7, srv["log"]
+    assert srv["log"]["rotateWhen"] == "midnight", srv["log"]
+    assert srv["log"]["rotateInterval"] == 1, srv["log"]
+    assert srv["listenPort"] == 8081, "未提供的顶层标量应取默认"
+    assert srv["cache"] == config_store.DEFAULT_SERVER_CONFIG["cache"], srv["cache"]
+
+
+def test_server_section_deep_merge_copilot():
+    """部分 server.copilot → 只覆盖 gheHost，其余 copilot 子键默认。"""
+    cfg = _load_cfg_with({"targets": [], "server": {"copilot": {"gheHost": "x.example.com"}}})
+    cop = cfg["server"]["copilot"]
+    assert cop["gheHost"] == "x.example.com", cop
+    assert cop["integrationId"] == "copilot-developer-cli", cop
+    assert cop["bigModel"] == "claude-sonnet-4.6", cop
+    assert cop["mediumModel"] == "claude-sonnet-4.6", cop
+    assert cop["smallModel"] == "claude-haiku-4.5", cop
+    assert cfg["server"]["log"] == config_store.DEFAULT_SERVER_CONFIG["log"], cfg["server"]["log"]
+
+
+def test_validate_server_section_clean_passes():
+    """合并出的默认 server 段 → 校验无错误。"""
+    cfg = {"targets": [], "modelDefaults": {"defaultPort": 8082}, "models": [],
+           "server": config_store._merge_server_config({})}
+    errors = validate_targets(cfg)
+    assert errors == [], f"合法 server 段不应有错误，实际: {errors}"
+
+
+def _server_errors(server):
+    """只带 server 段跑校验，返回结构化错误列表。"""
+    return validate_targets({"targets": [], "models": [], "server": server})
+
+
+def test_validate_server_type_errors():
+    """server 段各类型错误 → path/msg 精确匹配。"""
+    cases = [
+        ({"cache": {"maxSize": "abc"}}, "server.cache.maxSize",
+         "server.cache.maxSize must be a non-negative integer"),
+        ({"listenPort": "abc"}, "server.listenPort",
+         "server.listenPort must be a non-negative integer"),
+        ({"log": {"debug": "yes"}}, "server.log.debug",
+         "server.log.debug must be a boolean"),
+        ("nope", "server", "server must be an object"),
+    ]
+    for server, want_path, want_msg in cases:
+        errors = _server_errors(server)
+        _assert_structured(errors, f"server={server!r}")
+        assert want_path in _paths(errors), \
+            f"server={server!r} 应报 path={want_path}，实际 {sorted(_paths(errors))}"
+        assert any(e["path"] == want_path and e["msg"] == want_msg for e in errors), \
+            f"server={server!r} 应报 msg={want_msg!r}，实际 {errors}"
+
+
+def test_validate_server_preferred_provider():
+    """server.preferredProvider 非法枚举 → 报错且 msg 列出合法值；合法值不报错。"""
+    errors = _server_errors({"preferredProvider": "foo"})
+    _assert_structured(errors, "preferredProvider=foo")
+    assert "server.preferredProvider" in _paths(errors), sorted(_paths(errors))
+    msg = next(e["msg"] for e in errors if e["path"] == "server.preferredProvider")
+    assert msg.startswith("server.preferredProvider must be one of"), msg
+    assert "openai" in msg and "anthropic" in msg, msg
+    assert _server_errors({"preferredProvider": "openai"}) == [], "合法 provider 不应报错"
+
+
+def test_validate_server_legacy_models_type_error():
+    """server.legacyModels.big 为 int → 非空字符串错误；legacyModels 非 dict → object 错误。"""
+    errors = _server_errors({"legacyModels": {"big": 123}})
+    _assert_structured(errors, "legacyModels.big=123")
+    assert any(e["path"] == "server.legacyModels.big"
+               and e["msg"] == "server.legacyModels.big must be a non-empty string"
+               for e in errors), errors
+    errors2 = _server_errors({"legacyModels": "nope"})
+    assert any(e["path"] == "server.legacyModels"
+               and e["msg"] == "server.legacyModels must be an object"
+               for e in errors2), errors2
+
+
+def test_validate_server_listen_port_vs_target_port_current_behavior():
+    """现状记录：validate_targets 只查 target 之间端口重复，不查与 server.listenPort 冲突。
+
+    读 config_store.validate_targets 确认：ports dict 仅由 targets 填充，
+    server.listenPort 未参与冲突检测。此测试锁定当前行为，若将来实现冲突校验会变红提醒。
+    """
+    tgt = {"category": "free", "handler": "passthrough", "targetHost": "x.com", "models": []}
+    # 不冲突（target 8090 vs server 8081）→ 无错误
+    no_conflict = {"targets": [{"label": "a", "listenPort": 8090, **tgt}], "models": [],
+                   "server": {"listenPort": 8081}}
+    assert validate_targets(no_conflict) == [], \
+        f"不冲突时不应报错，实际: {validate_targets(no_conflict)}"
+    # 冲突（target 8081 == server.listenPort 8081）→ 现状不报错
+    conflict = {"targets": [{"label": "a", "listenPort": 8081, **tgt}], "models": [],
+                "server": {"listenPort": 8081}}
+    assert validate_targets(conflict) == [], \
+        f"现状：server.listenPort 与 target 端口冲突不报错，实际: {validate_targets(conflict)}"
+    # 对照：两个 target 端口重复仍报错（证明端口检测本身生效）
+    dup = {"targets": [{"label": "a", "listenPort": 8081, **tgt},
+                       {"label": "b", "listenPort": 8081, **tgt}], "models": []}
+    assert any(e["path"] == "targets[1].listenPort" for e in validate_targets(dup)), \
+        f"target 间端口重复应报错，实际: {validate_targets(dup)}"
+
+
 # ─── secrets 读写与打码 ───
 def test_secrets_roundtrip():
     with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:

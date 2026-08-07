@@ -20,6 +20,66 @@ VALID_HANDLERS = ("passthrough", "copilot", "qclaw", "gemini-native", "trae-work
 
 _REQUIRED_FIELDS = ("label", "listenPort", "category", "handler", "targetHost")
 
+# 顶层 server 段默认配置（.env 并入 targets.json 的单一事实源）。
+# 用户 server 段与此做一层深合并：顶层子键缺失补默认，嵌套 dict 的键缺失补默认。
+DEFAULT_SERVER_CONFIG = {
+    "listenPort": 8081,               # 原 ANTHROPIC_PORT env
+    "preferredProvider": "openai",    # 原 PREFERRED_PROVIDER env
+    "legacyModels": {                 # 原 BIG_MODEL/MEDIUM_MODEL/SMALL_MODEL env（仍被模型映射消费）
+        "big": "gpt-4.1",
+        "medium": "gpt-4.1",
+        "small": "gpt-4.1-mini",
+    },
+    "log": {                          # 原 DEBUG/LOG_FILE/LOG_RETENTION_DAYS/LOG_ROTATE_WHEN/LOG_ROTATE_INTERVAL
+        "debug": False,
+        "file": "",
+        "retentionDays": 7,
+        "rotateWhen": "midnight",
+        "rotateInterval": 1,
+    },
+    "cache": {                        # 原 CACHE_ENABLED/CACHE_MAX_SIZE/CACHE_TTL_SECONDS/CACHE_MAX_ITEM_SIZE_KB
+        "enabled": True,
+        "maxSize": 500,
+        "ttlSeconds": 3600,
+        "maxItemSizeKb": 100,
+    },
+    "copilot": {                      # 原 COPILOT_GHE_HOST/COPILOT_INTEGRATION_ID/COPILOT_BIG|MEDIUM|SMALL_MODEL
+        "gheHost": "copilot-api.bmw.ghe.com",
+        "integrationId": "copilot-developer-cli",
+        "bigModel": "claude-sonnet-4.6",
+        "mediumModel": "claude-sonnet-4.6",
+        "smallModel": "claude-haiku-4.5",
+    },
+    "qclaw": {                        # 原 QCLAW_BASE_URL（QCLAW_API_KEY 是私密凭据，留在 secrets.json）
+        "baseUrl": "https://mmgrcalltoken.3g.qq.com/aizone/v1",
+    },
+}
+
+# anthropic-compatible 入口端口：与 server.py 的 _ANTHROPIC_PORT 默认值同源，
+# 统一从 DEFAULT_SERVER_CONFIG 派生（单一事实源，勿再硬编码 8081）。
+ANTHROPIC_PORT = DEFAULT_SERVER_CONFIG["listenPort"]
+
+# server 段嵌套 dict 子键（做一层深合并）
+_SERVER_DICT_KEYS = ("legacyModels", "log", "cache", "copilot", "qclaw")
+
+
+def _merge_server_config(user_server: dict) -> dict:
+    """把用户 server 段深合并到 DEFAULT_SERVER_CONFIG 上（一层深合并，不递归）。
+
+    顶层子键缺失用默认；嵌套 dict（legacyModels/log/cache/copilot/qclaw）键缺失补默认。
+    """
+    merged = {}
+    for key, default_val in DEFAULT_SERVER_CONFIG.items():
+        if isinstance(default_val, dict):
+            user_sub = user_server.get(key)
+            sub = dict(default_val)
+            if isinstance(user_sub, dict):
+                sub.update(user_sub)
+            merged[key] = sub
+        else:
+            merged[key] = user_server.get(key, default_val)
+    return merged
+
 
 def load_targets(path: Path = TARGETS_PATH) -> dict:
     """加载 targets.json，兼容旧数组格式，自动迁移为新对象格式。"""
@@ -28,10 +88,12 @@ def load_targets(path: Path = TARGETS_PATH) -> dict:
             raw = json.load(f)
     except FileNotFoundError:
         logger.warning(f"targets.json not found: {path}, using empty config")
-        return {"targets": [], "modelDefaults": {"defaultPort": 8082}, "models": []}
+        return {"targets": [], "modelDefaults": {"defaultPort": 8082}, "models": [],
+                "server": _merge_server_config({})}
     except json.JSONDecodeError as e:
         logger.error(f"targets.json invalid JSON: {e}")
-        return {"targets": [], "modelDefaults": {"defaultPort": 8082}, "models": []}
+        return {"targets": [], "modelDefaults": {"defaultPort": 8082}, "models": [],
+                "server": _merge_server_config({})}
 
     if isinstance(raw, list):
         # 旧格式：数组 → 迁移
@@ -46,7 +108,8 @@ def load_targets(path: Path = TARGETS_PATH) -> dict:
                 "isFree": t.get("isFree", category == "free"),
                 "enabled": t.get("enabled", True),
             })
-        cfg = {"targets": migrated, "modelDefaults": {"defaultPort": 8082}, "models": []}
+        cfg = {"targets": migrated, "modelDefaults": {"defaultPort": 8082}, "models": [],
+               "server": _merge_server_config({})}
         try:
             save_targets(cfg, path)  # 回写迁移结果
             logger.info(f"targets.json migrated to new format: {path}")
@@ -66,10 +129,13 @@ def load_targets(path: Path = TARGETS_PATH) -> dict:
             "isFree": t.get("isFree", category == "free"),
             "enabled": t.get("enabled", True),
         })
+    user_server = raw.get("server")
     result = {
         "targets": normalized,
         "modelDefaults": raw.get("modelDefaults", {"defaultPort": 8082}),
         "models": raw.get("models", []),
+        "server": _merge_server_config(user_server) if isinstance(user_server, dict)
+                  else _merge_server_config({}),
     }
     return result
 
@@ -130,7 +196,99 @@ def validate_targets(cfg: dict) -> list:
     # models 结构校验与全局唯一性
     _validate_models(cfg.get("models", []), errors)
 
+    # server 段校验（缺失/空 dict 不报错，默认值兜底）
+    _validate_server_config(cfg.get("server"), errors)
+
     return errors
+
+
+_VALID_PROVIDERS = ("openai", "anthropic", "qclaw", "gemini", "gemini-openai", "copilot")
+
+
+def _validate_server_config(server, errors: list) -> None:
+    """校验顶层 server 段（缺失或空 dict 不报错，默认值兜底）。"""
+    if server is None:
+        return
+    if not isinstance(server, dict):
+        _err(errors, "server", "server must be an object")
+        return
+    if not server:
+        return
+
+    port = server.get("listenPort")
+    if port is not None and (isinstance(port, bool) or not isinstance(port, int) or port < 0):
+        _err(errors, "server.listenPort", "server.listenPort must be a non-negative integer")
+
+    provider = server.get("preferredProvider")
+    if provider is not None:
+        if not isinstance(provider, str) or provider not in _VALID_PROVIDERS:
+            _err(errors, "server.preferredProvider",
+                 f"server.preferredProvider must be one of {_VALID_PROVIDERS}")
+
+    def _non_empty_str(section: dict, key: str, path: str) -> None:
+        v = section.get(key)
+        if v is not None and (not isinstance(v, str) or not v):
+            _err(errors, path, f"{path} must be a non-empty string")
+
+    legacy = server.get("legacyModels")
+    if legacy is not None:
+        if not isinstance(legacy, dict):
+            _err(errors, "server.legacyModels", "server.legacyModels must be an object")
+        else:
+            for k in ("big", "medium", "small"):
+                _non_empty_str(legacy, k, f"server.legacyModels.{k}")
+
+    log = server.get("log")
+    if log is not None:
+        if not isinstance(log, dict):
+            _err(errors, "server.log", "server.log must be an object")
+        else:
+            dbg = log.get("debug")
+            if dbg is not None and not isinstance(dbg, bool):
+                _err(errors, "server.log.debug", "server.log.debug must be a boolean")
+            f = log.get("file")
+            if f is not None and not isinstance(f, str):
+                _err(errors, "server.log.file", "server.log.file must be a string")
+            rd = log.get("retentionDays")
+            if rd is not None and (isinstance(rd, bool) or not isinstance(rd, int) or rd < 0):
+                _err(errors, "server.log.retentionDays",
+                     "server.log.retentionDays must be a non-negative integer")
+            rw = log.get("rotateWhen")
+            if rw is not None and not isinstance(rw, str):
+                _err(errors, "server.log.rotateWhen", "server.log.rotateWhen must be a string")
+            ri = log.get("rotateInterval")
+            if ri is not None and (isinstance(ri, bool) or not isinstance(ri, int) or ri <= 0):
+                _err(errors, "server.log.rotateInterval",
+                     "server.log.rotateInterval must be a positive integer")
+
+    cache = server.get("cache")
+    if cache is not None:
+        if not isinstance(cache, dict):
+            _err(errors, "server.cache", "server.cache must be an object")
+        else:
+            en = cache.get("enabled")
+            if en is not None and not isinstance(en, bool):
+                _err(errors, "server.cache.enabled", "server.cache.enabled must be a boolean")
+            for k in ("maxSize", "ttlSeconds", "maxItemSizeKb"):
+                v = cache.get(k)
+                if v is not None and (isinstance(v, bool) or not isinstance(v, int) or v < 0):
+                    _err(errors, f"server.cache.{k}",
+                         f"server.cache.{k} must be a non-negative integer")
+
+    copilot = server.get("copilot")
+    if copilot is not None:
+        if not isinstance(copilot, dict):
+            _err(errors, "server.copilot", "server.copilot must be an object")
+        else:
+            for k in ("gheHost", "integrationId", "bigModel", "mediumModel", "smallModel"):
+                _non_empty_str(copilot, k, f"server.copilot.{k}")
+
+    qclaw = server.get("qclaw")
+    if qclaw is not None:
+        if not isinstance(qclaw, dict):
+            _err(errors, "server.qclaw", "server.qclaw must be an object")
+        else:
+            _non_empty_str(qclaw, "baseUrl", "server.qclaw.baseUrl")
 
 
 def _validate_models(models: list, errors: list) -> None:
@@ -213,8 +371,6 @@ def _resolve_model_alias(models, requested_model: str) -> Optional[dict]:
 
 
 
-
-ANTHROPIC_PORT = 8081  # 从 server.py:2891 的 _ANTHROPIC_PORT = int(os.environ.get("ANTHROPIC_PORT", "8081")) 同源默认值
 
 def _validate_aggregator_target(t: dict, label: str, base: str, errors: list) -> None:
     """校验聚合网关 target：virtualModels / poolDefaults / quotaErrorPatterns。
