@@ -610,7 +610,7 @@ def test_api_aggregate_status_returns_tripped_at():
 
 
 def test_config_export_complete():
-    """全量配置导出：单 JSON 含 targets/secrets/env 三段，且覆盖全部 11 个 target。"""
+    """全量配置导出：单 JSON 含 targets（含 server 段）/secrets 两段，覆盖全部 11 个 target。"""
     conn = http.client.HTTPConnection("127.0.0.1", 8081, timeout=15)
     conn.request("GET", "/api/config/export")
     resp = conn.getresponse()
@@ -618,17 +618,19 @@ def test_config_export_complete():
     conn.close()
     assert resp.status == 200, f"导出 HTTP {resp.status}"
     data = json.loads(body)
-    assert data.get("version") == 1, "导出应有 version=1"
+    assert data.get("version") == 2, "导出应有 version=2"
     assert data.get("exportedAt"), "导出应含 exportedAt"
-    # targets 段：完整配置对象（targets 数组 + modelDefaults）
+    # v2 架构：无独立 env 段（.env 已废弃，运行配置并入 server 段）
+    assert "env" not in data, "v2 导出不应再有独立 env 段（.env 已废弃）"
+    # targets 段：完整配置对象（targets 数组 + modelDefaults + server 段）
     assert isinstance(data.get("targets"), dict), "targets 段应为对象"
     assert len(data["targets"].get("targets", [])) >= 9, \
         f"targets 段应含全部 target（≥9），实际 {len(data['targets'].get('targets', []))}"
+    # server 段：主服务运行配置（.env 并入后的新家）
+    assert isinstance(data["targets"].get("server"), dict), "targets 段应含 server 段"
+    assert "listenPort" in data["targets"]["server"], "server 段应含 listenPort"
     # secrets 段：完整凭据对象
     assert isinstance(data.get("secrets"), dict), "secrets 段应为对象"
-    # env 段：含 COPILOT 运行配置键
-    assert isinstance(data.get("env"), dict), "env 段应为对象"
-    assert any(k.startswith("COPILOT_") for k in data["env"]), "env 段应含 COPILOT_* 键"
 
 
 def test_config_export_contains_secrets_values():
@@ -684,8 +686,8 @@ def test_config_import_roundtrip():
         result = json.loads(body)
         assert result.get("ok") is True
         assert result.get("targetsCount", 0) >= 9, "导入应返回 target 数"
-        assert result.get("restartRequired") is True, "env 段导入应提示需重启"
-        assert result.get("envWritten", 0) >= 0
+        assert result.get("restartRequired") is True, "server 段运行配置导入应提示需重启"
+        assert "envWritten" not in result, "v2 导入响应不应再有 envWritten 字段"
 
         # 验证热重载生效：/api/targets 返回的 enabled 已翻转
         conn = http.client.HTTPConnection("127.0.0.1", 8081, timeout=15)

@@ -2371,7 +2371,7 @@ function importConfigFromText(text) {{
     return;
   }}
   var label = (data && data.version !== undefined) ? ('v' + data.version + ' 配置') : '未知格式';
-  if (!confirm('⚠️ 导入 ' + label + ' 将覆盖当前 targets.json / secrets.json / .env（含全部私密凭据与端口配置）。\\n\\n此操作不可撤销，确定继续？')) return;
+  if (!confirm('⚠️ 导入 ' + label + ' 将覆盖当前 targets.json（含 server 配置）/ secrets.json（含全部私密凭据）。\\n\\n此操作不可撤销，确定继续？')) return;
   var btn = document.querySelector('.ov-actions .ov-btn-primary') || null;
   fetch('/api/config/import', {{
     method: 'POST',
@@ -2383,7 +2383,7 @@ function importConfigFromText(text) {{
     }})
     .then(function(res) {{
       if (res.ok) {{
-        setOvMsg('✅ 已导入 targets=' + res.body.targetsCount + ' secrets=' + res.body.secretsCount + ' env=' + res.body.envWritten + '（' + res.body.message + '）', 'success');
+        setOvMsg('✅ 已导入 targets=' + res.body.targetsCount + ' secrets=' + res.body.secretsCount + '（' + res.body.message + '）', 'success');
         setTimeout(function() {{ location.reload(); }}, 1500);
       }} else {{
         var detail = typeof res.body.detail === 'string' ? res.body.detail : JSON.stringify(res.body.detail);
