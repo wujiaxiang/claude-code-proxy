@@ -1,7 +1,7 @@
 [project]
 name = "anthropic-proxy"
 version = "0.1.0"
-description = "Proxy that translates between Anthropic API and LiteLLM"
+description = "Multi-backend proxy: Anthropic API entry with OpenAI-compatible gateway ports (targets.json driven)"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
@@ -9,10 +9,8 @@ dependencies = [
     "uvicorn>=0.34.0",
     "httpx>=0.25.0",
     "pydantic>=2.0.0",
-    "litellm>=1.81.0",
     "python-dotenv>=1.0.0",
-    "google-auth>=2.41.1",
-    "google-cloud-aiplatform>=1.120.0",
     "tiktoken>=0.7.0",
+    "cryptography>=42.0.0",
 ]
 
