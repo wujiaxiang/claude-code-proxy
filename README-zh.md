@@ -22,6 +22,7 @@
 | 8092 | gemini | free | **gemini-native** | OpenAI↔Gemini 原生转换 |
 | 8093 | opencode-zen | free | passthrough | OpenAI |
 | 8094 | open-go | paid | passthrough | OpenAI |
+| 8095 | deepseek | free | passthrough | OpenAI（DeepSeek 直连，`stripV1`：上游无 `/v1` 前缀） |
 
 > 权威端口表（targets.json 驱动）见 [docs/architecture.md](docs/architecture.md)。
 

@@ -16,6 +16,9 @@
 - **文档同步**：`AGENTS.md` / `README.md` / `README-zh.md` / `docs/architecture.md` 移除 LiteLLM 依赖、provider 策略机制、四个 server 段旧键的描述，8081 路由说明改为单一路径 + 404 语义
 
 ### Changed (架构统一, 2026-08-08)
+- **DeepSeek 用通用 `passthrough` + `stripV1` 表达无 `/v1` 上游**：原自定义 `deepseek` handler（仅用于路径重写）废弃，`VALID_HANDLERS` 移除 `deepseek`。DeepSeek target（8095）改用 `handler="passthrough"` + `stripV1:true`——`_rewrite_upstream_path` 新增 `stripV1` 分支，把客户端 `/v1/xxx` 剥成 `/xxx`（上游 `api.deepseek.com` 根路径直接挂 `/chat/completions`，无 `/v1`）。`routePrefix` 是替换语义无法删除 `/v1`，`stripV1` 是通用「删 /v1」表达。
+- **dashboard 分类统一**：8081 anthropic target 归入独立「Anthropic 入口」组（不再误入直连网关）；卡片由 `targets[]` 循环统一渲染（含运行状态 / 统计 / 嵌套 models 表），删除原手动 8081 卡；`_model_details_html` 兼容 `{name, aliases, target}` 路由型结构。
+- **`PUT /api/models` 保存路径修正**：模型定义写 `targets[]` 的 anthropic target 嵌套（原写顶层导致 `duplicate model name`——顶层与嵌套同名冲突）。
 - **8081 成为 `targets[]` 中一个普通 target（handler=`anthropic`）**：8081 不再是"特殊端口 + 全局配置"，而是与其他 target 一致，由 `targets[]` 里 `label`/`listenPort:8081`/`handler:"anthropic"` 的那条定义。server.py 启动时扫 `targets[]` 找 `handler=="anthropic"` 的 target 作为 Anthropic 翻译入口，`_MODELS_CFG` 从该 target 读取。
 - **dashboard + 全部 `/api/*` 管理 API 拆到独立端口 8079**：新增 `server.dashboardPort`（默认 `8079`）。dashboard 与所有 `/api/*` 路由挂在独立的 8079 app；8081 仅保留 Anthropic 翻译端点（`/v1/messages` / `count_tokens` / `/v1/models` / `/api/tags` / `/`），其 `/dashboard`、`/api/*` 请求由 `_DASHBOARD_PORT` 反向代理到 8079。dashboard 地址改为 `http://<IP>:8079/dashboard`（8081 的反向代理仍可用，属转发）。
 - **`models` / `modelDefaults` 迁入 anthropic target 嵌套**：原 `targets.json` 顶层的 `models[]` / `modelDefaults` 迁移进 `targets[]` 的 8081 anthropic target 内部；server.py 从该 target 读嵌套字段填充 `_MODELS_CFG`，顶层残留的 `models` / `modelDefaults` 不再是有效数据源（仅保留兼容加载）。dashboard「模型定义」modal 经 `GET/PUT /api/models` 读写该嵌套字段。

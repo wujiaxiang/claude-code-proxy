@@ -20,6 +20,7 @@
 | **8092** | gemini | free | **gemini-native** | OpenAI↔Gemini | **原生 Gemini 协议转换**（generateContent） |
 | **8093** | opencode-zen | free | passthrough | OpenAI | 免费透传 |
 | **8094** | open-go | paid | passthrough | OpenAI | 收费透传 |
+| **8095** | deepseek | free | passthrough | OpenAI | DeepSeek 直连透传（`stripV1:true`，上游 `api.deepseek.com` 无 `/v1` 前缀，客户端带 key） |
 
 - **分类**：`crack`（破解获取 token，注入 secrets.json）/ `free`（免费，透传客户端 key）/ `paid`（收费，透传客户端 key）/ `aggregate`（聚合网关，不持凭据）
 - **isFree**：管理界面维护，标记供应商 key 是否免费（重试策略预留字段）
@@ -79,6 +80,7 @@ dashboard：      http://192.168.2.128:8079/dashboard
       "cleanQclawBody": false,     // qclaw body 白名单清理
       "normalizeSse": false,       // SSE 帧规范化（修不合规上游，见下）
       "normalizeFinishReason": true, // normalizeSse 子开关：finish_reason "" → null
+      "stripV1": false,            // 上游 OpenAI 兼容但无 /v1 前缀（如 DeepSeek）：客户端 /v1/xxx → /xxx
       "isFree": false,
       "enabled": true
     }
@@ -363,10 +365,11 @@ dashboard「聚合网关」分组的 8080 卡片由前端 `loadAggregateStatus()
 
 ## 路径重写（_rewrite_upstream_path）
 
-优先级：**handler 映射表 > routePrefix 重写 > 原样**。
+优先级：**handler 映射表 > routePrefix 重写 > stripV1 剥离 > 原样**。
 
 - **handler 映射表**（`_HANDLER_PATH_MAP`）：如 copilot 的 `/v1/chat/completions` → `/chat/completions`、`/v1/models` → `/models`（上游无 /v1 前缀）
 - **routePrefix 重写**：客户端 `/v1/xxx` → `routePrefix + /xxx`（如 openrouter `/v1/chat/completions` → `/api/v1/chat/completions`）
+- **stripV1 剥离**：`stripV1: true` 时把客户端 `/v1/xxx` → `/xxx`（上游 OpenAI 兼容但根路径直接挂端点，无 `/v1` 前缀，如 DeepSeek `api.deepseek.com/chat/completions`）。配合 `handler=passthrough` 使用，是「删除 /v1」的通用表达（routePrefix 是替换语义，无法删除）
 - **原样**：其余路径直接透传
 
 ## handler 分发
