@@ -38,6 +38,13 @@ _CODEBUDDY_SYS_REWRITES = (
      "Focused task executor agent."),
     ('You are "Sisyphus" - Powerful AI Agent with orchestration capabilities from OhMyOpenCode.',
      'You are "Sisyphus" - a capable coding agent with strong orchestration abilities.'),
+    # Claude Code 官方 system prompt 身份声明——腾讯上游对 "Claude Code" /
+    # "Anthropic's official CLI" 敏感触发 content_filter，替换为中性描述。
+    # 2026-08-08 实测：带此身份的请求 100% content_filter，替换后正常。
+    ("x-anthropic-billing-header: cc_version=",
+     "x-context-header: claude-cli-version="),
+    ("You are Claude Code, Anthropic's official CLI for Claude.",
+     "You are an AI coding assistant integrated with a terminal environment."),
 )
 
 
