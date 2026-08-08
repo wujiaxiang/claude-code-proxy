@@ -1907,6 +1907,10 @@ async def catch_all(request: Request, path: str):
     # Skip root path — handled by root() above
     if path == "" or path == "/":
         return {"message": "Anthropic Proxy for LiteLLM"}
+    # 新版 Claude Code 启动时 HEAD /api/hello 做连通性检查——返回 200 声明代理健康，
+    # 否则客户端判定 base_url 不可用，拒绝后续 /v1/messages 请求。
+    if path == "api/hello" or path == "/api/hello":
+        return JSONResponse(content={"ok": True}, status_code=200)
     body = None
     try:
         body = await request.body()

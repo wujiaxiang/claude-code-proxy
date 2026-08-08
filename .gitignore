@@ -83,3 +83,6 @@ logs/
 targets.json
 .env.bak
 targets.json.bak
+
+# 日志轮转文件（TimedRotatingFileHandler）
+*.log.*
