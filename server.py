@@ -1714,10 +1714,10 @@ async def create_message(request: MessagesRequest, raw_request: Request):
         elif clean_model.startswith("openai/"):
             clean_model = clean_model[len("openai/") :]
 
-        # Dump 上游原始请求关键字段，方便排查
+        # Dump 上游原始请求关键字段，方便排查（INFO 级别：8081 入站可观测，勿降级 DEBUG）
         upstream_thinking = body_json.get("thinking", {})
         upstream_max_tokens = body_json.get("max_tokens", "N/A")
-        logger.debug(
+        logger.info(
             f"📊 UPSTREAM REQUEST: model={original_model} stream={body_json.get('stream')} max_tokens={upstream_max_tokens} thinking={upstream_thinking}"
         )
 
@@ -1727,6 +1727,7 @@ async def create_message(request: MessagesRequest, raw_request: Request):
         if mapped:
             from anthropic_convert import convert_anthropic_request_to_openai, convert_openai_response_to_anthropic
             _fwd_port = int(mapped["port"])
+            logger.info(f"🔀 [8081] route: {original_model} → 127.0.0.1:{_fwd_port}/v1/chat/completions model={mapped['model']}")
             openai_body = convert_anthropic_request_to_openai(body_json)
             openai_body["model"] = mapped["model"]
             openai_payload = json.dumps(openai_body).encode("utf-8")
