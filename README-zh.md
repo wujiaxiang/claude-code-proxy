@@ -10,7 +10,8 @@
 | 端口 | 供应商 | 分类 | handler | 协议 |
 |------|--------|------|---------|------|
 | 8080 | aggregator | aggregate | aggregator | OpenAI（聚合网关：虚拟模型路由 / 会话粘性 / 熔断降级） |
-| 8081 | anthropic-compatible | — | FastAPI | Anthropic（入口 + dashboard） |
+| 8079 | dashboard | — | FastAPI | 管理面（dashboard + 全部 /api/* 管理 API，独立端口） |
+| 8081 | anthropic-compatible | — | FastAPI | Anthropic 翻译入口（/v1/messages 等，对应 targets[] 中 handler="anthropic" 的 target） |
 | 8082 | copilot-enterprise | crack | copilot | OpenAI（GHE 企业版，收费） |
 | 8083 | copilot | crack | copilot | OpenAI（个人版） |
 | 8084 | codebuddy | crack | passthrough | OpenAI |
@@ -31,7 +32,7 @@
 - **base_url 规范**：crack 类与 gemini-native 统一 `/v1`（代理内部映射下游）；free/paid 透传用 `routePrefix`（如 `/api/v1`）
 - **codebuddy 非流式兼容**：上游只接受流式（11101），代理自动把非流式请求转流式聚合为完整 JSON，非流式客户端也可用
 - **SSE 帧规范化（`normalizeSse`）**：部分上游返回的 SSE 帧不合规（如 codebuddy 每帧都塞满 `content:""` / `tool_calls:[]` 等空字段，导致客户端 SDK 按"键是否出现"分段，把思考链切成数百个独立块）。开启后代理逐帧剔除空值字段还原标准 OpenAI 格式，有内容的 `tool_calls` 等严格保留；解析失败一律原样透传不吞帧
-- **管理界面**：`http://127.0.0.1:8081/dashboard`（任意端口 `/dashboard` 也可访问，`/api/*` 自动代理回 8081）
+- **管理界面**：`http://127.0.0.1:8079/dashboard`（也可经任意端口 `/dashboard` 反向代理访问，实际由 8079 独立 app 承载，`/api/*` 同理）
 
 ## 快速启动
 
@@ -40,13 +41,13 @@ cd claude-code-proxy
 python3 -m venv .venv && .venv/bin/pip install -r requirements.txt   # 或 uv sync
 
 # 配置 targets.json（端口/供应商/分类/handler/模型）与 secrets.json（token）
-# 运行配置（可选）写进 targets.json 顶层 server 段，只剩三个键：listenPort / log / cache
+# 运行配置（可选）写进 targets.json 顶层 server 段，只剩四个键：listenPort / dashboardPort / log / cache
 # .env 已废弃删除（备份 .env.bak），旧部署用 scripts/migrate_env_to_targets.py 迁移进 server 段
 
-.venv/bin/python server.py   # 启动 8081 + targets.json 定义的全部端口
+.venv/bin/python server.py   # 启动 8081 翻译入口 + 8079 dashboard + targets.json 定义的全部端口
 ```
 
-> 端口-供应商绑定由 `targets.json` 决定。8081 的模型路由由顶层 `models[]` 决定（模型 → 端口 + 下游模型名），没配的模型直接 404。
+> 端口-供应商绑定由 `targets.json` 决定。8081 的模型路由由 `targets[]` 中 `handler="anthropic"` 的 8081 target 嵌套的 `models[]` 决定（模型 → 端口 + 下游模型名），没配的模型直接 404。
 >
 > legacy 单端口模式（按环境变量选 provider + LiteLLM 翻译）已彻底下线，相关的四个 server 段旧键一并删除；残留在旧配置里也只会被静默忽略，不报错。
 
@@ -81,7 +82,7 @@ api_key  = dummy（crack 类）；真实 key（free/paid 透传）
 
 ## Dashboard 管理界面
 
-`http://127.0.0.1:8081/dashboard`：
+`http://127.0.0.1:8079/dashboard`（也可经任意端口 `/dashboard` 反向代理访问，实际由 8079 独立 app 承载）：
 
 - **分类栏**：聚合网关（8081）/ 破解网关 / 直连网关 三组，带数量徽标
 - **卡片**：端口强调条 + 请求数 + 流量统计块（成功率/运行时长/进度条）+ 可粘贴 `base_url` + token 编辑

@@ -5,7 +5,7 @@
 ### Removed
 - **legacy 单端口模式彻底下线（2026-08-08）**：8081 早期是「一个端口按 `PREFERRED_PROVIDER` 选后端 + LiteLLM 翻译」的单端口代理，多端口架构上线后这条路径已长期无人走，本次连同其全部依赖一次性删除。
   - **删除 legacy `/v1/chat/completions` 端点**：8081 不再提供 OpenAI 协议入口（各 target 端口自己的 `/v1/chat/completions` 不受影响）
-  - **删除 `PREFERRED_PROVIDER` 机制**：连同 `targets.server` 段的 `preferredProvider` / `legacyModels` / `copilot` / `qclaw` 四个旧键一并移除。`DEFAULT_SERVER_CONFIG` 现在只剩 `listenPort` / `log` / `cache` 三个键；旧配置里残留这些键不会报错，深合并时静默丢弃
+  - **删除 `PREFERRED_PROVIDER` 机制**：连同 `targets.server` 段的 `preferredProvider` / `legacyModels` / `copilot` / `qclaw` 四个旧键一并移除。`DEFAULT_SERVER_CONFIG` 现在只剩 `listenPort` / `dashboardPort` / `log` / `cache` 四个键；旧配置里残留这些键不会报错，深合并时静默丢弃
   - **移除 LiteLLM 依赖**：`import litellm`、`convert_anthropic_to_litellm` 及整个 `_PROVIDER_STRATEGIES` 策略族、OAI↔Anthropic 转换（`_convert_oai_to_anthropic`）、`_close_json_fragment` 全部删除。`gateways/translate.py` 从 ~370 行缩到 ~130 行，只剩 token 估算族 + `clean_gemini_schema`
   - **删除 `/v1/messages` 的分支 B / 分支 C**：分支 B（copilot 原生透传）与分支 C（LiteLLM 翻译）移除，只保留分支 A：查 `models[]` 拿 `{port, model}` → `anthropic_convert` 翻译 → httpx 转发本地端口 → 译回 Anthropic。**未在 `models[]` 配路由的模型直接返回 404**，不再有兜底路径
   - **validator 模型映射退化**：`MessagesRequest` 的模型 validator 不再做 provider 前缀改写/大中小模型映射，只保留 `original_model` 记录
@@ -14,6 +14,13 @@
 - **`/v1/messages/count_tokens` 改纯 tiktoken 估算**：不再经 LiteLLM 转换，直接走 `_estimate_messages_tokens`（含 system 与 tools 的文本提取），无网络调用、无第三方翻译层
 - **`COPILOT_*` 配置函数化**：原 `server.copilot` 段的 GHE host / integration id / 大中小模型名改为每次调用实时推导，`gateways/copilot.py` 新增 `_copilot_api_base()` / `_copilot_integration_id()` / `_copilot_big_model()` 等，数据源是 copilot target（8082/8083）的 `targetHost` / `extraHeaders` / `modelRoles`。同理原 `server.qclaw.baseUrl` 由 qclaw target 的 `targetHost` 承载。配置从此单一事实源在 target 定义里，不再两处各写一份
 - **文档同步**：`AGENTS.md` / `README.md` / `README-zh.md` / `docs/architecture.md` 移除 LiteLLM 依赖、provider 策略机制、四个 server 段旧键的描述，8081 路由说明改为单一路径 + 404 语义
+
+### Changed (架构统一, 2026-08-08)
+- **8081 成为 `targets[]` 中一个普通 target（handler=`anthropic`）**：8081 不再是"特殊端口 + 全局配置"，而是与其他 target 一致，由 `targets[]` 里 `label`/`listenPort:8081`/`handler:"anthropic"` 的那条定义。server.py 启动时扫 `targets[]` 找 `handler=="anthropic"` 的 target 作为 Anthropic 翻译入口，`_MODELS_CFG` 从该 target 读取。
+- **dashboard + 全部 `/api/*` 管理 API 拆到独立端口 8079**：新增 `server.dashboardPort`（默认 `8079`）。dashboard 与所有 `/api/*` 路由挂在独立的 8079 app；8081 仅保留 Anthropic 翻译端点（`/v1/messages` / `count_tokens` / `/v1/models` / `/api/tags` / `/`），其 `/dashboard`、`/api/*` 请求由 `_DASHBOARD_PORT` 反向代理到 8079。dashboard 地址改为 `http://<IP>:8079/dashboard`（8081 的反向代理仍可用，属转发）。
+- **`models` / `modelDefaults` 迁入 anthropic target 嵌套**：原 `targets.json` 顶层的 `models[]` / `modelDefaults` 迁移进 `targets[]` 的 8081 anthropic target 内部；server.py 从该 target 读嵌套字段填充 `_MODELS_CFG`，顶层残留的 `models` / `modelDefaults` 不再是有效数据源（仅保留兼容加载）。dashboard「模型定义」modal 经 `GET/PUT /api/models` 读写该嵌套字段。
+- **`server` 段新增 `dashboardPort`（第四个键）**：`DEFAULT_SERVER_CONFIG` 现有四个键 `listenPort` / `dashboardPort` / `log` / `cache`（详见 §Added 配置架构整合条）。
+- **文档同步**：`AGENTS.md` §3/§4/§7/§9、`docs/architecture.md`（端口表/schema/模型定义/dashboard 地址）、`README.md` / `README-zh.md`（端口表/dashboard 地址/server 段键/models 位置）同步到 8079 拆分与 8081-as-target 现状。
 
 ### Added
 - **配置架构整合：`.env` 废弃 → `targets.json` 顶层 `server` 段（2026-08-07）**：配置文件从三个（targets.json / secrets.json / .env）收敛为两个（targets.json / secrets.json）。原 `.env` 的非私密运行配置整体并入 `targets.json` 顶层新增的 `server` 段，`.env` 已删除（备份 `.env.bak`）

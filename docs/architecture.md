@@ -8,7 +8,8 @@
 | 端口 | 供应商 | 分类 | handler | 协议 | 用途 |
 |------|--------|------|---------|------|------|
 | **8080** | aggregator | aggregate | aggregator | OpenAI | 聚合网关（虚拟模型路由 / 会话粘性 / 重试降级 / 配额熔断） |
-| **8081** | anthropic-compatible | — | FastAPI | Anthropic | Anthropic 入口 + dashboard（`/v1/messages` 按 `models[]` 解析目标端口，翻译为 OpenAI 后转发到该本地端口） |
+ | **8079** | dashboard | — | FastAPI | 管理面 | dashboard 管理界面 + 全部 `/api/*` 管理 API（独立 app，由 `server.dashboardPort` 配置，默认 8079） |
+ | **8081** | anthropic-compatible | — | FastAPI | Anthropic | Anthropic 翻译入口（`/v1/messages` 按 `models[]` 解析目标端口，翻译为 OpenAI 后转发到该本地端口）；仅保留 `/v1/messages`/`count_tokens`/`/v1/models`/`/api/tags`/`/`，其 `/dashboard`、`/api/*` 反向代理到 8079 |
 | **8082** | copilot | crack | copilot | OpenAI | GitHub Copilot Enterprise 破解透传（企业 PAT） |
 | **8083** | copilot | crack | copilot | OpenAI | 个人版 Copilot（上游 api.githubcopilot.com，与 8082 企业版账号隔离） |
 | **8084** | codebuddy | crack | passthrough | OpenAI | CodeBuddy 破解透传 |
@@ -37,25 +38,34 @@
 ```
 OpenAI 协议：base_url = http://192.168.2.128:8090/api/v1，api_key = 任意（free 类用真实 key）
 Anthropic 协议：base_url = http://192.168.2.128:8081，api_key = "dummy"
+dashboard：      http://192.168.2.128:8079/dashboard
 ```
 
-> dashboard 卡片详情页的 `base_url` 属性直接展示可粘贴即用的地址（局域网 IP + 端口 + 后缀）。
+> dashboard 卡片详情页的 `base_url` 属性直接展示可粘贴即用的地址（局域网 IP + 端口 + 后缀）。dashboard 独立挂在 8079，8081 的 `/dashboard`、`/api/*` 请求会反向代理到 8079。
 
 ## targets.json schema
 
 ```jsonc
 {
-  "modelDefaults": { "defaultPort": 8082 },   // 直连端口未命中时的默认端口（8081 未命中直接 404，不用它）
-  "models": [                                  // 全局模型定义（名称/别名 → 下游端口+真实模型）
-    { "name": "sonnet", "aliases": [], "target": { "port": 8080, "model": "agg:sonnet" } },
-    { "name": "haiku", "aliases": [], "target": { "port": 8082, "model": "claude-haiku-4.5" } }
-  ],
   "targets": [
+    {
+      "label": "anthropic",        // 8081 的 anthropic-compatible 入口（对应 server.listenPort）
+      "listenPort": 8081,
+      "category": "free",          // 入口不持凭据，仅做翻译与路由
+      "handler": "anthropic",      // 标记本 target 为 Anthropic 翻译入口
+      "enabled": true,
+      // —— models / modelDefaults 已迁移进此 target 嵌套（原顶层 models/modelDefaults 不再是有效数据源）——
+      "modelDefaults": { "defaultPort": 8082 },   // 直连端口未命中时的默认端口（8081 未命中直接 404，不用它）
+      "models": [                                  // 模型定义（名称/别名 → 下游端口+真实模型）
+        { "name": "sonnet", "aliases": [], "target": { "port": 8080, "model": "agg:sonnet" } },
+        { "name": "haiku", "aliases": [], "target": { "port": 8082, "model": "claude-haiku-4.5" } }
+      ]
+    },
     {
       "label": "copilot",          // 唯一标识（dashboard/API 用）
       "listenPort": 8082,          // 本机监听端口
       "category": "crack",         // crack / free / paid
-      "handler": "copilot",        // passthrough / copilot / qclaw / gemini-native
+      "handler": "copilot",        // passthrough / copilot / qclaw / gemini-native / trae-work / aggregator / anthropic
       "targetHost": "...",         // 上游 host
       "targetPort": 443,           // 上游端口
       "targetProtocol": "https",   // http / https
@@ -85,7 +95,8 @@ Anthropic 协议：base_url = http://192.168.2.128:8081，api_key = "dummy"
 ```jsonc
 {
   "server": {
-    "listenPort": 8081,                 // 原 ANTHROPIC_PORT，anthropic-compatible 入口端口
+    "listenPort": 8081,                 // 原 ANTHROPIC_PORT，anthropic-compatible 入口端口（对应 targets[] 中 handler="anthropic" 的 8081 target）
+    "dashboardPort": 8079,              // dashboard 管理面独立端口（与 8081 翻译入口分离，架构统一）
     "log": {                            // 原 DEBUG/LOG_FILE/LOG_RETENTION_DAYS/LOG_ROTATE_WHEN/LOG_ROTATE_INTERVAL
       "debug": false,
       "file": "",
@@ -103,7 +114,7 @@ Anthropic 协议：base_url = http://192.168.2.128:8081，api_key = "dummy"
 }
 ```
 
-> **只剩这三个键。** 早期这里还有四个键（选择默认 provider、legacy 大中小模型名、copilot 配置、qclaw baseUrl），它们随 legacy 单端口模式一并删除，已不在 `DEFAULT_SERVER_CONFIG` 中；旧配置里残留会被深合并逻辑静默丢弃，不报错。
+> **只剩这四个键**（`listenPort` / `dashboardPort` / `log` / `cache`）。早期这里还有四个键（选择默认 provider、legacy 大中小模型名、copilot 配置、qclaw baseUrl），它们随 legacy 单端口模式一并删除，已不在 `DEFAULT_SERVER_CONFIG` 中；旧配置里残留会被深合并逻辑静默丢弃，不报错。models/modelDefaults 也已从顶层迁入 `targets[]` 的 anthropic target 嵌套。
 >
 > 原 copilot 段的 GHE host / integration id / 大中小模型名已**函数化**（`gateways/copilot.py` 的 `_copilot_api_base()` / `_copilot_integration_id()` / `_copilot_*_model()`），每次调用从 copilot target（8082/8083）的 `targetHost` / `extraHeaders` / `modelRoles` 实时推导；原 qclaw 段的 baseUrl 同理由 qclaw target 的 `targetHost` 承载。两者都不再需要独立配置项。
 
@@ -318,21 +329,24 @@ dashboard「聚合网关」分组的 8080 卡片由前端 `loadAggregateStatus()
 ### 配置编辑（dashboard，非黑盒）
 
 - `GET/PUT /api/aggregate/config`：读写聚合 target 的 `virtualModels / poolDefaults / quotaErrorPatterns / name`。PUT 为**整体替换语义**（`virtualModels` 传完整 map；未提供的字段保留现值），校验后写 targets.json 并热重载（引擎自动 reload，保留会话/熔断状态）
-- `GET/PUT /api/models`：读写全局 `modelDefaults / models` 配置
-- dashboard：8080 卡片「✏️ 编辑配置」modal（虚拟模型增删/池成员 port/model/weight/retries/降级池编辑）、8081 卡片「✏️ 模型定义」modal（modelDefaults + models[] 增删改）
+- `GET/PUT /api/models`：读写 `targets[]` 中 `handler="anthropic"` 的 8081 target 嵌套的 `modelDefaults / models`（原顶层 `models/modelDefaults` 已迁入此 target）
+- dashboard：8080 卡片「✏️ 编辑配置」modal（虚拟模型增删/池成员 port/model/weight/retries/降级池编辑）、8081 卡片「✏️ 模型定义」modal（modelDefaults + models[] 增删改，操作的就是该 8081 target 的嵌套字段）
 
 ### 模型定义（models）
 
-8081 与所有 OpenAI 协议直连端口统一用全局 `models[]` 做别名解析（`_resolve_model_alias`）：
+8081 与所有 OpenAI 协议直连端口统一用 `models[]` 做别名解析（`_resolve_model_alias`）。该 `models[]` 与 `modelDefaults` 现位于 `targets[]` 中 `handler="anthropic"` 的 8081 target 嵌套内（server.py 启动时读此 target 填充 `_MODELS_CFG`，顶层残留的 `models/modelDefaults` 不再生效）：
 
 - **命中且 `target.port` 等于请求到达的端口** → 只改写模型名继续原上游转发
 - **命中且指向另一端口**（含聚合网关 `agg:xxx`）→ 整体改路由到该端口
 - **未命中** → 8081 直接返回 404（legacy 单端口模式下线后不再有兜底路径，模型必须先在 `models[]` 里配路由）；直连端口未命中则原样透传模型名给自己上游
 
-示例（targets.json 顶层）：
+示例（嵌套在 anthropic target 内）：
 
 ```jsonc
 {
+  "label": "anthropic",
+  "listenPort": 8081,
+  "handler": "anthropic",
   "modelDefaults": { "defaultPort": 8082 },
   "models": [
     { "name": "sonnet", "aliases": [], "target": { "port": 8080, "model": "agg:sonnet" } },
@@ -343,9 +357,9 @@ dashboard「聚合网关」分组的 8080 卡片由前端 `loadAggregateStatus()
 
 **防环约束**：任何 `models[].target.port` 或聚合网关池成员 `port` 不得等于 8081（anthropic-compatible 自身端口），否则配置校验报错。
 
-**管理入口**：dashboard 8081 卡片「✏️ 模型定义」→ `GET/PUT /api/models`
+**管理入口**：dashboard 8081 卡片「✏️ 模型定义」→ `GET/PUT /api/models`（实际操作 anthropic target 嵌套的 models）
 
-实现：`gateways/aggregator/engine.py`（`AggregatorEngine`，纯路由/分类/熔断/统计逻辑，无网络 I/O）+ `gateways/aggregator/http_adapter.py`（`_handle_aggregate_request` 分发 / `_aggregator_prober` 探测）+ `server.py`（reload 钩子 / `/api/aggregate/status`、`/api/aggregate/config`、`/api/models` / lifespan 预初始化引擎）+ `config_store.py`（aggregate/aggregator 校验 + 顶层 `modelDefaults/models` 校验与保留加载）。
+实现：`gateways/aggregator/engine.py`（`AggregatorEngine`，纯路由/分类/熔断/统计逻辑，无网络 I/O）+ `gateways/aggregator/http_adapter.py`（`_handle_aggregate_request` 分发 / `_aggregator_prober` 探测）+ `server.py`（reload 钩子 / `/api/aggregate/status`、`/api/aggregate/config`、`/api/models` / lifespan 预初始化引擎）+ `config_store.py`（aggregate/aggregator 校验；`models/modelDefaults` 现从 anthropic target 加载，顶层残留仅保留兼容）。
 
 ## 路径重写（_rewrite_upstream_path）
 
@@ -401,7 +415,7 @@ dashboard「聚合网关」分组的 8080 卡片由前端 `loadAggregateStatus()
 
 ## dashboard 管理界面
 
-`http://127.0.0.1:8081/dashboard`（任意 target 端口 `/dashboard` 也可访问，`/api/*` 自动代理回 8081）：
+`http://127.0.0.1:8079/dashboard`（也可经任意 target 端口的 `/dashboard` 反向代理访问，实际由 8079 独立 app 承载，`/api/*` 同理）：
 
 - **分类栏**：聚合网关（8081）/ 破解网关（crack）/ 直连网关（free/paid）三组
 - **卡片头**：端口强调条 + 名称 + 分类 badge + 请求数 + 展开箭头

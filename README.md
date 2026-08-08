@@ -29,11 +29,12 @@ A proxy server that exposes one Anthropic-compatible entry (8081) plus one OpenA
 3. **Create `targets.json`** (port/provider/category/handler/model config) and `secrets.json` (private tokens, gitignored).
    See [docs/architecture.md](docs/architecture.md) for the full schema.
 
-4. **(Optional) Add a top-level `server` section to `targets.json`** for global runtime settings. Only three keys remain; the whole section and any of its keys can be omitted, in which case defaults apply:
+4. **(Optional) Add a top-level `server` section to `targets.json`** for global runtime settings.    Only four keys remain; the whole section and any of its keys can be omitted, in which case defaults apply:
 
    | Key | Default | Was |
    |-----|---------|-----|
    | `listenPort` | `8081` | `ANTHROPIC_PORT` |
+   | `dashboardPort` | `8079` | dashboard 管理面独立端口（与 8081 翻译入口分离） |
    | `log` `{debug, file, retentionDays, rotateWhen, rotateInterval}` | `false` / `""` / `7` / `"midnight"` / `1` | `DEBUG` / `LOG_FILE` / `LOG_RETENTION_DAYS` / `LOG_ROTATE_WHEN` / `LOG_ROTATE_INTERVAL` |
    | `cache` `{enabled, maxSize, ttlSeconds, maxItemSizeKb}` | `true` / `500` / `3600` / `100` | `CACHE_ENABLED` / `CACHE_MAX_SIZE` / `CACHE_TTL_SECONDS` / `CACHE_MAX_ITEM_SIZE_KB` |
 
@@ -65,7 +66,8 @@ Add to `~/.claude/settings.json` (any provider — only `targets.json` decides r
 | 端口 | 供应商 | 分类 | handler | 协议 |
 |------|--------|------|---------|------|
 | 8080 | aggregator | aggregate | aggregator | OpenAI（聚合网关：虚拟模型路由 / 会话粘性 / 熔断降级） |
-| 8081 | anthropic-compatible | — | FastAPI | Anthropic（入口 + dashboard） |
+| 8079 | dashboard | — | FastAPI | 管理面（dashboard + 全部 /api/* 管理 API，独立端口） |
+| 8081 | anthropic-compatible | — | FastAPI | Anthropic 翻译入口（/v1/messages 等，对应 targets[] 中 handler="anthropic" 的 target） |
 | 8082 | copilot-enterprise | crack | copilot | OpenAI（GHE 企业版，收费） |
 | 8083 | copilot | crack | copilot | OpenAI（个人版） |
 | 8084 | codebuddy | crack | passthrough | OpenAI |
@@ -90,7 +92,7 @@ Add to `~/.claude/settings.json` (any provider — only `targets.json` decides r
 
 ## Dashboard 🖥️
 
-管理界面 `http://127.0.0.1:8081/dashboard`（任意 target 端口 `/dashboard` 也可访问）：
+管理界面 `http://127.0.0.1:8079/dashboard`（也可经任意 target 端口 `/dashboard` 反向代理访问，实际由 8079 独立 app 承载）：
 
 - 分类栏：聚合网关（8081）/ 破解网关 / 直连网关
 - 卡片：请求数、流量统计（成功率/时长/进度条）、可粘贴 `base_url`

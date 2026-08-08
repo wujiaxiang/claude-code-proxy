@@ -88,11 +88,13 @@ tail -f codebuddy.log                 # 查
 
 > **配置文件现在只有两个**：`targets.json`（运行配置 + Target 定义）+ `secrets.json`（私密凭据）。`.env` 已废弃删除（备份 `.env.bak`），原运行配置并入 `targets.json` 顶层 `server` 段。旧部署用一次性脚本 `scripts/migrate_env_to_targets.py` 把旧 `.env` 迁进 `server` 段。
 
-- **`targets.json` 顶层 `server` 段**（主服务运行配置，可选，缺失或子键缺失自动补默认）：承载原 `.env` 的非私密运行配置。**只剩三个键**（默认值见 `config_store.py` 的 `DEFAULT_SERVER_CONFIG`，用户 server 段与之做一层深合并；早期还有四个键（默认 provider 选择、legacy 大中小模型名、copilot 配置、qclaw baseUrl），已随 legacy 单端口模式一并删除，配置里残留也会被合并逻辑静默丢弃，不报错。详见 CHANGELOG）：
-  - `listenPort`（默认 `8081`）：原 `ANTHROPIC_PORT`，anthropic-compatible 入口端口
-  - `log`（`{debug, file, retentionDays, rotateWhen, rotateInterval}`，默认 `false / "" / 7 / "midnight" / 1`）：原 `DEBUG/LOG_FILE/LOG_RETENTION_DAYS/LOG_ROTATE_WHEN/LOG_ROTATE_INTERVAL`
-  - `cache`（`{enabled, maxSize, ttlSeconds, maxItemSizeKb}`，默认 `true / 500 / 3600 / 100`）：原 `CACHE_ENABLED/CACHE_MAX_SIZE/CACHE_TTL_SECONDS/CACHE_MAX_ITEM_SIZE_KB`
-  - 已删除的 copilot 段（GHE host / integration id / 大中小模型名）改为**函数化**（`gateways/copilot.py` 的 `_copilot_api_base()`/`_copilot_integration_id()`/`_copilot_*_model()`），每次调用从 copilot target（8082/8083）的 `targetHost`/`extraHeaders`/`modelRoles` 实时推导；已删除的 qclaw 段 baseUrl 同理由 qclaw target 的 `targetHost` 承载。两者都不再需要独立配置项
+ - **`targets.json` 顶层 `server` 段**（主服务运行配置，可选，缺失或子键缺失自动补默认）：承载原 `.env` 的非私密运行配置。**只剩四个键**（默认值见 `config_store.py` 的 `DEFAULT_SERVER_CONFIG`，用户 server 段与之做一层深合并；早期还有四个键（默认 provider 选择、legacy 大中小模型名、copilot 配置、qclaw baseUrl），已随 legacy 单端口模式一并删除，配置里残留也会被合并逻辑静默丢弃，不报错。详见 CHANGELOG）：
+   - `listenPort`（默认 `8081`）：原 `ANTHROPIC_PORT`，anthropic-compatible 入口端口（对应 `targets[]` 中 `handler="anthropic"` 的 8081 target）
+   - `dashboardPort`（默认 `8079`）：dashboard 管理面独立端口。dashboard 与全部 `/api/*` 管理 API 挂在独立的 8079 app；8081 仅保留 Anthropic 翻译端点（`/v1/messages`/`count_tokens`/`/v1/models`/`/api/tags`/`/`），其 `/dashboard`、`/api/*` 请求由 `_DASHBOARD_PORT` 反向代理到 8079
+   - `log`（`{debug, file, retentionDays, rotateWhen, rotateInterval}`，默认 `false / "" / 7 / "midnight" / 1`）：原 `DEBUG/LOG_FILE/LOG_RETENTION_DAYS/LOG_ROTATE_WHEN/LOG_ROTATE_INTERVAL`
+   - `cache`（`{enabled, maxSize, ttlSeconds, maxItemSizeKb}`，默认 `true / 500 / 3600 / 100`）：原 `CACHE_ENABLED/CACHE_MAX_SIZE/CACHE_TTL_SECONDS/CACHE_MAX_ITEM_SIZE_KB`
+   - 已删除的 copilot 段（GHE host / integration id / 大中小模型名）改为**函数化**（`gateways/copilot.py` 的 `_copilot_api_base()`/`_copilot_integration_id()`/`_copilot_*_model()`），每次调用从 copilot target（8082/8083）的 `targetHost`/`extraHeaders`/`modelRoles` 实时推导；已删除的 qclaw 段 baseUrl 同理由 qclaw target 的 `targetHost` 承载。两者都不再需要独立配置项
+ - **`models` / `modelDefaults` 的位置（架构统一后）**：不再放在 `targets.json` 顶层，而是**迁移进 `targets[]` 中 `handler="anthropic"` 的 8081 target 内嵌套**（即 `targets[]` 里 `label`/`listenPort:8081` 的那条的 `models[]` 与 `modelDefaults`）。server.py 启动时从 anthropic target 读取并填充 `_MODELS_CFG`，顶层残留的 `models`/`modelDefaults` 不再是有效数据源。dashboard「模型定义」编辑 modal 读写的是该 8081 target 的嵌套字段，并经 `GET/PUT /api/models` 热更新。
 - **`targets.json`**（Target 定义，核心配置）：必填 `label / listenPort / category / handler / targetHost`；category ∈ `crack|free|paid|aggregate`；handler ∈ `passthrough|copilot|qclaw|gemini-native|trae-work|aggregator`；crack 类必须有 `crackTool`；label/端口不能冲突；`enabled=false` 跳过必填校验（预留位）。secrets 优先级：`secrets.json > apikeyEnv 环境变量 > 客户端透传`。**热重载**：mtime 轮询 2s，改完即生效（含端口动态增删）。可选行为开关：`cleanCodebuddyBody` / `cleanQclawBody` / `normalizeSse`（SSE 帧规范化，修不合规上游）/ `normalizeFinishReason`。完整 schema 见 [docs/architecture.md](docs/architecture.md)
 - **`secrets.json`**（私密 key/token，gitignored，dashboard 可热编辑）：**私密凭据唯一事实源**。破解工具提取的 key/token 写入此文件。当前字段：`copilot_token, copilot_personal_token, codebuddy_token, codebuddy_refresh_token, codebuddy_uid, codebuddy_nickname, trae_work_token, trae_work_refresh_token, trae_work_user_id, trae_work_bound_device_id, qclaw_api_key, qclaw_login_key, qclaw_guid, qclaw_user_id, qclaw_nickname, qclaw_openclaw_token, qclaw_device_token`。注：`copilot_token` 同时供 8082 企业 GHE target（secretRef）与 server.py 翻译层 `COPILOT_GHE_TOKEN`（同源 token，热重载同步）
 - **全量配置导出/导入**（`GET /api/config/export` + `POST /api/config/import`，dashboard「📦 导出配置 / 📥 导入配置」按钮）：两个 gitignored 配置源打包成**单个 JSON**（v2 格式：`{version, exportedAt, targets, secrets}`，`version=2`；运行配置已并入 `targets.server` 段，不再有独立 `env` 段），实现"从 GitHub 下载代码 → 导入一个配置文件 → 达到现有配置效果"的迁移诉求。**物理文件保持分离**（热重载粒度 + 私密凭据隔离是刻意设计，勿合并）。导入校验 version + `validate_targets`（失败 422 且不写任何文件），成功则写两文件 + `_reload_targets()`（端口 diff）+ `_refresh_secrets()` 即时生效。导出含完整私密凭据，需妥善保管
@@ -107,7 +109,8 @@ tail -f codebuddy.log                 # 查
 | 端口 | 供应商 | 分类 | handler | 协议 | 用途 |
 |------|--------|------|---------|------|------|
 | **8080** | aggregator | aggregate | aggregator | OpenAI | 聚合网关（虚拟模型路由 / 会话粘性 / 重试降级 / 配额熔断，路由到本地各真实端口） |
-| **8081** | anthropic-compatible | — | FastAPI | Anthropic | `/v1/messages`（Anthropic）/ dashboard 管理界面 / `/api/targets` 等 REST API |
+ | **8079** | dashboard | — | FastAPI | 管理面 | dashboard 管理界面 + 全部 `/api/*` 管理 API（独立 app，由 `server.dashboardPort` 配置，默认 8079） |
+ | **8081** | anthropic-compatible | — | FastAPI | Anthropic | `/v1/messages`（Anthropic 翻译入口，对应 `targets[]` 中 `handler="anthropic"` 的 target）/ `count_tokens` / `/v1/models` / `/api/tags` / `/`；其 `/dashboard`、`/api/*` 反向代理到 8079 |
 | **8082** | copilot-enterprise | crack | copilot | OpenAI | GHE 企业版 Copilot（收费，上游 copilot-api.bmw.ghe.com，token 用企业 PAT） |
 | **8083** | copilot | crack | copilot | OpenAI | 个人版 Copilot（上游 api.githubcopilot.com，token 从本地 `/root/.copilot` 破解，与 8082 账号隔离） |
 | **8084** | codebuddy | crack | passthrough | OpenAI | CodeBuddy（上游 copilot.tencent.com，token 用 refresh 自动续期） |
@@ -120,7 +123,7 @@ tail -f codebuddy.log                 # 查
 | **8094** | open-go | paid | passthrough | OpenAI | 收费代理 |
 
 - **base_url 规范**：crack 类与 gemini-native 统一 `/v1`（代理内部映射下游）；free/paid 透传用 `routePrefix`（如 `/api/v1`）
-- **客户端接入**：OpenAI 协议 `base_url = http://<局域网IP>:8082/v1` 等，`api_key = "dummy"`（crack 类不校验；free/paid 用真实 key）；Anthropic 协议 `base_url = http://<局域网IP>:8081`
+ - **客户端接入**：OpenAI 协议 `base_url = http://<局域网IP>:8082/v1` 等，`api_key = "dummy"`（crack 类不校验；free/paid 用真实 key）；Anthropic 协议 `base_url = http://<局域网IP>:8081`；dashboard 访问 `http://<局域网IP>:8079/dashboard`（或 8081 的 `/dashboard` 反向代理到 8079）
 
 ---
 
@@ -196,7 +199,7 @@ tail -f codebuddy.log                 # 查
 - **gateways/aggregator/engine.py**：聚合网关纯引擎逻辑（`AggregatorEngine`，路由 / 会话粘性 / 熔断 / 降级）
 - **gateways/aggregator/http_adapter.py**：聚合网关 HTTP 适配（`_handle_aggregate_request`/`_aggregator_prober`）
   - ⚠️ `_AGGREGATOR_ENGINE` 全局通过 `import server as _srv` + `_srv._AGGREGATOR_ENGINE` 模块属性共享
-- **dashboard/routes.py**（~74 行）：管理面板**装配入口**（定义 `dashboard_router` + import dashboard/ 子模块触发路由注册 + re-export）；server.py 仍 `from dashboard.routes import dashboard_router` 挂载，调用点零改动
+ - **dashboard/routes.py**（~74 行）：管理面板**装配入口**（定义 `dashboard_router` + import dashboard/ 子模块触发路由注册 + re-export）；dashboard 挂在独立的 8079 app（`server.dashboardPort`），server.py 仍 `from dashboard.routes import dashboard_router` 挂载到该 app，调用点零改动
 - **dashboard/frontend.py**（~2750 行）：前端渲染层（`DASHBOARD_STYLE` + `_html_escape`/`_get_lan_ip`/`_format_uptime`/`_model_details_html`/`_build_card_html` + `dashboard()` 页面路由）
 - **dashboard/schemas.py**：Pydantic 请求体模型（`ModelsUpdate`/`AggregateConfigUpdate`/`TargetUpdate`/`SecretUpdate`/`SecretBulkUpdate`）
 - **dashboard/api_targets.py**：`api_targets`/`api_update_target`/`api_target_mapping`/`api_prune_models`/`api_target_models_html`
@@ -270,7 +273,7 @@ $env:Path = "C:\Program Files\QClaw\v0.2.33.617\resources\git\cmd;C:\Windows\Sys
 - **排查 403/9002 错误**（QClaw）：登录态/解密 Key/UA/19000 寄生四步 → [docs/qclaw.md](docs/qclaw.md) §7 排查指南
 - **排查代理不通**：`ss -tlnp | grep :8081` 主端口是否监听 → `tail -20 proxy.log` 查最近日志 → 日志中 `startup diag: QClaw upstream = 200` 表示上游连通
 - **排查 codebuddy / trae-work 网关行为**（请求被拦、SSE 异常、工具调用不识别）：**先看对应的独立日志**（`codebuddy.log` / `traework.log`），不是 proxy.log——两者 `propagate=False` 不互通（见 §2.1）。默认 INFO 下逐请求细节不写盘，需临时开 DEBUG
-- **查看网关额度/签到状态**：dashboard（8081/dashboard）→ 各 crack 卡片状态区；`GET /api/crack/{label}/status` 返回额度/签到/token 到期/最后定时刷新
+- **查看网关额度/签到状态**：dashboard（8079/dashboard，或 8081 `/dashboard` 反向代理）→ 各 crack 卡片状态区；`GET /api/crack/{label}/status` 返回额度/签到/token 到期/最后定时刷新
 - **清理过期模型**：dashboard → 模型区 → "🧹 清理过期模型"按钮（仅 copilot 系显示）；或 `POST /api/targets/{label}/prune-models`
 
 ---
