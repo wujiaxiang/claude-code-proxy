@@ -298,12 +298,13 @@ def test_gateway_category_sections():
 
 
 def test_anthropic_compatible_8081():
-    """8081 卡片应改名 anthropic-compatible 并带统计。"""
+    """8081 卡片应由循环统一渲染（handler=anthropic），在「Anthropic 入口」组。"""
     _, body = _get_dashboard()
-    assert "anthropic-compatible" in body, "8081 卡片应显示 anthropic-compatible"
-    assert "claude-code-proxy (8081" not in body, "不应再显示旧名 claude-code-proxy (8081"
-    # 聚合网关标签
-    assert "b-meta-agg" in body, "8081 应有聚合网关标签样式"
+    assert "anthropic" in body, "8081 卡片应显示 anthropic（targets[] handler=anthropic）"
+    assert "anthropic-compatible" not in body, "不应再显示旧手动卡名 anthropic-compatible"
+    # Anthropic 入口分组 + 协议 badge
+    assert "Anthropic 入口" in body, "应有 Anthropic 入口分组"
+    assert "Anthropic 协议" in body, "8081 应有 Anthropic 协议标签"
     # 请求数标签/统计
     assert "ct-summary" in body, "卡片头应有请求数摘要"
     assert "stats-block" in body, "8081 详情应有流量统计块"
@@ -400,15 +401,15 @@ def test_dashboard_registry_equivalence_models():
     status, body = _get_dashboard()
     assert status == 200, f"dashboard HTTP {status}"
 
-    # ① 卡片数量 = 2 特殊卡片（8080 聚合 + 8081 anthropic-compatible）
-    #   + 10 个非 aggregate 的 enabled target（aggregator 类在卡片循环中被 pass 跳过）
+    # ① 卡片数量 = 所有 enabled 非 aggregate 的 target（含 8081 anthropic，
+    #   由循环统一渲染）+ 8080 聚合手动卡（aggregator 类在卡片循环中被 pass 跳过）
     ports = re.findall(r'data-port="(\d+)"', body)
     assert len(ports) >= 10, f"至少 10 个 data-port 卡片，实际 {len(ports)}"
-    # enabled 且非 aggregate 类 target 数 = 渲染出的 target 卡片数下限
+    # enabled 且非 aggregate 类 target 数 + 8080 手动聚合卡 = 渲染出的 data-port 卡片数
     enabled_targets = [t for t in _server._TARGETS if t.get("enabled", True)]
     non_agg_targets = [t for t in enabled_targets if t.get("category") != "aggregate"]
-    assert len(ports) == len(non_agg_targets) + 2, (
-        f"卡片总数应为 {len(non_agg_targets) + 2}（{len(non_agg_targets)} 个 target 卡片 + 8080/8081），"
+    assert len(ports) == len(non_agg_targets) + 1, (
+        f"卡片总数应为 {len(non_agg_targets) + 1}（{len(non_agg_targets)} 个 target 卡片含 8081 + 8080 手动聚合卡），"
         f"实际 {len(ports)}"
     )
 

@@ -20,7 +20,6 @@ from server import (
     _ANTHROPIC_STATS,
     _MODEL_STATS,
     _TARGET_STATS,
-    _anthropic_port_models,
     _build_models_list,
     _crack_env_check,
     _fetch_live_models,
@@ -610,10 +609,13 @@ def _model_details_html(models, model_stats=None, label=None, edit_mode=False, c
     """
     editable = label is not None
     # 规范化：统一为 [{id, display, enabled, aliases}]
+    # 兼容两种 models 结构：target 白名单型 {id, display_name, enabled} 与
+    # anthropic 入口路由型 {name, aliases, target:{port, model}}（无 id/enabled，
+    # 路由定义恒展示）。
     norm = []
     for m in models or []:
         if isinstance(m, dict):
-            mid = m.get('id', '')
+            mid = m.get('id', '') or m.get('name', '')
             display = m.get('display_name', '') or _humanize_model_name(mid)
             enabled = m.get('enabled', True)
             aliases = m.get('aliases') or []
@@ -919,9 +921,23 @@ async def dashboard():
         except Exception:
             return {"label": f"port-{port}", "listenPort": port, "upstream": "?", "models": [], "total": 0, "ok": 0, "translated": 0, "err": 0, "alive": False, "startedAt": "", "modelStats": {}}
 
-    _dash_ports = [t["listenPort"] for t in _srv._TARGETS if t.get("enabled", True)]
+    # 探测端口排除 anthropic 入口（8081 是 FastAPI，无 /__proxy_info__ 自检端点，
+    # 状态由 _ANTHROPIC_STATS 提供，下方单独构造 result）。
+    _dash_ports = [t["listenPort"] for t in _srv._TARGETS if t.get("enabled", True) and t.get("handler") != "anthropic"]
     results = await asyncio.gather(*[_fetch(p) for p in _dash_ports]) if _dash_ports else []
     _result_map = {r["listenPort"]: r for r in results}
+    # 8081 Anthropic 入口：无 /__proxy_info__ 端点，用主服务统计构造 result
+    _result_map[_srv._ANTHROPIC_PORT] = {
+        "label": "anthropic", "listenPort": _srv._ANTHROPIC_PORT,
+        "upstream": "内置翻译入口", "models": _srv._MODELS_CFG.get("models", []),
+        "total": _ANTHROPIC_STATS.get("totalRequests", 0),
+        "ok": _ANTHROPIC_STATS.get("passthroughOk", 0),
+        "translated": 0,
+        "err": _ANTHROPIC_STATS.get("passthroughError", 0),
+        "alive": True,
+        "startedAt": _ANTHROPIC_STATS.get("startedAt", ""),
+        "modelStats": _MODEL_STATS.get("anthropic", {}),
+    }
 
     def _make_stats_detail(r):
         """构建增强统计字典（成功率、时长、进度条数据）。"""
@@ -947,8 +963,8 @@ async def dashboard():
     # ── 局域网 IP（可粘贴 base_url 用）──
     _lan_ip = _get_lan_ip()
 
-    # ── 分组：聚合网关(8081) / 破解网关(crack) / 直连网关(free/paid) ──
-    agg_cards, crack_cards, direct_cards = [], [], []
+    # ── 分组：Anthropic 入口(handler=anthropic) / 聚合网关(8080) / 破解网关(crack) / 直连网关(free/paid) ──
+    entry_cards, agg_cards, crack_cards, direct_cards = [], [], [], []
 
     # ── 8080 流量聚合（AggregatorEngine：虚拟模型路由 + 会话粘性 + 熔断）──
     # 监控视角与其他卡片一致：卡头请求数摘要 + 展开区流量统计块 + 成员级 model-table 单表
@@ -1027,49 +1043,9 @@ async def dashboard():
         ),
     ))
 
-    # ── 8081 Anthropic（FastAPI，本 App 自身）—— 转发网关 ──
-    _8081_total = _ANTHROPIC_STATS.get("totalRequests", 0)
-    _8081_ok = _ANTHROPIC_STATS.get("passthroughOk", 0)
-    _8081_err = _ANTHROPIC_STATS.get("passthroughError", 0)
-    _8081_rate = round(_8081_ok / _8081_total * 100, 1) if _8081_total > 0 else 100.0
-    # 8081 卡片关联的 target：modelDefaults.defaultPort 对应端口（dashboard 映射按钮定位用）
-    _forward_target = next((t for t in _srv._TARGETS if t.get("listenPort") == _srv._MODELS_CFG["modelDefaults"].get("defaultPort", 8082)), None)
-    _forward_label = _forward_target["label"] if _forward_target else None
-    _ap_models = _anthropic_port_models()
-    agg_cards.append(_build_card_html(
-        name="anthropic-compatible",
-        note="FastAPI · Anthropic 协议入口 · /v1/messages 翻译为 OpenAI 后内部请求 8082",
-        kind_badge="Protocol",
-        status_badge="运行中",
-        status_badge_class="purple",
-        kv_items=[
-            ("base_url", f"http://{_lan_ip}:8081"),
-            ("监听地址", "http://0.0.0.0:8081"),
-            ("内部回调", "http://127.0.0.1:8082/v1/chat/completions"),
-            ("协议", "Anthropic /v1/messages → OpenAI 翻译"),
-            ("模型数量", f"{len(_ap_models)} 个（models[] 定义）"),
-            ("systemd 服务", "anthropic-compatible"),
-        ],
-        models=_ap_models,
-        model_stats=_MODEL_STATS.get("anthropic", {}),
-        stats_detail={
-            "total": _8081_total, "ok": _8081_ok, "err": _8081_err,
-            "translated": 0, "success_rate": _8081_rate,
-            "uptime": _format_uptime(_ANTHROPIC_STATS.get("startedAt", "")), "alive": True,
-        },
-        description="接收 Anthropic 客户端请求，结构化解码后转换为 OpenAI 格式，内部转发到 8082（copilot 透传）。响应译回 Anthropic 格式。",
-        label=None,
-        port=8081,
-        raw_html=(
-            '<div class="model-ops">'
-            '  <button class="model-edit-toggle" onclick="openModelsEditor(this)" '
-            '    title="编辑模型定义（name/别名 → 下游端口+真实模型，可指向聚合虚拟模型 agg:xxx）">✏️ 模型定义</button>'
-            '</div>'
-        ),
-        meta_badges=[("Forward Gateway", "b-meta-agg"), ("Anthropic", "b-meta-normal")],
-    ))
-
     # ── 动态 target 卡片（targets.json 驱动）──
+    # 8081 是 targets[] 中 handler=anthropic 的 target（内置翻译入口，无上游），
+    # 由下方循环统一渲染进「Anthropic 入口」组（含嵌套 models[]/模型定义编辑）。
     for t in _srv._TARGETS:
         port = t["listenPort"]
         r = _result_map.get(port)
@@ -1091,9 +1067,12 @@ async def dashboard():
         meta_badges = [
             ("稳定性高" if is_stable else "稳定性低", "b-meta-stable" if is_stable else "b-meta-unstable"),
         ]
-        # 协议标签：gemini-native 是 OpenAI↔Gemini 转换；其余 target（crack/透传/trae-work）客户端均走 OpenAI 协议
+        # 协议标签：gemini-native 是 OpenAI↔Gemini 转换；anthropic 是 Anthropic 翻译入口；
+        # 其余 target（crack/透传/trae-work）客户端均走 OpenAI 协议
         if t.get("handler") == "gemini-native":
             meta_badges.append(("Gemini协议", "b-meta-gemini"))
+        elif t.get("handler") == "anthropic":
+            meta_badges.append(("Anthropic 协议", "b-meta-anthropic"))
         else:
             meta_badges.append(("OpenAI 协议", "b-meta-oa"))
         secret = _cfg.resolve_secret(t, _srv._SECRETS)
@@ -1174,6 +1153,17 @@ async def dashboard():
                 f'</div>'
             )
 
+        if t.get("handler") == "anthropic":
+            # 8081 Anthropic 入口：无上游 token，展示模型定义编辑（models[] 路由配置）
+            raw_html = (
+                '<div class="model-ops">'
+                '  <button class="model-edit-toggle" onclick="openModelsEditor(this)" '
+                '    title="编辑模型定义（name/别名 → 下游端口+真实模型，可指向聚合虚拟模型 agg:xxx）">✏️ 模型定义</button>'
+                '</div>'
+            )
+        else:
+            raw_html = token_edit
+
         card = _build_card_html(
             name=f"{t['label']}",
             note="统一透传引擎 · targets.json 驱动",
@@ -1186,7 +1176,7 @@ async def dashboard():
             stats_detail=_make_stats_detail(r),
             description=f"category={category} · handler={t.get('handler','passthrough')} · isFree={t.get('isFree')}",
             accent_class=f"accent-{port}",
-            raw_html=token_edit,
+            raw_html=raw_html,
             label=t["label"],
             port=port,
             meta_badges=meta_badges,
@@ -1197,7 +1187,10 @@ async def dashboard():
                        if _srv._MODEL_REGISTRY is not None
                        else (_target_model_source(t) == "copilot" or t.get("hasModels") is True)),
         )
-        if category == "crack":
+        if t.get("handler") == "anthropic":
+            # 8081 Anthropic 翻译入口（targets[] 中 handler=anthropic，无上游）
+            entry_cards.append(card)
+        elif category == "crack":
             crack_cards.append(card)
         elif category == "aggregate":
             # 聚合网关卡片已手动构建（含状态区/编辑按钮），循环跳过避免重复
@@ -1215,7 +1208,8 @@ async def dashboard():
         )
 
     cards_html = (
-        _render_group("聚合网关", agg_cards)
+        _render_group("Anthropic 入口", entry_cards)
+        + _render_group("聚合网关", agg_cards)
         + _render_group("破解网关", crack_cards)
         + _render_group("直连网关", direct_cards)
     )
@@ -1236,7 +1230,7 @@ async def dashboard():
 </head>
 <body>
   <h1>🔀 LLM Gateway — 管理总览</h1>
-  <div class="sub">8081 Anthropic (FastAPI) → 8082 copilot (透传) → 上游 · 统一 targets.json 驱动 <span class="refresh-time">· 手动刷新 · {datetime.now().strftime("%H:%M:%S")}</span></div>
+  <div class="sub">8081 Anthropic 翻译入口（models[] 路由）→ 本地 target 端口 · 管理面 8079 · 统一 targets.json 驱动 <span class="refresh-time">· 手动刷新 · {datetime.now().strftime("%H:%M:%S")}</span></div>
   <div class="overview-bar">
     <div class="kpi-grid">
       <div class="kpi-card">

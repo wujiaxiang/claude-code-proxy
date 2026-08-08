@@ -682,23 +682,23 @@ _HANDLER_PATH_MAP = {
         "/v1/models": "/models",
         "/v1/responses": "/responses",
     },
-    "deepseek": {
-        "/v1/chat/completions": "/chat/completions",
-        "/v1/models": "/models",
-    },
 }
 
 
-def _rewrite_upstream_path(handler: str, raw_path: str, route_prefix: str) -> str:
-    """按 handler 精准映射上游路径；无映射时退回通用 routePrefix 重写。
+def _rewrite_upstream_path(handler: str, raw_path: str, route_prefix: str, strip_v1: bool = False) -> str:
+    """按 handler 精准映射上游路径；无映射时退回通用 routePrefix / stripV1 重写。
 
-    优先级：handler 映射表 > routePrefix 重写 > 原样。
+    优先级：handler 映射表 > routePrefix 重写 > stripV1 剥离 > 原样。
+    stripV1：上游为 OpenAI 兼容但无 /v1 前缀（如 DeepSeek api.deepseek.com 直接挂
+    /chat/completions）时，把客户端 /v1/xxx 剥成 /xxx。
     """
     handler_map = _HANDLER_PATH_MAP.get(handler or "")
     if handler_map and raw_path in handler_map:
         return handler_map[raw_path]
     if route_prefix and raw_path.startswith("/v1"):
         return route_prefix + raw_path[3:]
+    if strip_v1 and raw_path.startswith("/v1"):
+        return raw_path[3:]
     return raw_path
 
 
@@ -1192,6 +1192,7 @@ async def _handle_target_request(reader, writer, target):  # pyright: ignore[rep
                 target.get("handler", "passthrough"),
                 raw_path,
                 target.get("routePrefix", ""),
+                bool(target.get("stripV1", False)),
             )
             if _use_responses:
                 upstream_path = "/responses"

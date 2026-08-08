@@ -62,12 +62,15 @@ async def api_targets():
 
 @dashboard_router.put("/api/models")
 async def api_update_models(update: ModelsUpdate):
-    """更新全局模型定义，写 targets.json 顶层 models[]/modelDefaults 并热重载。"""
+    """更新模型定义，写 targets.json 的 anthropic target（8081）嵌套 models[]/modelDefaults 并热重载。"""
     cfg = _cfg.load_targets()
+    anth = _cfg._get_anthropic_target(cfg)
+    if anth is None:
+        raise HTTPException(status_code=422, detail="targets.json 缺少 handler=anthropic 的 8081 target（模型定义归属）")
     if update.models is not None:
-        cfg["models"] = update.models
+        anth["models"] = update.models
     if update.modelDefaults is not None:
-        cfg["modelDefaults"] = update.modelDefaults
+        anth["modelDefaults"] = update.modelDefaults
     errors = _cfg.validate_targets(cfg)
     if errors:
         raise HTTPException(status_code=422, detail=errors)

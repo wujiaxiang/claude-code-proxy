@@ -680,40 +680,30 @@ def test_get_target_models_aggregator():
 
 
 # ─── P2: DeepSeek handler 进入 VALID_HANDLERS（RED：handler="deepseek" 尚未注册）───
-def test_validate_deepseek_handler():
-    """handler="deepseek" 的合法 target 应通过 validate_targets（返回 []）。
-
-    当前 VALID_HANDLERS = ("passthrough", "copilot", "qclaw",
-    "gemini-native", "trae-work", "aggregator") 不含 "deepseek"，
-    所以 validate_targets 会报 targets[0].handler 非法 → 返回非空错误列表
-    → 断言 == [] 失败 → RED。后续任务需在 config_store 注册该 handler。
-    """
-    target = {"label": "deepseek", "listenPort": 8095, "category": "free",
-              "handler": "deepseek", "targetHost": "api.deepseek.com",
-              "targetPort": 443, "targetProtocol": "https", "enabled": True}
-    cfg = {"targets": [target]}
-    errors = validate_targets(cfg)
-    assert errors == [], f"deepseek handler 应被接受，实际报错: {errors}"
-    print("PASS test_validate_deepseek_handler: deepseek handler accepted by validate_targets")
-
-
-# ─── P3: DeepSeek 直连网关路径重写（RED：_HANDLER_PATH_MAP 尚未含 "deepseek" 键）───
 def test_deepseek_path_rewrite():
-    """deepseek handler 应把 /v1 前缀重写为 DeepSeek 上游路径（无 /v1）。
+    """stripV1 标志应把 /v1 前缀剥离为无 /v1 上游路径（DeepSeek api.deepseek.com）。
 
     DeepSeek 上游 API 是 https://api.deepseek.com（无 /v1 前缀），
-    端点 POST /chat/completions、GET /models。
-    当前 _HANDLER_PATH_MAP 无 "deepseek" 键，_rewrite_upstream_path 走
-    routePrefix 空分支返回原样 /v1/chat/completions → 与期望不等 → RED。
+    端点 POST /chat/completions、GET /models。target 用 handler=passthrough +
+    stripV1=true 表达路径剥离（不再用自定义 deepseek handler）。
     """
     import server as _srv
-    got_chat = _srv._rewrite_upstream_path("deepseek", "/v1/chat/completions", "")
+    # stripV1=true 时剥离 /v1
+    got_chat = _srv._rewrite_upstream_path("passthrough", "/v1/chat/completions", "", True)
     assert got_chat == "/chat/completions", \
-        f"deepseek /v1/chat/completions 应重写为 /chat/completions，实际: {got_chat!r}"
-    got_models = _srv._rewrite_upstream_path("deepseek", "/v1/models", "")
+        f"stripV1 /v1/chat/completions 应重写为 /chat/completions，实际: {got_chat!r}"
+    got_models = _srv._rewrite_upstream_path("passthrough", "/v1/models", "", True)
     assert got_models == "/models", \
-        f"deepseek /v1/models 应重写为 /models，实际: {got_models!r}"
-    print("PASS test_deepseek_path_rewrite: deepseek path rewrite correct")
+        f"stripV1 /v1/models 应重写为 /models，实际: {got_models!r}"
+    # stripV1=false（默认）时保留原样
+    got_default = _srv._rewrite_upstream_path("passthrough", "/v1/chat/completions", "")
+    assert got_default == "/v1/chat/completions", \
+        f"无 stripV1 应保留原样，实际: {got_default!r}"
+    # routePrefix 优先级高于 stripV1
+    got_prefix = _srv._rewrite_upstream_path("passthrough", "/v1/chat/completions", "/api/v1", True)
+    assert got_prefix == "/api/v1/chat/completions", \
+        f"routePrefix 应优先于 stripV1，实际: {got_prefix!r}"
+    print("PASS test_deepseek_path_rewrite: stripV1 path rewrite correct")
 
 
 # ─── T3: 8081 作为 targets[] 条目（handler="anthropic" + 嵌套 models/modelDefaults）───

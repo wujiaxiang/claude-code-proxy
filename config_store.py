@@ -16,7 +16,7 @@ TARGETS_PATH = Path(__file__).parent / "targets.json"
 SECRETS_PATH = Path(__file__).parent / "secrets.json"
 
 VALID_CATEGORIES = ("crack", "free", "paid", "aggregate")
-VALID_HANDLERS = ("passthrough", "copilot", "qclaw", "gemini-native", "trae-work", "aggregator", "deepseek", "anthropic")
+VALID_HANDLERS = ("passthrough", "copilot", "qclaw", "gemini-native", "trae-work", "aggregator", "anthropic")
 
 _REQUIRED_FIELDS = ("label", "listenPort", "category", "handler", "targetHost")
 
