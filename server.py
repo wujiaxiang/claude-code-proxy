@@ -7,17 +7,12 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 from typing import AsyncIterator, Callable, List, Dict, Any, Optional, Union, Literal
 import httpx
 import os
-import socket
-import base64
 import asyncio
-import inspect
-import struct
 from urllib.parse import urlparse
 from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.responses import HTMLResponse
 import uuid
 import time
-import re
 from datetime import datetime
 from pathlib import Path
 import sys
@@ -229,7 +224,6 @@ codebuddy_logger = _setup_gateway_logger("codebuddy")
 traework_logger = _setup_gateway_logger("trae-work")
 
 # Configure uvicorn to be quieter
-import uvicorn
 
 # Tell uvicorn's loggers to be quiet
 logging.getLogger("uvicorn").setLevel(logging.WARNING)
@@ -408,7 +402,6 @@ async def lifespan(app):
 app = FastAPI(lifespan=lifespan)
 
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import JSONResponse
 
 @app.exception_handler(RequestValidationError)
 async def validation_exception_handler(request: Request, exc: RequestValidationError):
@@ -426,23 +419,6 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
         f"📋 BODY PREVIEW: {json.dumps(body_json, ensure_ascii=False)[:2000]}"
     )
     return JSONResponse(status_code=422, content={"detail": exc.errors(), "body": body_json})
-
-# Get API keys from environment
-ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
-OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
-
-# Get custom base URLs from environment
-OPENAI_BASE_URL = os.environ.get("OPENAI_BASE_URL")
-ANTHROPIC_BASE_URL = os.environ.get("ANTHROPIC_BASE_URL")
-
-# Gemini thought_signature 存储：tool_use_id → signature
-_thought_signatures: Dict[str, str] = {}
-
-# Vertex AI (Google Cloud)
-VERTEX_PROJECT = os.environ.get("VERTEX_PROJECT", "unset")
-VERTEX_LOCATION = os.environ.get("VERTEX_LOCATION", "unset")
-USE_VERTEX_AUTH = os.environ.get("USE_VERTEX_AUTH", "False").lower() == "true"
 
 # ─── QClaw 上游直连配置 ───
 # 上游 LLM 接口（OpenAI 兼容），从 QClaw 客户端本地存储解密 API Key。
