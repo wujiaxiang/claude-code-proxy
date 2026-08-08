@@ -1,4 +1,4 @@
-"""验证上游限流错误被正确转成 429 / SSE error 事件，覆盖多网关多格式 + 配置表驱动。
+"""验证上游限流错误被正确转成 429，覆盖多网关多格式 + 配置表驱动。
 
 对应文档：docs/error-code-mapping.md
 
@@ -10,18 +10,7 @@
    - 标准 OAI:   {"error":{"type":"rate_limit_error",...}}
    - 配置表驱动：新增一行 keyword（如 "quota_exceeded"）即可被识别
    - 非限流（如 authentication_error）不被误判
-2. LiteLLM 翻译路径（qclaw/copilot/anthropic/gemini）：litellm 抛 RateLimitError
-   → openai_chat_completions 返回 HTTP 429 + Retry-After
-3. LiteLLM 非限流异常 → 500 不变
-
-用 FastAPI TestClient 但不进入 with 上下文（避免触发 lifespan 绑定端口）。
 """
-from unittest.mock import patch, AsyncMock
-
-import litellm
-from litellm.exceptions import RateLimitError
-from fastapi.testclient import TestClient
-
 import server
 
 
@@ -46,14 +35,6 @@ STANDARD_OAI_BODY = (
 NON_RATE_BODY = '{"error":{"message":"invalid api key","type":"authentication_error"}}'
 
 
-def _make_rate_limit_error():
-    return RateLimitError(
-        "ResourceExhausted: Worker local total request limit reached (32/32)",
-        llm_provider="qclaw",
-        model="some-model",
-    )
-
-
 def test_error_map_table_driven():
     """配置表驱动：多网关限流格式 + 新增 keyword 都能识别，非限流不误判。"""
     assert server._map_upstream_error(OPENROUTER_BODY) == (429, "rate_limit_error")
@@ -73,53 +54,6 @@ def test_error_map_table_driven():
     print("[PASS] 配置表驱动：openrouter(ResourceExhausted/rate-limited)/nvidia/标准OAI + 扩展keyword 均识别，非限流不误判")
 
 
-def test_litellm_rate_limit_returns_429():
-    orig_provider = server.PREFERRED_PROVIDER
-    server.PREFERRED_PROVIDER = "anthropic"
-    try:
-        with patch.object(
-            server.litellm, "acompletion", new=AsyncMock(side_effect=_make_rate_limit_error())
-        ):
-            client = TestClient(server.app)
-            resp = client.post(
-                "/v1/chat/completions",
-                json={
-                    "model": "claude-sonnet-4-5",
-                    "messages": [{"role": "user", "content": "hi"}],
-                    "stream": False,
-                },
-            )
-        assert resp.status_code == 429, f"期望 429，实际 {resp.status_code}: {resp.text}"
-        assert resp.headers.get("retry-after"), "缺少 Retry-After 头"
-        print(f"[PASS] LiteLLM 限流 → 429, Retry-After={resp.headers.get('retry-after')}")
-    finally:
-        server.PREFERRED_PROVIDER = orig_provider
-
-
-def test_litellm_non_rate_limit_stays_500():
-    orig_provider = server.PREFERRED_PROVIDER
-    server.PREFERRED_PROVIDER = "anthropic"
-    try:
-        with patch.object(
-            server.litellm, "acompletion", new=AsyncMock(side_effect=ValueError("boom"))
-        ):
-            client = TestClient(server.app)
-            resp = client.post(
-                "/v1/chat/completions",
-                json={
-                    "model": "claude-sonnet-4-5",
-                    "messages": [{"role": "user", "content": "hi"}],
-                    "stream": False,
-                },
-            )
-        assert resp.status_code == 500, f"期望 500，实际 {resp.status_code}: {resp.text}"
-        print("[PASS] LiteLLM 非限流异常 → 500 (保持不变)")
-    finally:
-        server.PREFERRED_PROVIDER = orig_provider
-
-
 if __name__ == "__main__":
     test_error_map_table_driven()
-    test_litellm_rate_limit_returns_429()
-    test_litellm_non_rate_limit_stays_500()
     print("ALL TESTS PASSED")

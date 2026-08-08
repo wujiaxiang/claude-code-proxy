@@ -265,22 +265,58 @@ def _load_cfg_with(raw: dict) -> dict:
         p.unlink(missing_ok=True)
 
 
+#   精简后 server 段只有三个顶层键（8081 legacy 清理）。旧键 preferredProvider /
+#   legacyModels / copilot / qclaw 已从 DEFAULT_SERVER_CONFIG 移除。
+SLIM_SERVER_KEYS = {"listenPort", "log", "cache"}
+REMOVED_SERVER_KEYS = ("preferredProvider", "legacyModels", "copilot", "qclaw")
+
+
+def test_server_section_slim_shape():
+    """DEFAULT_SERVER_CONFIG 与 load_targets 的 server 段都只有 listenPort/log/cache 三键。"""
+    default_keys = set(config_store.DEFAULT_SERVER_CONFIG)
+    assert default_keys == SLIM_SERVER_KEYS, \
+        f"DEFAULT_SERVER_CONFIG 应只含 {sorted(SLIM_SERVER_KEYS)}，实际 {sorted(default_keys)}"
+    cfg = _load_cfg_with({"targets": [], "modelDefaults": {"defaultPort": 8082}, "models": []})
+    srv_keys = set(cfg["server"])
+    assert srv_keys == SLIM_SERVER_KEYS, \
+        f"load_targets 的 server 段应只含 {sorted(SLIM_SERVER_KEYS)}，实际 {sorted(srv_keys)}"
+    for removed in REMOVED_SERVER_KEYS:
+        assert removed not in default_keys, f"DEFAULT_SERVER_CONFIG 不应再有 {removed}"
+        assert removed not in srv_keys, f"server 段不应再有 {removed}"
+
+
 def test_server_section_defaults_when_absent():
-    """缺失 server 段 → load_targets 返回完整默认（7 顶层键 + 关键默认值）。"""
+    """缺失 server 段 → load_targets 返回完整默认（3 顶层键 + 关键默认值）。"""
     cfg = _load_cfg_with({"targets": [], "modelDefaults": {"defaultPort": 8082}, "models": []})
     srv = cfg["server"]
     assert set(srv) == set(config_store.DEFAULT_SERVER_CONFIG), \
         f"server 顶层键应与 DEFAULT_SERVER_CONFIG 一致，实际 {sorted(srv)}"
-    assert len(srv) == 7, f"server 应有 7 个顶层键，实际 {len(srv)}: {sorted(srv)}"
+    assert len(srv) == 3, f"server 应有 3 个顶层键，实际 {len(srv)}: {sorted(srv)}"
     assert srv["listenPort"] == 8081, srv["listenPort"]
-    assert srv["preferredProvider"] == "openai", srv["preferredProvider"]
     assert srv["log"]["file"] == "", repr(srv["log"]["file"])
     assert srv["log"]["debug"] is False, srv["log"]["debug"]
-    assert srv["copilot"]["gheHost"] == "copilot-api.bmw.ghe.com", srv["copilot"]["gheHost"]
-    assert "mmgrcalltoken" in srv["qclaw"]["baseUrl"], srv["qclaw"]["baseUrl"]
     assert srv["cache"]["enabled"] is True and srv["cache"]["maxSize"] == 500, srv["cache"]
-    assert srv["legacyModels"] == {"big": "gpt-4.1", "medium": "gpt-4.1", "small": "gpt-4.1-mini"}, \
-        srv["legacyModels"]
+
+
+def test_server_section_legacy_keys_ignored():
+    """未迁移的旧配置（server 段含已删除的旧键）→ 校验不报错，load_targets 正常。"""
+    legacy = {
+        "listenPort": 8081,
+        "preferredProvider": "openai",
+        "legacyModels": {"big": "gpt-4.1", "medium": "gpt-4.1", "small": "gpt-4.1-mini"},
+        "copilot": {"gheHost": "copilot-api.bmw.ghe.com", "integrationId": "copilot-developer-cli"},
+        "qclaw": {"baseUrl": "https://mmgrcalltoken.3g.qq.com/aizone/v1"},
+        "log": {"debug": True},
+    }
+    errors = validate_targets({"targets": [], "models": [], "server": legacy})
+    assert errors == [], f"server 段的未知旧键应被静默忽略，实际报错: {errors}"
+    cfg = _load_cfg_with({"targets": [], "modelDefaults": {"defaultPort": 8082},
+                          "models": [], "server": legacy})
+    srv = cfg["server"]
+    assert srv["listenPort"] == 8081, srv["listenPort"]
+    assert srv["log"]["debug"] is True, srv["log"]
+    assert srv["log"]["retentionDays"] == 7, "未提供的 log 子键仍取默认"
+    assert srv["cache"] == config_store.DEFAULT_SERVER_CONFIG["cache"], srv["cache"]
 
 
 def test_server_section_deep_merge_log():
@@ -294,18 +330,6 @@ def test_server_section_deep_merge_log():
     assert srv["log"]["rotateInterval"] == 1, srv["log"]
     assert srv["listenPort"] == 8081, "未提供的顶层标量应取默认"
     assert srv["cache"] == config_store.DEFAULT_SERVER_CONFIG["cache"], srv["cache"]
-
-
-def test_server_section_deep_merge_copilot():
-    """部分 server.copilot → 只覆盖 gheHost，其余 copilot 子键默认。"""
-    cfg = _load_cfg_with({"targets": [], "server": {"copilot": {"gheHost": "x.example.com"}}})
-    cop = cfg["server"]["copilot"]
-    assert cop["gheHost"] == "x.example.com", cop
-    assert cop["integrationId"] == "copilot-developer-cli", cop
-    assert cop["bigModel"] == "claude-sonnet-4.6", cop
-    assert cop["mediumModel"] == "claude-sonnet-4.6", cop
-    assert cop["smallModel"] == "claude-haiku-4.5", cop
-    assert cfg["server"]["log"] == config_store.DEFAULT_SERVER_CONFIG["log"], cfg["server"]["log"]
 
 
 def test_validate_server_section_clean_passes():
@@ -339,30 +363,6 @@ def test_validate_server_type_errors():
             f"server={server!r} 应报 path={want_path}，实际 {sorted(_paths(errors))}"
         assert any(e["path"] == want_path and e["msg"] == want_msg for e in errors), \
             f"server={server!r} 应报 msg={want_msg!r}，实际 {errors}"
-
-
-def test_validate_server_preferred_provider():
-    """server.preferredProvider 非法枚举 → 报错且 msg 列出合法值；合法值不报错。"""
-    errors = _server_errors({"preferredProvider": "foo"})
-    _assert_structured(errors, "preferredProvider=foo")
-    assert "server.preferredProvider" in _paths(errors), sorted(_paths(errors))
-    msg = next(e["msg"] for e in errors if e["path"] == "server.preferredProvider")
-    assert msg.startswith("server.preferredProvider must be one of"), msg
-    assert "openai" in msg and "anthropic" in msg, msg
-    assert _server_errors({"preferredProvider": "openai"}) == [], "合法 provider 不应报错"
-
-
-def test_validate_server_legacy_models_type_error():
-    """server.legacyModels.big 为 int → 非空字符串错误；legacyModels 非 dict → object 错误。"""
-    errors = _server_errors({"legacyModels": {"big": 123}})
-    _assert_structured(errors, "legacyModels.big=123")
-    assert any(e["path"] == "server.legacyModels.big"
-               and e["msg"] == "server.legacyModels.big must be a non-empty string"
-               for e in errors), errors
-    errors2 = _server_errors({"legacyModels": "nope"})
-    assert any(e["path"] == "server.legacyModels"
-               and e["msg"] == "server.legacyModels must be an object"
-               for e in errors2), errors2
 
 
 def test_validate_server_listen_port_vs_target_port_current_behavior():

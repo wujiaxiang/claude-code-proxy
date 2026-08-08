@@ -6,7 +6,10 @@
 
 覆盖分支（server.py create_message）：
   分支 A  models[] 映射命中 → anthropic→openai 翻译 → 转发本地端口 /v1/chat/completions
-  分支 B  PREFERRED_PROVIDER == "copilot" → Copilot /v1/messages 原生透传 + 3 次重试
+
+仅覆盖分支 A：原分支 B（PREFERRED_PROVIDER == "copilot" 的 Copilot /v1/messages
+原生透传 + 3 次重试）已随「8081 legacy 单端口模式大清理」删除，其用例与
+PREFERRED_PROVIDER 注入管道一并移除。分支 A 只由 _MODELS_CFG 注入驱动。
 
 不需要任何真实端口：全部通过 ASGI 直调 app + 替换 server.httpx.AsyncClient 完成。
 分支 C（LiteLLM）不在本次重构范围，未覆盖。
@@ -69,20 +72,6 @@ class FakeResponse:
         self.closed = True
 
 
-class _StreamCtx:
-    """client.stream(...) 返回的 async context manager。"""
-
-    def __init__(self, resp):
-        self._resp = resp
-
-    async def __aenter__(self):
-        return self._resp
-
-    async def __aexit__(self, *exc):
-        await self._resp.aclose()
-        return False
-
-
 def make_fake_client_cls(script, calls):
     """
     构造假 AsyncClient 类。
@@ -122,16 +111,6 @@ def make_fake_client_cls(script, calls):
         async def send(self, req, stream=False):
             calls.append(("send", req["url"], {"stream": stream}))
             return _next()
-
-        # 分支 B 非流式用 post
-        async def post(self, url, **kw):
-            calls.append(("post", url, kw))
-            return _next()
-
-        # 分支 B 流式用 stream
-        def stream(self, method, url, **kw):
-            calls.append(("stream", url, kw))
-            return _StreamCtx(_next())
 
     return FakeAsyncClient
 
@@ -235,13 +214,12 @@ async def _asgi_post_events(path, body_obj, headers=None):
     return out["status"], out["headers"], out["events"]
 
 
-def run_case(script, body_obj, models_cfg=None, provider="copilot", headers=None):
+def run_case(script, body_obj, models_cfg=None, headers=None):
     """
     在受控环境跑一次 /v1/messages：
       - 替换 server.httpx.AsyncClient 为假客户端（按 script 回放）
-      - 注入 models[] 配置（None 表示空，用于强制走分支 B）
-      - 注入 PREFERRED_PROVIDER
-      - asyncio.sleep 打桩为记录耗时（避免真等 0.5s 且可断言 backoff）
+      - 注入 models[] 配置（分支 A 的唯一开关）
+      - asyncio.sleep 打桩为记录耗时（可断言 backoff）
     返回 (status, headers, body_bytes, calls, sleeps)
     """
     calls = []
@@ -255,20 +233,17 @@ def run_case(script, body_obj, models_cfg=None, provider="copilot", headers=None
         return await real_sleep(0)
 
     old_models = _srv._MODELS_CFG
-    old_provider = _srv.PREFERRED_PROVIDER
     try:
         _srv._MODELS_CFG = models_cfg if models_cfg is not None else {"models": [], "modelDefaults": {}}
-        _srv.PREFERRED_PROVIDER = provider
         with patch.object(_srv.httpx, "AsyncClient", fake_cls), \
              patch.object(_srv.asyncio, "sleep", fake_sleep):
             status, hdrs, raw = asyncio.run(_asgi_post("/v1/messages", body_obj, headers))
     finally:
         _srv._MODELS_CFG = old_models
-        _srv.PREFERRED_PROVIDER = old_provider
     return status, hdrs, raw, calls, sleeps
 
 
-def run_case_events(script, body_obj, models_cfg=None, provider="copilot", headers=None):
+def run_case_events(script, body_obj, models_cfg=None, headers=None):
     """与 run_case 相同，但返回 (status, headers, body_events, calls, sleeps)，
     body_events 为 http.response.body 事件的原始列表（未拼接）。"""
     calls = []
@@ -282,16 +257,13 @@ def run_case_events(script, body_obj, models_cfg=None, provider="copilot", heade
         return await real_sleep(0)
 
     old_models = _srv._MODELS_CFG
-    old_provider = _srv.PREFERRED_PROVIDER
     try:
         _srv._MODELS_CFG = models_cfg if models_cfg is not None else {"models": [], "modelDefaults": {}}
-        _srv.PREFERRED_PROVIDER = provider
         with patch.object(_srv.httpx, "AsyncClient", fake_cls), \
              patch.object(_srv.asyncio, "sleep", fake_sleep):
             status, hdrs, events = asyncio.run(_asgi_post_events("/v1/messages", body_obj, headers))
     finally:
         _srv._MODELS_CFG = old_models
-        _srv.PREFERRED_PROVIDER = old_provider
     return status, hdrs, events, calls, sleeps
 
 
@@ -485,181 +457,6 @@ def test_branch_a_non_stream_rate_limit_mapped_to_429():
     assert data["error"]["original_status"] == 500, data
     assert hdrs.get("retry-after"), f"应带 Retry-After 头，实到 {hdrs}"
     # 非可识别错误仍原样透传由 test_branch_a_non_stream_upstream_502 锁定（不变）
-
-
-# ============================================================
-# 分支 B —— Copilot /v1/messages 原生透传 + 3 次重试
-# ============================================================
-
-def test_branch_b_non_stream_retry_then_success():
-    """
-    分支 B 非流式：第 1 次 500 → 第 2 次 200。
-    锁定：共 2 次请求、第 2 次前 sleep 0.5s、响应 model 还原为原始请求名。
-    """
-    ok = {"id": "msg_1", "type": "message", "model": "copilot-internal",
-          "content": [{"type": "text", "text": "ok"}]}
-    script = [FakeResponse(500, body=b'{"error":"boom"}'),
-              FakeResponse(200, body=json.dumps(ok).encode())]
-
-    status, _, raw, calls, sleeps = run_case(script, _req("claude-3-5-sonnet"), provider="copilot")
-
-    assert status == 200, f"期望 200，实到 {status}"
-    assert len(calls) == 2, f"期望重试 1 次共 2 请求，实到 {len(calls)}"
-    assert sleeps == [0.5], f"期望重试前 backoff 0.5s，实到 {sleeps}"
-    data = json.loads(raw)
-    assert data["model"] == "claude-3-5-sonnet", f"model 未还原: {data['model']}"
-
-
-def test_branch_b_non_stream_retry_exhausted_502():
-    """
-    分支 B 非流式：连续 500。
-    锁定当前行为 —— attempt 0/1 命中 `status>=500 and attempt<2` 重试；
-    attempt 2（第 3 次）**不再重试而是直接回传上游 500**，
-    因此最终返回 500 而非 502。502 只在连接异常耗尽时出现。
-    """
-    script = [FakeResponse(500, body=b'{"error":"e1"}'),
-              FakeResponse(500, body=b'{"error":"e2"}'),
-              FakeResponse(500, body=b'{"error":"e3"}')]
-
-    status, _, raw, calls, sleeps = run_case(script, _req("claude-3-5-sonnet"), provider="copilot")
-
-    assert len(calls) == 3, f"期望最多 3 次请求，实到 {len(calls)}"
-    assert sleeps == [0.5, 0.5], f"期望两次 backoff，实到 {sleeps}"
-    assert status == 500, f"锁定：第 3 次 500 直接回传上游状态码，实到 {status}"
-    assert json.loads(raw) == {"error": "e3"}, raw
-
-
-def test_branch_b_non_stream_connect_error_exhausted_502():
-    """分支 B 非流式：3 次均连接失败 → HTTPException 502（重试真正耗尽的路径）。"""
-    err = _srv.httpx.ConnectError("conn refused")
-    script = [err, err, err]
-
-    status, _, raw, calls, sleeps = run_case(script, _req("claude-3-5-sonnet"), provider="copilot")
-
-    assert len(calls) == 3, f"期望 3 次尝试，实到 {len(calls)}"
-    assert sleeps == [0.5, 0.5], f"期望两次 backoff，实到 {sleeps}"
-    assert status == 502, f"期望 502，实到 {status}"
-    assert "upstream unavailable" in raw.decode(), raw
-
-
-def test_branch_b_stream_retry_then_success():
-    """
-    分支 B 流式：第 1 次 500（读干后重试）→ 第 2 次 200 正常透传。
-    锁定：2 次 stream 调用、1 次 0.5s backoff、chunk 原样透传（无 [DONE] 追加）。
-    """
-    body = b'event: message_start\ndata: {"type":"message_start"}\n\n'
-    script = [FakeResponse(500, body=b'{"error":"boom"}'),
-              FakeResponse(200, body=body, chunks=[body[:20], body[20:]])]
-
-    status, hdrs, raw, calls, sleeps = run_case(
-        script, _req("claude-3-5-sonnet", stream=True), provider="copilot"
-    )
-
-    assert status == 200, f"期望 200，实到 {status}"
-    assert "text/event-stream" in hdrs.get("content-type", ""), hdrs
-    assert len(calls) == 2 and all(c[0] == "stream" for c in calls), calls
-    assert sleeps == [0.5], f"期望一次 backoff，实到 {sleeps}"
-    # 分支 B 流式与分支 A 不同：不追加 data: [DONE]
-    assert raw == body, f"透传字节不符: {raw!r}"
-
-
-def test_branch_b_stream_retry_exhausted_error_frame():
-    """
-    分支 B 流式：连续 3 次 500 → 3 次 stream 调用、2 次 backoff，
-    锁定当前行为：HTTP 状态仍是 200（StreamingResponse 头已发出），
-    body 是一个**裸 JSON 错误对象**（没有 SSE `data: ` 前缀，也没有 event 行）。
-    """
-    script = [FakeResponse(500, body=b'{"error":"e1"}'),
-              FakeResponse(500, body=b'{"error":"e2"}'),
-              FakeResponse(500, body=b'{"error":"e3"}')]
-
-    status, hdrs, raw, calls, sleeps = run_case(
-        script, _req("claude-3-5-sonnet", stream=True), provider="copilot"
-    )
-
-    assert status == 200, f"流式错误当前仍为 200，实到 {status}"
-    assert len(calls) == 3, f"期望 3 次尝试，实到 {len(calls)}"
-    assert sleeps == [0.5, 0.5], f"期望两次 backoff，实到 {sleeps}"
-    assert not raw.startswith(b"data: "), f"锁定：错误帧无 SSE 前缀，实到 {raw!r}"
-    data = json.loads(raw)
-    assert data["error"]["type"] == "proxy_error", data
-    assert "upstream 500" in data["error"]["message"], data
-
-
-def test_branch_b_stream_connect_error_exhausted_error_frame():
-    """分支 B 流式：3 次连接异常 → 同样输出裸 JSON 错误帧，携带异常字符串。"""
-    err = _srv.httpx.ReadError("read failed")
-    status, _, raw, calls, sleeps = run_case(
-        [err, err, err], _req("claude-3-5-sonnet", stream=True), provider="copilot"
-    )
-    assert status == 200, status
-    assert sleeps == [0.5, 0.5], sleeps
-    data = json.loads(raw)
-    assert "read failed" in data["error"]["message"], data
-
-
-def test_branch_b_body_cleanup_blank_content_and_tool_choice():
-    """
-    分支 B 请求体清洗锁定：
-      - content 为空白字符串 → 替换为 "."
-      - 有 tool_choice 但无 tools → 移除 tool_choice
-    """
-    ok = {"id": "m", "type": "message", "model": "x", "content": []}
-    script = [FakeResponse(200, body=json.dumps(ok).encode())]
-    body = {
-        "model": "claude-3-5-sonnet",
-        "max_tokens": 16,
-        "tool_choice": {"type": "auto"},
-        "messages": [
-            {"role": "user", "content": "   "},
-            {"role": "user", "content": "real"},
-        ],
-    }
-    status, _, _, calls, _ = run_case(script, body, provider="copilot")
-
-    assert status == 200, status
-    sent = calls[0][2]["json"]
-    contents = [m["content"] for m in sent["messages"]]
-    assert contents == [".", "real"], f"空白 content 未被替换: {contents}"
-    assert "tool_choice" not in sent, "无 tools 时 tool_choice 应被移除"
-
-
-def test_branch_b_null_content_rejected_by_pydantic_422():
-    """
-    锁定一处现状缺陷：create_message 里 `if c is None or ...: msg["content"] = "."`
-    的 **None 分支经 HTTP 永远走不到** —— MessagesRequest.content 的类型是
-    Union[str, List[...]]，content=null 在进入 handler 前就被 Pydantic 判 422。
-    即上游根本收不到该请求，清洗代码是死分支。
-
-    本测试锁定「返回 422 且未发出任何上游请求」。若重构时放宽了模型校验
-    （让 None 真正走到清洗逻辑），此断言会 FAIL —— 那是预期的行为变更信号。
-    """
-    script = [FakeResponse(200, body=b'{"id":"m","type":"message","content":[]}')]
-    body = {
-        "model": "claude-3-5-sonnet",
-        "max_tokens": 16,
-        "messages": [{"role": "assistant", "content": None}],
-    }
-    status, _, _, calls, _ = run_case(script, body, provider="copilot")
-
-    assert status == 422, f"锁定：content=null 被 Pydantic 拒绝，实到 {status}"
-    assert calls == [], f"422 时不应触达上游，实到 {calls}"
-
-
-def test_branch_a_wins_over_branch_b():
-    """
-    分支优先级锁定：models[] 命中时即便 PREFERRED_PROVIDER==copilot，
-    也走分支 A（转发本地端口），不进 Copilot 透传。
-    """
-    up = {"id": "c", "object": "chat.completion", "model": MAPPED_MODEL,
-          "choices": [{"index": 0, "message": {"role": "assistant", "content": "A"}, "finish_reason": "stop"}]}
-    resp = FakeResponse(200, body=json.dumps(up).encode())
-    status, _, _, calls, _ = run_case(
-        [resp], _req("lock-test-model"), models_cfg=_MODELS_CFG_FIXTURE, provider="copilot"
-    )
-    assert status == 200, status
-    assert calls[0][0] == "send", f"应走分支 A 的 build_request/send，实到 {calls[0][0]}"
-    assert f":{MAPPED_PORT}" in calls[0][1], calls[0][1]
 
 
 def main():
