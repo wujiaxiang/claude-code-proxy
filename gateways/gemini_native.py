@@ -267,11 +267,4 @@ async def _handle_gemini_native(writer, target, method, path, headers, body, sta
             pass
 
 
-def _gemini_provider(req, litellm_req, orig):
-    """Gemini 原生 API — 走 LiteLLM（gemini/ 前缀），框架内置 thoughtSignature 处理"""
-    from server import logger
-    litellm_req["api_key"] = os.environ.get("GEMINI_API_KEY", "")
-    # 不修改 req.model，让 LiteLLM 的 gemini/ 前缀路由正常工作
-    # 模型名在非流式响应中由 convert_litellm_to_anthropic 后的 original_model 还原
-    logger.debug(f"☀️ Gemini via LiteLLM: → {litellm_req.get('model')}")
-    return None  # LiteLLM 处理剩余流程
+

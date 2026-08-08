@@ -22,14 +22,10 @@ _REQUIRED_FIELDS = ("label", "listenPort", "category", "handler", "targetHost")
 
 # 顶层 server 段默认配置（.env 并入 targets.json 的单一事实源）。
 # 用户 server 段与此做一层深合并：顶层子键缺失补默认，嵌套 dict 的键缺失补默认。
+# 8081 legacy 清理：preferredProvider/legacyModels/copilot/qclaw 已移除（旧键静默忽略），
+# 只剩 listenPort/log/cache 三个运行时键。
 DEFAULT_SERVER_CONFIG = {
     "listenPort": 8081,               # 原 ANTHROPIC_PORT env
-    "preferredProvider": "openai",    # 原 PREFERRED_PROVIDER env
-    "legacyModels": {                 # 原 BIG_MODEL/MEDIUM_MODEL/SMALL_MODEL env（仍被模型映射消费）
-        "big": "gpt-4.1",
-        "medium": "gpt-4.1",
-        "small": "gpt-4.1-mini",
-    },
     "log": {                          # 原 DEBUG/LOG_FILE/LOG_RETENTION_DAYS/LOG_ROTATE_WHEN/LOG_ROTATE_INTERVAL
         "debug": False,
         "file": "",
@@ -43,30 +39,19 @@ DEFAULT_SERVER_CONFIG = {
         "ttlSeconds": 3600,
         "maxItemSizeKb": 100,
     },
-    "copilot": {                      # 原 COPILOT_GHE_HOST/COPILOT_INTEGRATION_ID/COPILOT_BIG|MEDIUM|SMALL_MODEL
-        "gheHost": "copilot-api.bmw.ghe.com",
-        "integrationId": "copilot-developer-cli",
-        "bigModel": "claude-sonnet-4.6",
-        "mediumModel": "claude-sonnet-4.6",
-        "smallModel": "claude-haiku-4.5",
-    },
-    "qclaw": {                        # 原 QCLAW_BASE_URL（QCLAW_API_KEY 是私密凭据，留在 secrets.json）
-        "baseUrl": "https://mmgrcalltoken.3g.qq.com/aizone/v1",
-    },
 }
 
 # anthropic-compatible 入口端口：与 server.py 的 _ANTHROPIC_PORT 默认值同源，
 # 统一从 DEFAULT_SERVER_CONFIG 派生（单一事实源，勿再硬编码 8081）。
 ANTHROPIC_PORT = DEFAULT_SERVER_CONFIG["listenPort"]
 
-# server 段嵌套 dict 子键（做一层深合并）
-_SERVER_DICT_KEYS = ("legacyModels", "log", "cache", "copilot", "qclaw")
-
 
 def _merge_server_config(user_server: dict) -> dict:
     """把用户 server 段深合并到 DEFAULT_SERVER_CONFIG 上（一层深合并，不递归）。
 
-    顶层子键缺失用默认；嵌套 dict（legacyModels/log/cache/copilot/qclaw）键缺失补默认。
+    顶层子键缺失用默认；嵌套 dict（log/cache）键缺失补默认。
+    已删除的旧键（preferredProvider/legacyModels/copilot/qclaw）不在
+    DEFAULT_SERVER_CONFIG 中，合并后被自然丢弃（静默忽略）。
     """
     merged = {}
     for key, default_val in DEFAULT_SERVER_CONFIG.items():
@@ -202,11 +187,8 @@ def validate_targets(cfg: dict) -> list:
     return errors
 
 
-_VALID_PROVIDERS = ("openai", "anthropic", "qclaw", "gemini", "gemini-openai", "copilot")
-
-
 def _validate_server_config(server, errors: list) -> None:
-    """校验顶层 server 段（缺失或空 dict 不报错，默认值兜底）。"""
+    """校验顶层 server 段（缺失或空 dict 不报错，默认值兜底；未知旧键静默忽略）。"""
     if server is None:
         return
     if not isinstance(server, dict):
@@ -218,25 +200,6 @@ def _validate_server_config(server, errors: list) -> None:
     port = server.get("listenPort")
     if port is not None and (isinstance(port, bool) or not isinstance(port, int) or port < 0):
         _err(errors, "server.listenPort", "server.listenPort must be a non-negative integer")
-
-    provider = server.get("preferredProvider")
-    if provider is not None:
-        if not isinstance(provider, str) or provider not in _VALID_PROVIDERS:
-            _err(errors, "server.preferredProvider",
-                 f"server.preferredProvider must be one of {_VALID_PROVIDERS}")
-
-    def _non_empty_str(section: dict, key: str, path: str) -> None:
-        v = section.get(key)
-        if v is not None and (not isinstance(v, str) or not v):
-            _err(errors, path, f"{path} must be a non-empty string")
-
-    legacy = server.get("legacyModels")
-    if legacy is not None:
-        if not isinstance(legacy, dict):
-            _err(errors, "server.legacyModels", "server.legacyModels must be an object")
-        else:
-            for k in ("big", "medium", "small"):
-                _non_empty_str(legacy, k, f"server.legacyModels.{k}")
 
     log = server.get("log")
     if log is not None:
@@ -274,21 +237,6 @@ def _validate_server_config(server, errors: list) -> None:
                 if v is not None and (isinstance(v, bool) or not isinstance(v, int) or v < 0):
                     _err(errors, f"server.cache.{k}",
                          f"server.cache.{k} must be a non-negative integer")
-
-    copilot = server.get("copilot")
-    if copilot is not None:
-        if not isinstance(copilot, dict):
-            _err(errors, "server.copilot", "server.copilot must be an object")
-        else:
-            for k in ("gheHost", "integrationId", "bigModel", "mediumModel", "smallModel"):
-                _non_empty_str(copilot, k, f"server.copilot.{k}")
-
-    qclaw = server.get("qclaw")
-    if qclaw is not None:
-        if not isinstance(qclaw, dict):
-            _err(errors, "server.qclaw", "server.qclaw must be an object")
-        else:
-            _non_empty_str(qclaw, "baseUrl", "server.qclaw.baseUrl")
 
 
 def _validate_models(models: list, errors: list) -> None:

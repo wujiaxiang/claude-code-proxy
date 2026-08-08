@@ -5,10 +5,12 @@
 #   1. Copilot Responses API 桥接（/chat/completions ↔ /responses 双向转换）
 #   2. Provider 策略（模型名映射 + LiteLLM 请求装配）
 #
-# 注：COPILOT_GHE_TOKEN / COPILOT_API_BASE / COPILOT_INTEGRATION_ID /
-# COPILOT_{BIG,MEDIUM,SMALL}_MODEL 仍留在 server.py —— 其中 COPILOT_GHE_TOKEN 是
-# 热重载可变全局（_load_vendor_targets/_reload_targets/_refresh_secrets 里 global
-# 重赋值），import 绑定的是快照会丢失热更新，因此一律在函数内延迟导入取实时值。
+# 注：COPILOT_GHE_TOKEN 仍留在 server.py —— 它是热重载可变全局
+# （_load_vendor_targets/_reload_targets/_refresh_secrets 里 global 重赋值），
+# import 绑定的是快照会丢失热更新，因此一律在函数内延迟导入取实时值。
+# 原 COPILOT_API_BASE / COPILOT_INTEGRATION_ID / COPILOT_{BIG,MEDIUM,SMALL}_MODEL
+# 已函数化（_copilot_api_base()/_copilot_integration_id()/_copilot_*_model()），
+# 每次调用从 copilot target 实时推导。
 import json
 import time
 import uuid
@@ -377,18 +379,18 @@ async def _write_copilot_responses_stream(writer, resp, model: str, label: str) 
 
 def _copilot_model_name(anthropic_model: str) -> str:
     """把 Anthropic 模型名映射到 Copilot 企业可用模型名"""
-    from server import COPILOT_BIG_MODEL, COPILOT_MEDIUM_MODEL, COPILOT_SMALL_MODEL
+    from server import _copilot_big_model, _copilot_medium_model, _copilot_small_model
     m = anthropic_model.lower()
     # 去掉 provider 前缀
     for prefix in ("anthropic/", "openai/", "copilot/"):
         if m.startswith(prefix):
             m = m[len(prefix):]
     if "opus" in m:
-        return COPILOT_BIG_MODEL
+        return _copilot_big_model()
     if "sonnet" in m:
-        return COPILOT_MEDIUM_MODEL
+        return _copilot_medium_model()
     if "haiku" in m:
-        return COPILOT_SMALL_MODEL
+        return _copilot_small_model()
     # 如果已经是 copilot 的模型名（如 claude-sonnet-4.6），直接使用
     return m
 
@@ -400,38 +402,3 @@ def _is_claude_family_model(model_name: str) -> bool:
             m = m[len(prefix):]
             break
     return m.startswith("claude-") or "claude" in m
-
-
-def _copilot_provider(req, litellm_req, orig):
-    """GitHub Copilot Enterprise — 走 LiteLLM（与 qclaw 同一路径）"""
-    # COPILOT_GHE_TOKEN 为热重载可变全局，必须在调用时取实时值（勿改为模块级 import）
-    from server import (
-        COPILOT_GHE_TOKEN,
-        COPILOT_API_BASE,
-        COPILOT_INTEGRATION_ID,
-        logger,
-    )
-    # 模型映射
-    target_model = _copilot_model_name(orig)
-    litellm_req["model"] = f"openai/{target_model}"
-    litellm_req["api_key"] = COPILOT_GHE_TOKEN
-    litellm_req["api_base"] = COPILOT_API_BASE
-    litellm_req["extra_headers"] = {"Copilot-Integration-Id": COPILOT_INTEGRATION_ID}
-
-    # 模型能力分流：Claude 家族不接受采样参数，GPT 家族保留
-    if _is_claude_family_model(target_model):
-        for k in ("temperature", "top_p", "top_k", "min_p"):
-            litellm_req.pop(k, None)
-
-    # Copilot 不接受空/None 消息 content
-    for msg in litellm_req.get("messages", []):
-        c = msg.get("content")
-        if c is None or (isinstance(c, str) and not c.strip()):
-            msg["content"] = "."
-
-    # Copilot 不接受没有 tools 时的 tool_choice
-    if litellm_req.get("tool_choice") and not litellm_req.get("tools"):
-        litellm_req.pop("tool_choice")
-
-    logger.debug(f"🤖 Copilot via LiteLLM: → {litellm_req['model']}")
-    return None  # 继续走 LiteLLM

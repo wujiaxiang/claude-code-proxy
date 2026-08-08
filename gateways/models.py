@@ -8,9 +8,13 @@
      _MODEL_REGISTRY 会在 _load_vendor_targets / _reload_targets / _refresh_secrets 里被
      `global` 重新赋值。一律写 `_srv.<NAME>` 属性访问，每次读到的都是当前对象；
      若写成模块级 `from server import X` 值拷贝，热重载后会读到旧配置。
-  2. **稳定符号**（函数 / logger / PREFERRED_PROVIDER / COPILOT_* / OPENAI_* 等）——
+  2. **稳定符号**（函数 / logger / _copilot_* / OPENAI_* 等）——
      在各自使用函数体内 `from server import X` 延迟导入（模块级 import 会撞上
      server.py 顶部 re-export 的循环导入，且值拷贝在热重载后读到旧值）。
+
+上游能力判据不走全局 preferredProvider 配置（单一 provider 假设，多 target 世界下已失真），
+改为扫描 _TARGETS 里是否存在对应 handler 的 enabled target（见
+_has_enabled_target_with_handler），天然随热重载生效。
 """
 
 import asyncio
@@ -27,14 +31,27 @@ import httpx
 #      `global` 重新赋值或随配置更新。一律写 `_srv.<NAME>` 属性访问，每次读到的
 #      都是当前对象；若写成模块级 `from server import X` 值拷贝，热重载后会读到
 #      旧快照。
-#   2. **稳定符号**（函数 / logger / PREFERRED_PROVIDER / COPILOT_* / OPENAI_* 等）——
+#   2. **稳定符号**（函数 / logger / _copilot_* / OPENAI_* 等）——
 #      在各自使用函数体内 `from server import X` 延迟导入。
 #   为什么一律延迟：models 被 server.py 顶部 re-export import（from gateways.models
 #   import ...），若此处模块级 `from server import X`，会在 server 尚在初始化、X 尚未
-#   定义时触发循环导入 ImportError（COPILOT_API_BASE 等定义在 server.py ~650 行，
+#   定义时触发循环导入 ImportError（_copilot_* 函数定义在 server.py 中部，
 #   晚于 models 的 import 点）。延迟到函数体后，调用时 server 已完成加载，且每次读到
 #   当前值。
 import server as _srv
+
+
+def _has_enabled_target_with_handler(handler: str) -> bool:
+    """当前配置里是否存在指定 handler 的 enabled target。
+
+    取代旧的全局 preferredProvider 判据：单一 provider 的假设在多 target 架构下已失真
+    （同时跑 copilot / qclaw / codebuddy 时，一个全局字段只能表达其中一个）。
+    读的是热重载全局 _srv._TARGETS，配置改动即时生效，无需缓存失效逻辑。
+    """
+    return any(
+        t.get("handler") == handler and t.get("enabled", True)
+        for t in _srv._TARGETS
+    )
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -312,18 +329,15 @@ def _humanize_model_name(mid) -> str:
 
 
 async def _fetch_downstream_models() -> List[dict]:
-    """从下游网关拉取模型列表，按下游 endpoint 区分 provider 拉取方式。
+    """从下游网关拉取模型列表（dashboard / /v1/models 的下游预览来源）。
 
-    - copilot / openai / qclaw：直连下游 /models（OpenAI 格式）
+    - 存在 enabled 的 copilot handler target 时：直连 Copilot /models（OpenAI 格式）
     - 返回统一格式的 model dict 列表
     """
     from server import (
-        COPILOT_API_BASE,
         COPILOT_GHE_TOKEN,
-        COPILOT_INTEGRATION_ID,
-        OPENAI_API_KEY,
-        OPENAI_BASE_URL,
-        PREFERRED_PROVIDER,
+        _copilot_api_base,
+        _copilot_integration_id,
         logger,
     )
     global _DOWNSTREAM_MODELS_CACHE, _DOWNSTREAM_MODELS_CACHE_TIME
@@ -333,13 +347,13 @@ async def _fetch_downstream_models() -> List[dict]:
 
     downstream = []
     try:
-        if PREFERRED_PROVIDER == "copilot":
+        if _has_enabled_target_with_handler("copilot"):
             async with httpx.AsyncClient(timeout=httpx.Timeout(10.0), trust_env=False) as client:
                 resp = await client.get(
-                    f"{COPILOT_API_BASE}/models",
+                    f"{_copilot_api_base()}/models",
                     headers={
                         "Authorization": f"Bearer {COPILOT_GHE_TOKEN}",
-                        "Copilot-Integration-Id": COPILOT_INTEGRATION_ID,
+                        "Copilot-Integration-Id": _copilot_integration_id(),
                     },
                 )
                 if resp.status_code == 200:
@@ -370,25 +384,13 @@ async def _fetch_downstream_models() -> List[dict]:
                             "tokenizer": caps.get("tokenizer"),
                             "preview": m.get("preview", False),
                         })
-        elif PREFERRED_PROVIDER in ("openai",):
-            # OpenAI 上游
-            base = OPENAI_BASE_URL or "https://api.openai.com/v1"
-            url = base.rstrip("/") + "/models"
-            async with httpx.AsyncClient(timeout=httpx.Timeout(10.0), trust_env=False) as client:
-                resp = await client.get(url, headers={"Authorization": f"Bearer {OPENAI_API_KEY}"})
-                if resp.status_code == 200:
-                    data = resp.json()
-                    for m in data.get("data", []):
-                        downstream.append({
-                            "id": m["id"],
-                            "object": "model",
-                            "created": m.get("created", 1700000000),
-                            "owned_by": m.get("owned_by", "openai"),
-                            "display_name": m.get("id", ""),
-                        })
+        # 有意的 feature reduction：旧代码在全局 provider 配置为 "openai" 时拉
+        # OPENAI_BASE_URL/models 作下游预览。多 target 架构下不存在"那个 openai 上游"
+        # —— 每个 passthrough target 各有自己的 host/key，单一全局 OPENAI_* 已无意义。
+        # 逐 target 的模型预览由 _fetch_live_models(target) 承担（编辑弹框用）。
 
         if downstream:
-            logger.debug(f"Fetched {len(downstream)} downstream models from {PREFERRED_PROVIDER}")
+            logger.debug(f"Fetched {len(downstream)} downstream models from copilot")
             _DOWNSTREAM_MODELS_CACHE = downstream
             _DOWNSTREAM_MODELS_CACHE_TIME = now
     except Exception as e:
@@ -402,8 +404,8 @@ async def _fetch_downstream_models() -> List[dict]:
 def _build_models_list(include_aliases: bool = True) -> List[dict]:
     """构建模型列表，同时兼容 OpenAI 和 Anthropic 两套规范。
 
-    - copilot/openai provider：从下游 /models 拉取 + Claude Code 别名
-    - 其他 provider：硬编码列表 + 别名
+    - 存在 enabled 的 copilot handler target：用下游 /models 缓存 + Claude Code 别名
+    - 无下游缓存时：按 enabled 的 qclaw / copilot handler 给硬编码 fallback + 别名
     - include_aliases=True：加 Anthropic 别名（8081 Anthropic 端口用）
     - include_aliases=False：只返回真实下游模型（8082 OpenAI 端口用）
 
@@ -411,10 +413,9 @@ def _build_models_list(include_aliases: bool = True) -> List[dict]:
     两套字段都塞进去，各取所需。
     """
     from server import (
-        COPILOT_BIG_MODEL,
-        COPILOT_MEDIUM_MODEL,
-        COPILOT_SMALL_MODEL,
-        PREFERRED_PROVIDER,
+        _copilot_big_model,
+        _copilot_medium_model,
+        _copilot_small_model,
     )
     models: List[dict] = []
 
@@ -436,7 +437,7 @@ def _build_models_list(include_aliases: bool = True) -> List[dict]:
                     "display_name": _humanize_model_name(_m["name"]),
                 })
 
-    # ── 能用下游 /models 的 provider：直接用缓存的列表（异步预拉取在 startup 完成）──
+    # ── 能用下游 /models 的 handler：直接用缓存的列表（异步预拉取在 startup 完成）──
     _downstream = _DOWNSTREAM_MODELS_CACHE or []
     if _downstream:
         for dm in _downstream:
@@ -447,7 +448,7 @@ def _build_models_list(include_aliases: bool = True) -> List[dict]:
 
     # ── 无下游缓存的 fallback（qclaw / gemini / anthropic 等）──
     _passthrough_models = []
-    if PREFERRED_PROVIDER in ("qclaw",):
+    if _has_enabled_target_with_handler("qclaw"):
         _passthrough_models = [
             ("modelroute", "QClaw Model Route"),
             ("pool-deepseek-v4-pro", "DeepSeek V4 Pro"),
@@ -459,11 +460,11 @@ def _build_models_list(include_aliases: bool = True) -> List[dict]:
             ("pool-minimax-m3", "MiniMax M3"),
             ("pool-minimax-m2.7", "MiniMax M2.7"),
         ]
-    elif PREFERRED_PROVIDER == "copilot":
+    elif _has_enabled_target_with_handler("copilot"):
         _passthrough_models = [
-            (COPILOT_BIG_MODEL, "Copilot Big"),
-            (COPILOT_MEDIUM_MODEL, "Copilot Medium"),
-            (COPILOT_SMALL_MODEL, "Copilot Small"),
+            (_copilot_big_model(), "Copilot Big"),
+            (_copilot_medium_model(), "Copilot Medium"),
+            (_copilot_small_model(), "Copilot Small"),
         ]
 
     for mid, display in _passthrough_models:

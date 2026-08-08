@@ -30,62 +30,6 @@ def _clean_qclaw_body(body: dict) -> dict:
     return cleaned
 
 
-async def _passthrough_to_qclaw(
-    litellm_req: dict,
-    request,  # type: ignore - MessagesRequest defined later
-    original_model: str,
-    request_id: str,
-):
-    """绕过 litellm，直接用 httpx 打 QClaw 网关的 /chat/completions。
-    用于 9002 重试——litellm 内部缓存状态重置不彻底，只能绕过去。
-    """
-    from server import get_http_client, QCLAW_API_KEY, QCLAW_BASE_URL, StreamingResponse, HTTPException, _convert_oai_to_anthropic
-    mapped_model = litellm_req["model"]
-    if "/" in mapped_model:
-        mapped_model = mapped_model.split("/", 1)[1]  # openai/xxx -> xxx
-
-    body = {
-        "model": mapped_model,
-        "messages": litellm_req["messages"],
-        "max_tokens": litellm_req.get("max_tokens") or litellm_req.get("max_completion_tokens", 4096),
-    }
-    if litellm_req.get("temperature") is not None:
-        body["temperature"] = litellm_req["temperature"]
-    if litellm_req.get("top_p") is not None:
-        body["top_p"] = litellm_req["top_p"]
-    if litellm_req.get("tools"):
-        body["tools"] = litellm_req["tools"]
-
-    headers = {
-        "Authorization": f"Bearer {QCLAW_API_KEY}",
-        "Content-Type": "application/json",
-        "User-Agent": "OpenAI/JS 6.39.1",  # 上游拒绝 python-httpx 默认 UA
-    }
-
-    client = await get_http_client()
-    url = QCLAW_BASE_URL.rstrip("/") + "/chat/completions"
-
-    if getattr(request, "stream", False):
-        body["stream"] = True
-        async def _stream():
-            async with client.stream("POST", url, json=body, headers=headers) as resp:
-                if resp.status_code >= 400:
-                    error_text = await resp.aread()
-                    yield f"data: {{\"error\":\"upstream {resp.status_code}: {error_text.decode('utf-8', errors='replace')[:200]}\"}}\n\n".encode()
-                    yield b"data: [DONE]\n\n"
-                    return
-                async for chunk in resp.aiter_bytes():
-                    yield chunk
-        return StreamingResponse(_stream(), media_type="text/event-stream")
-    else:
-        resp = await client.post(url, json=body, headers=headers, timeout=300.0)
-        if resp.status_code >= 400:
-            raise HTTPException(status_code=resp.status_code, detail=f"upstream: {resp.text[:500]}")
-        data = resp.json()
-        # 转换为 Anthropic 格式
-        return _convert_oai_to_anthropic(data, request, original_model)
-
-
 def _dpapi_unprotect(encrypted_bytes: bytes) -> bytes:
     """Windows DPAPI 解密（Chrome 风格 os_crypt 的 AES 密钥保护层）。"""
     import ctypes
@@ -177,29 +121,3 @@ def _decrypt_qclaw_api_key() -> str:
     except Exception as e:
         logger.warning(f"Failed to decrypt QClaw API key: {e}")
         return ""
-
-
-def _qclaw_provider(req, litellm_req, orig):
-    """QClaw 上游直连（OpenAI 兼容接口）"""
-    from server import QCLAW_API_KEY, QCLAW_BASE_URL, logger
-    litellm_req["api_key"] = QCLAW_API_KEY
-    litellm_req["api_base"] = QCLAW_BASE_URL
-    litellm_req["extra_headers"] = {"User-Agent": "OpenAI/JS 6.39.1"}  # 上游拒绝 python-httpx 默认 UA
-    # 清理 litellm 内部字段和 Anthropic 专属字段，防止上游拒绝非标准参数
-    for k in ("stop", "top_k", "metadata", "thinking", "reasoning",
-              "reasoning_effort", "extra_body", "provider_specific_fields",
-              "custom_llm_provider", "model_info"):
-        litellm_req.pop(k, None)
-    msgs = litellm_req.get("messages", [])
-    if not any(m.get("role") == "system" for m in msgs):
-        msgs.insert(0, {"role": "system", "content": "You are Claude, a helpful AI assistant."})
-    # 恢复上游原始 max_tokens（此值可能在 convert 阶段被 OpenAI/Gemini 截断）
-    original_max = litellm_req.pop("_original_max_tokens", None)
-    if original_max is not None and original_max != litellm_req.get("max_completion_tokens"):
-        litellm_req["max_completion_tokens"] = original_max
-        logger.debug(f"🐙 QClaw: restored max_tokens {litellm_req['max_completion_tokens']} -> {original_max}")
-
-    req.model = orig
-    max_tok = litellm_req.get("max_completion_tokens", "N/A")
-    logger.debug(f"🐙 QClaw: {req.model} max_tokens={max_tok} stream={litellm_req.get('stream')} extra_body=(not set)")
-    return None  # 继续走 LiteLLM

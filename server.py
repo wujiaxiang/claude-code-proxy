@@ -15,7 +15,6 @@ import struct
 from urllib.parse import urlparse
 from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.responses import HTMLResponse
-import litellm
 import uuid
 import time
 import re
@@ -32,10 +31,8 @@ if __name__ == "__main__" and "server" not in sys.modules:
 from gateways.qclaw import (
     _QCLAW_ALLOWED_KEYS,
     _clean_qclaw_body,
-    _passthrough_to_qclaw,
     _dpapi_unprotect,
     _decrypt_qclaw_api_key,
-    _qclaw_provider,
 )
 
 # Copilot 网关符号（从 gateways/copilot.py 拆分导入；内部对 server 模块为延迟导入，无循环依赖）
@@ -49,7 +46,6 @@ from gateways.copilot import (
     _write_copilot_responses_stream,
     _copilot_model_name,
     _is_claude_family_model,
-    _copilot_provider,
 )
 
 # CodeBuddy 网关符号（从 gateways/codebuddy.py 拆分导入；内部对 server 模块为延迟导入，无循环依赖）
@@ -68,7 +64,6 @@ from gateways.gemini_native import (
     _gemini_to_openai_response,
     _gemini_chunk_to_openai,
     _handle_gemini_native,
-    _gemini_provider,
 )
 
 # Trae Work 网关符号（从 gateways/trae_work.py 拆分导入；内部对 server 模块为延迟导入，无循环依赖）
@@ -93,24 +88,14 @@ from gateways.models import (
 import gateways.models as _gmodels  # 模型缓存状态（_DOWNSTREAM_MODELS_CACHE）归 gateways.models 模块所有，需模块属性实时读取
 
 # 翻译层符号（从 server.py 拆出至 gateways/translate.py；内部对 server 模块为延迟导入，
-# 模块级仅通过 PEP 562 惰性引用 provider 策略函数，无循环依赖）
+# 现仅保留 token 估算族——LiteLLM 翻译链与 provider 策略已随分支 C 删除）
 from gateways.translate import (
-    _PROVIDER_STRATEGIES,
-    _close_json_fragment,
-    _convert_oai_to_anthropic,
-    _default_provider,
     _estimate_messages_tokens,
-    _estimate_text_tokens,
-    _extract_text_from_content,
-    _litellm_oai_stream,
-    _map_model_name,
-    clean_gemini_schema,
 )
 
 # 错误翻译层（从 gateways/errors.py 下沉；内部对 server 模块为延迟导入，无循环依赖）
 from gateways.errors import (
     _is_auth_expired_error,
-    _is_rate_limit_error,
     _VENDOR_ERROR_MAPS,
     _VENDOR_ERROR_PATTERNS,
     _VENDOR_RETRY_AFTER,
@@ -320,40 +305,6 @@ async def get_http_client() -> httpx.AsyncClient:
         )
     return _http_client
 
-async def _reset_litellm_clients():
-    """清除 litellm 内部缓存的 HTTP 客户端 + 代理自身连接池，强制重新创建连接。
-    当 QClaw 网关 upstream auth 过期返回 9002 时调用。"""
-    import litellm as _llm
-    # 1) 关闭代理自己的 httpx 连接池（透传路径用）
-    global _http_client
-    if _http_client and not _http_client.is_closed:
-        await _http_client.aclose()
-        _http_client = None
-        logger.info("🔄 proxy http client reset")
-    # 2) 清除 litellm 异步客户端
-    try:
-        await _llm.close_litellm_async_clients()  # pyright: ignore[reportPrivateImportUsage] - litellm 未在 __all__ 导出但为公开运行时 API
-        logger.info("🔄 litellm async clients reset")
-    except Exception as _e:
-        logger.warning(f"Failed to reset litellm async clients: {_e}")
-    # 3) 清除 litellm 同步客户端缓存
-    try:
-        if hasattr(_llm, "in_memory_llm_clients_cache"):
-            cache = _llm.in_memory_llm_clients_cache
-            if hasattr(cache, "cache_dict"):
-                cache.cache_dict.clear()
-                logger.info("🔄 litellm in-memory client cache cleared")
-    except Exception as _e:
-        logger.warning(f"Failed to clear litellm cache dict: {_e}")
-    # 4) 用 importlib 重载 litellm 的 openai adapter 模块，强制重建 client
-    try:
-        import litellm.llms.openai.openai as oai_mod
-        import importlib
-        importlib.reload(oai_mod)
-        logger.info("🔄 litellm openai adapter reloaded")
-    except Exception as _e:
-        logger.warning(f"Failed to reload openai adapter: {_e}")
-
 
 @asynccontextmanager
 async def lifespan(app):
@@ -368,7 +319,7 @@ async def lifespan(app):
 
     # 启动诊断：验证 QClaw 链路是否正常
     import httpx as _httpx
-    _qclaw_diag_base = QCLAW_BASE_URL
+    _qclaw_diag_base = _qclaw_base_url()
     try:
         async with _httpx.AsyncClient(timeout=_httpx.Timeout(10.0), trust_env=False) as _diag:
             _r = await _diag.post(
@@ -380,12 +331,11 @@ async def lifespan(app):
     except Exception as _e:
         logger.warning(f"startup diag: QClaw upstream unreachable: {_e}")
     # 预热下游模型列表缓存（copilot/openai 等能从 /models 拉取的 provider）
-    if PREFERRED_PROVIDER in ("copilot", "openai"):
-        try:
-            await _fetch_downstream_models()
-            logger.info(f"startup: preloaded {len(_gmodels._DOWNSTREAM_MODELS_CACHE or [])} downstream models")
-        except Exception as _me:
-            logger.warning(f"startup: failed to preload downstream models: {_me}")
+    try:
+        await _fetch_downstream_models()
+        logger.info(f"startup: preloaded {len(_gmodels._DOWNSTREAM_MODELS_CACHE or [])} downstream models")
+    except Exception as _me:
+        logger.warning(f"startup: failed to preload downstream models: {_me}")
 
     # ── 破解类 target：缺 key 时自动调用破解工具提取 ──
     for t in _TARGETS:
@@ -495,8 +445,9 @@ VERTEX_LOCATION = os.environ.get("VERTEX_LOCATION", "unset")
 USE_VERTEX_AUTH = os.environ.get("USE_VERTEX_AUTH", "False").lower() == "true"
 
 # ─── QClaw 上游直连配置 ───
-# 上游 LLM 接口（OpenAI 兼容），从 QClaw 客户端本地存储解密 API Key
-QCLAW_BASE_URL = _SERVER_CFG["qclaw"]["baseUrl"]
+# 上游 LLM 接口（OpenAI 兼容），从 QClaw 客户端本地存储解密 API Key。
+# base URL 不再读 server 段（已删除 server.qclaw），由 _qclaw_base_url() 在调用时
+# 从 qclaw target（targetHost + routePrefix）实时推导（见下方函数，定义在 _TARGETS 之后）。
 
 
 QCLAW_API_KEY = _decrypt_qclaw_api_key()
@@ -509,74 +460,13 @@ else:
 # COPILOT_GHE_TOKEN：私密凭据，已收敛到 secrets.json copilot_token 字段（唯一事实源，
 # 与 8082 企业 GHE target 的 secretRef 同源）。模块加载时从 env 读一次作初始兜底；
 # _load_vendor_targets() / _reload_targets() / _refresh_secrets() 热重载时从 secrets.json
-# 覆盖（dashboard 可编辑、热生效）。其余 COPILOT_* 为纯配置，读 targets.json server 段。
+# 覆盖（dashboard 可编辑、热生效）。
 COPILOT_GHE_TOKEN = os.environ.get("COPILOT_GHE_TOKEN", "")
-COPILOT_GHE_HOST = _SERVER_CFG["copilot"]["gheHost"]
-COPILOT_INTEGRATION_ID = _SERVER_CFG["copilot"]["integrationId"]
-# api_base for LiteLLM（不含路径，LiteLLM 会追加 /chat/completions）
-COPILOT_API_BASE = f"https://{COPILOT_GHE_HOST}"
-# Copilot 模型映射（opus→big, sonnet→medium, haiku→small）
-COPILOT_BIG_MODEL    = _SERVER_CFG["copilot"]["bigModel"]
-COPILOT_MEDIUM_MODEL = _SERVER_CFG["copilot"]["mediumModel"]
-COPILOT_SMALL_MODEL  = _SERVER_CFG["copilot"]["smallModel"]
-
-# Get preferred provider
-PREFERRED_PROVIDER = str(_SERVER_CFG["preferredProvider"]).lower()
-valid_providers = ("openai", "anthropic", "qclaw", "gemini", "gemini-openai", "copilot")
-if PREFERRED_PROVIDER not in valid_providers:
-    print(f"Warning: Unknown PREFERRED_PROVIDER '{PREFERRED_PROVIDER}', falling back to 'openai'")
-    PREFERRED_PROVIDER = "openai"
-
-print(f"🚀 Preferred provider: {PREFERRED_PROVIDER}")
-
-# 注册 QClaw 模型到 LiteLLM，避免 "model isn't mapped" 错误
-if PREFERRED_PROVIDER in ("qclaw",):
-    _qclaw_all_models = {
-        m: {
-            "max_tokens": 16384, "input_cost_per_token": 0, "output_cost_per_token": 0,
-            "litellm_provider": "openai", "mode": "chat",
-        }
-        for m in [
-            "modelroute",
-            "pool-hy3-preview",
-            "pool-deepseek-v4-pro",
-            "pool-deepseek-v4-flash",
-            "pool-glm-5.2",
-            "pool-glm-5.2-night",
-            "pool-glm-5.1",
-            "pool-kimi-k2.7-code-highspeed",
-            "pool-kimi-k2.6",
-            "pool-minimax-m3",
-            "pool-minimax-m2.7",
-        ]
-    }
-    litellm.register_model(_qclaw_all_models)
-    print("🐙 QClaw models registered in LiteLLM")
-
-# 注册 Copilot 模型到 LiteLLM，避免 "model isn't mapped" 错误
-if PREFERRED_PROVIDER == "copilot":
-    _copilot_models = {
-        m: {"max_tokens": 64000, "input_cost_per_token": 0, "output_cost_per_token": 0,
-            "litellm_provider": "openai", "mode": "chat"}
-        for m in [
-            COPILOT_BIG_MODEL, COPILOT_MEDIUM_MODEL, COPILOT_SMALL_MODEL,
-            # 全量可用模型（来自 /models API，2026-06）
-            "claude-haiku-4.5", "claude-sonnet-4.5", "claude-sonnet-4.6",
-            "claude-opus-4.5", "claude-opus-4.6", "claude-opus-4.8",
-            "gpt-5.5", "gpt-5.4", "gpt-5.3-codex", "gpt-5-mini",
-            "gpt-4.1", "gpt-4.1-2025-04-14",
-            "gpt-4o-mini", "gpt-4o-mini-2024-07-18",
-            "gpt-3.5-turbo", "gpt-3.5-turbo-0613",
-            "gemini-2.5-pro",
-        ]
-    }
-    litellm.register_model(_copilot_models)
-    print("🤖 Copilot models registered in LiteLLM")
-
-# Get model mapping configuration from targets.json server 段（legacyModels）
-BIG_MODEL = _SERVER_CFG["legacyModels"]["big"]
-MEDIUM_MODEL = _SERVER_CFG["legacyModels"]["medium"]
-SMALL_MODEL = _SERVER_CFG["legacyModels"]["small"]
+# 其余 COPILOT_*（host/integrationId/模型角色）不再是模块级常量：模块加载时 _TARGETS
+# 尚为空列表（_load_vendor_targets 在 lifespan 才填充），且已删除 server.copilot 段。
+# 改为函数化实时解析（见下方 _copilot_ghe_host/_copilot_integration_id/_copilot_api_base/
+# _copilot_big_model/_copilot_medium_model/_copilot_small_model，定义在 _TARGETS 之后），
+# 每次调用从第一个 enabled 的 copilot handler target 推导，天然随热重载生效。
 
 # ─── 统一透传引擎配置（targets.json 驱动）───
 _TARGETS: list = []
@@ -587,6 +477,63 @@ _TARGET_STATS: Dict[str, dict] = {}
 _MODEL_STATS: Dict[str, Dict[str, Dict[str, int]]] = {}
 # 模型别名/转发目标配置（targets.json 顶层 models[] + modelDefaults）
 _MODELS_CFG: dict = {"models": [], "modelDefaults": {"defaultPort": 8082}}
+
+
+def _first_enabled_target_with_handler(handler: str) -> Optional[dict]:
+    """返回第一个 enabled 且 handler 匹配的 target，无则 None。每次调用实时扫 _TARGETS。"""
+    for t in _TARGETS:
+        if t.get("handler") == handler and t.get("enabled", True):
+            return t
+    return None
+
+
+def _copilot_ghe_host() -> str:
+    """Copilot GHE host：从第一个 enabled 的 copilot handler target 的 targetHost 推导。"""
+    t = _first_enabled_target_with_handler("copilot")
+    return (t or {}).get("targetHost", "")
+
+
+def _copilot_integration_id() -> str:
+    """Copilot Integration-Id：从 copilot target 的 extraHeaders.Copilot-Integration-Id 推导。"""
+    t = _first_enabled_target_with_handler("copilot")
+    return ((t or {}).get("extraHeaders") or {}).get("Copilot-Integration-Id", "")
+
+
+def _copilot_api_base() -> str:
+    """api_base（不含路径，LiteLLM 会追加 /chat/completions）。"""
+    host = _copilot_ghe_host()
+    return f"https://{host}" if host else ""
+
+
+def _copilot_model_role(role: str) -> str:
+    """Copilot 模型角色（big/medium/small）：从 copilot target 的 modelRoles 推导。"""
+    t = _first_enabled_target_with_handler("copilot")
+    return ((t or {}).get("modelRoles") or {}).get(role, "")
+
+
+def _copilot_big_model() -> str:
+    return _copilot_model_role("big")
+
+
+def _copilot_medium_model() -> str:
+    return _copilot_model_role("medium")
+
+
+def _copilot_small_model() -> str:
+    return _copilot_model_role("small")
+
+
+def _qclaw_base_url() -> str:
+    """QClaw 上游 base URL：从 qclaw target 的 targetHost + routePrefix 推导。
+
+    qclaw target 的 handler 是 passthrough（非 "qclaw"），故按 label 匹配。
+    """
+    for t in _TARGETS:
+        if t.get("label") == "qclaw" and t.get("enabled", True):
+            host = t.get("targetHost", "")
+            prefix = t.get("routePrefix", "")
+            return f"https://{host}{prefix}" if host else ""
+    return ""
 
 # ─── 聚合网关（8080）单例引擎 + 重载去重签名 ───
 _AGGREGATOR_ENGINE = None  # type: ignore
@@ -1461,26 +1408,6 @@ async def _vendor_server(host, port, target):
     return server
 
 
-# List of OpenAI models
-OPENAI_MODELS = [
-    "o3-mini",
-    "o1",
-    "o1-mini",
-    "o1-pro",
-    "gpt-4.5-preview",
-    "gpt-4o",
-    "gpt-4o-audio-preview",
-    "chatgpt-4o-latest",
-    "gpt-4o-mini",
-    "gpt-4o-mini-audio-preview",
-    "gpt-4.1",  # Added default big model
-    "gpt-4.1-mini",  # Added default small model
-]
-
-# List of Gemini models
-GEMINI_MODELS = ["gemini-2.5-flash", "gemini-2.5-pro"]
-
-
 # Models for Anthropic API requests
 class ContentBlockText(BaseModel):
     type: Literal["text"]
@@ -1579,95 +1506,11 @@ class MessagesRequest(BaseModel):
     cache_control: Optional[Dict[str, Any]] = None
 
     @field_validator("model")
-    def validate_model_field(cls, v, info):  # Renamed to avoid conflict
-        original_model = v
-        new_model = v  # Default to original value
-
-        logger.debug(
-            f"📋 MODEL VALIDATION: Original='{original_model}', Preferred='{PREFERRED_PROVIDER}', BIG='{BIG_MODEL}', SMALL='{SMALL_MODEL}'"
-        )
-
-        # Remove provider prefixes for easier matching
-        clean_v = v
-        if clean_v.startswith("anthropic/"):
-            clean_v = clean_v[10:]
-        elif clean_v.startswith("openai/"):
-            clean_v = clean_v[7:]
-        elif clean_v.startswith("gemini/"):
-            clean_v = clean_v[7:]
-        elif clean_v.startswith("qclaw/"):
-            clean_v = clean_v[6:]
-
-        # --- Mapping Logic --- START ---
-        mapped = False
-        if PREFERRED_PROVIDER == "anthropic":
-            # 也走模型映射：sonnet/haiku → BIG/SMALL_MODEL
-            if "haiku" in clean_v.lower():
-                new_model = f"anthropic/{SMALL_MODEL}"
-                mapped = True
-            elif "sonnet" in clean_v.lower():
-                new_model = f"anthropic/{MEDIUM_MODEL}"
-                mapped = True
-            else:
-                new_model = f"anthropic/{clean_v}"
-                mapped = True
-
-        # Map Haiku to SMALL_MODEL based on provider preference
-        elif "haiku" in clean_v.lower():
-            if PREFERRED_PROVIDER in ("gemini", "gemini-openai"):
-                new_model = f"gemini/{SMALL_MODEL}"
-            elif PREFERRED_PROVIDER in ("qclaw", "copilot"):
-                new_model = SMALL_MODEL
-            else:
-                new_model = f"openai/{SMALL_MODEL}"
-            mapped = True
-
-        # Map Sonnet to MEDIUM_MODEL (3-tier: Opus>Sonnet>Haiku)
-        elif "sonnet" in clean_v.lower():
-            if PREFERRED_PROVIDER in ("gemini", "gemini-openai"):
-                new_model = f"gemini/{MEDIUM_MODEL}"
-            elif PREFERRED_PROVIDER in ("qclaw", "copilot"):
-                new_model = MEDIUM_MODEL
-            else:
-                new_model = f"openai/{MEDIUM_MODEL}"
-            mapped = True
-
-        # Map Opus to BIG_MODEL
-        elif "opus" in clean_v.lower():
-            if PREFERRED_PROVIDER in ("gemini", "gemini-openai"):
-                new_model = f"gemini/{BIG_MODEL}"
-            elif PREFERRED_PROVIDER in ("qclaw", "copilot"):
-                new_model = BIG_MODEL
-            else:
-                new_model = f"openai/{BIG_MODEL}"
-            mapped = True
-
-        # Add prefixes to non-mapped models if they match known lists
-        elif not mapped:
-            if clean_v in GEMINI_MODELS and not v.startswith("gemini/"):
-                new_model = f"gemini/{clean_v}"
-                mapped = True
-            elif clean_v in OPENAI_MODELS and not v.startswith("openai/"):
-                new_model = f"openai/{clean_v}"
-                mapped = True
-        # --- Mapping Logic --- END ---
-
-        if mapped:
-            logger.debug(f"📌 MODEL MAPPING: '{original_model}' ➡️ '{new_model}'")
-        else:
-            # If no mapping occurred and no prefix exists, log warning or decide default
-            if not v.startswith(("openai/", "gemini/", "anthropic/")):
-                logger.warning(
-                    f"⚠️ No prefix or mapping rule for model: '{original_model}'. Using as is."
-                )
-            new_model = v  # Ensure we return the original if no rule applied
-
-        # Store the original model in the values dictionary
+    def validate_model_field(cls, v, info):
         values = info.data
         if isinstance(values, dict):
-            values["original_model"] = original_model
-
-        return new_model
+            values["original_model"] = v
+        return v
 
 
 class TokenCountRequest(BaseModel):
@@ -1680,87 +1523,11 @@ class TokenCountRequest(BaseModel):
     original_model: Optional[str] = None  # Will store the original model name
 
     @field_validator("model")
-    def validate_model_token_count(cls, v, info):  # Renamed to avoid conflict
-        # Use the same logic as MessagesRequest validator
-        # NOTE: Pydantic validators might not share state easily if not class methods
-        # Re-implementing the logic here for clarity, could be refactored
-        original_model = v
-        new_model = v  # Default to original value
-
-        logger.debug(
-            f"📋 TOKEN COUNT VALIDATION: Original='{original_model}', Preferred='{PREFERRED_PROVIDER}', BIG='{BIG_MODEL}', SMALL='{SMALL_MODEL}'"
-        )
-
-        # Remove provider prefixes for easier matching
-        clean_v = v
-        if clean_v.startswith("anthropic/"):
-            clean_v = clean_v[10:]
-        elif clean_v.startswith("openai/"):
-            clean_v = clean_v[7:]
-        elif clean_v.startswith("gemini/"):
-            clean_v = clean_v[7:]
-        elif clean_v.startswith("qclaw/"):
-            clean_v = clean_v[6:]
-
-        # --- Mapping Logic --- START ---
-        mapped = False
-        if PREFERRED_PROVIDER == "anthropic":
-            if "haiku" in clean_v.lower():
-                new_model = f"anthropic/{SMALL_MODEL}"
-                mapped = True
-            elif "sonnet" in clean_v.lower():
-                new_model = f"anthropic/{BIG_MODEL}"
-                mapped = True
-            else:
-                new_model = f"anthropic/{clean_v}"
-                mapped = True
-
-        # Map Haiku to SMALL_MODEL based on provider preference
-        elif "haiku" in clean_v.lower():
-            if PREFERRED_PROVIDER in ("gemini", "gemini-openai"):
-                new_model = f"gemini/{SMALL_MODEL}"
-            elif PREFERRED_PROVIDER in ("qclaw", "copilot"):
-                new_model = SMALL_MODEL
-            else:
-                new_model = f"openai/{SMALL_MODEL}"
-            mapped = True
-
-        # Map Opus to BIG_MODEL
-        elif "opus" in clean_v.lower():
-            if PREFERRED_PROVIDER in ("gemini", "gemini-openai"):
-                new_model = f"gemini/{BIG_MODEL}"
-            elif PREFERRED_PROVIDER in ("qclaw", "copilot"):
-                new_model = BIG_MODEL
-            else:
-                new_model = f"openai/{BIG_MODEL}"
-            mapped = True
-
-        # Default: map everything else (Sonnet, unknown) to MEDIUM_MODEL
-        elif not mapped:
-            if PREFERRED_PROVIDER in ("gemini", "gemini-openai"):
-                new_model = f"gemini/{MEDIUM_MODEL}"
-            elif PREFERRED_PROVIDER in ("qclaw", "copilot"):
-                new_model = MEDIUM_MODEL
-            else:
-                new_model = f"openai/{MEDIUM_MODEL}"
-            mapped = True
-        # --- Mapping Logic --- END ---
-
-        if mapped:
-            logger.debug(f"📌 TOKEN COUNT MAPPING: '{original_model}' ➡️ '{new_model}'")
-        else:
-            if not v.startswith(("openai/", "gemini/", "anthropic/")):
-                logger.warning(
-                    f"⚠️ No prefix or mapping rule for token count model: '{original_model}'. Using as is."
-                )
-            new_model = v  # Ensure we return the original if no rule applied
-
-        # Store the original model in the values dictionary
+    def validate_model_token_count(cls, v, info):
         values = info.data
         if isinstance(values, dict):
-            values["original_model"] = original_model
-
-        return new_model
+            values["original_model"] = v
+        return v
 
 
 class TokenCountResponse(BaseModel):
@@ -1895,7 +1662,6 @@ def _log_exception(event: str, exc: Exception, context: Optional[Dict[str, Any]]
 
     details = {
         "event": event,
-        "provider": PREFERRED_PROVIDER,
         "error_type": type(exc).__name__,
         "error_message": str(exc),
         "traceback": traceback.format_exc(),
@@ -1918,1449 +1684,6 @@ def _log_exception(event: str, exc: Exception, context: Optional[Dict[str, Any]]
     logger.error(
         f"ERROR_CONTEXT {json.dumps(_sanitize_for_log(details), ensure_ascii=False)}"
     )
-
-
-def convert_anthropic_to_litellm(anthropic_request: MessagesRequest) -> Dict[str, Any]:
-    """Convert Anthropic API request format to LiteLLM format (which follows OpenAI)."""
-    # LiteLLM already handles Anthropic models when using the format model="anthropic/claude-3-opus-20240229"
-    # So we just need to convert our Pydantic model to a dict in the expected format
-
-    messages = []
-
-    # Add system message if present
-    if anthropic_request.system:
-        # Handle different formats of system messages
-        if isinstance(anthropic_request.system, str):
-            # Simple string format
-            messages.append({"role": "system", "content": anthropic_request.system})
-        elif isinstance(anthropic_request.system, list):
-            # List of content blocks
-            system_text = ""
-            for block in anthropic_request.system:
-                if hasattr(block, "type") and block.type == "text":
-                    system_text += block.text + "\n\n"
-                elif isinstance(block, dict) and block.get("type") == "text":
-                    system_text += block.get("text", "") + "\n\n"
-
-            if system_text:
-                messages.append({"role": "system", "content": system_text.strip()})
-
-    # Add conversation messages
-    for idx, msg in enumerate(anthropic_request.messages):
-        content = msg.content
-        if isinstance(content, str):
-            messages.append({"role": msg.role, "content": content})
-        else:
-            # Special handling for tool_result in user messages
-            # OpenAI format: each tool_result → {"role": "tool", "tool_call_id": "xxx", "content": "yyy"}
-            if msg.role == "user" and any(
-                block.type == "tool_result"
-                for block in content
-                if hasattr(block, "type")
-            ):
-                text_parts = []
-                for block in content:
-                    if hasattr(block, "type"):
-                        if block.type == "text":
-                            text_parts.append(block.text)
-                        elif block.type == "tool_result":
-                            tool_id = (
-                                block.tool_use_id
-                                if hasattr(block, "tool_use_id")
-                                else ""
-                            )
-                            result_content = ""
-                            if hasattr(block, "content"):
-                                if isinstance(block.content, str):
-                                    result_content = block.content
-                                elif isinstance(block.content, list):
-                                    for cb in block.content:
-                                        if isinstance(cb, dict) and cb.get("type") == "text":
-                                            result_content += cb.get("text", "") + "\n"
-                                        elif not isinstance(cb, dict) and hasattr(cb, "type") and cb.type == "text":
-                                            result_content += cb.text + "\n"
-                                        else:
-                                            result_content += str(cb) + "\n"
-                                else:
-                                    result_content = str(block.content)
-                            # OpenAI standard: tool role message
-                            messages.append({
-                                "role": "tool",
-                                "tool_call_id": tool_id,
-                                "content": result_content.strip() or "Tool executed successfully",
-                            })
-                # Any remaining text goes as a separate user message
-                if text_parts:
-                    messages.append({"role": "user", "content": "\n".join(text_parts)})
-            # Regular handling for other message types（与 tool_result 处理同级）
-            elif msg.role == "assistant" and any(
-                hasattr(b, "type") and b.type == "tool_use"
-                for b in content
-            ):
-                # Assistant with tool_use — convert to OpenAI tool_calls format
-                tool_calls = []
-                text_content = ""
-                sigs_for_provider = []  # LiteLLM Gemini 需要消息级别的 thought_signatures
-                for block in content:
-                    if hasattr(block, "type"):
-                        if block.type == "text":
-                            text_content += block.text
-                        elif block.type == "tool_use":
-                            tc = {
-                                "id": block.id,
-                                "type": "function",
-                                "function": {
-                                    "name": block.name,
-                                    "arguments": json.dumps(block.input) if block.input else "{}"
-                                }
-                            }
-                            # 注入签名到 tool_call 本身（备用兼容）
-                            sig = _thought_signatures.get(block.id)
-                            if sig:
-                                tc["function"]["provider_specific_fields"] = {"thought_signature": sig}
-                                sigs_for_provider.append(sig)
-                            tool_calls.append(tc)
-                msg_entry: Dict[str, Any] = {"role": "assistant"}
-                if text_content:
-                    msg_entry["content"] = text_content
-                else:
-                    msg_entry["content"] = None
-                if tool_calls:
-                    msg_entry["tool_calls"] = tool_calls
-                # LiteLLM Gemini handler 从消息级别 provider_specific_fields 读取签名
-                if sigs_for_provider:
-                    msg_entry["provider_specific_fields"] = {"thought_signatures": sigs_for_provider}
-                messages.append(msg_entry)
-            else:
-                processed_content = []
-                for block in content:
-                    if hasattr(block, "type"):
-                        if block.type == "text":
-                            processed_content.append(
-                                {"type": "text", "text": block.text}
-                            )
-                        elif block.type == "image":
-                            # Convert Anthropic image source → OpenAI image_url format
-                            source = block.source if isinstance(block.source, dict) else {}
-                            if source.get("type") == "base64":
-                                img_url = f"data:{source.get('media_type', 'image/png')};base64,{source.get('data', '')}"
-                            else:
-                                img_url = source.get("url", "")
-                            processed_content.append(
-                                {"type": "image_url", "image_url": {"url": img_url}}
-                            )
-                        elif block.type == "tool_use":
-                            # Handle tool use blocks if needed
-                            processed_content.append(
-                                {
-                                    "type": "tool_use",
-                                    "id": block.id,
-                                    "name": block.name,
-                                    "input": block.input,
-                                }
-                            )
-                    elif block.type == "tool_result":
-                        # Handle different formats of tool result content
-                        processed_content_block: Dict[str, Any] = {
-                            "type": "tool_result",
-                            "tool_use_id": block.tool_use_id
-                            if hasattr(block, "tool_use_id")
-                            else "",
-                        }
-
-                        # Process the content field properly
-                        if hasattr(block, "content"):
-                            if isinstance(block.content, str):
-                                # If it's a simple string, create a text block for it
-                                processed_content_block["content"] = [
-                                    {"type": "text", "text": block.content}
-                                ]
-                            elif isinstance(block.content, list):
-                                # If it's already a list of blocks, keep it
-                                processed_content_block["content"] = block.content
-                            else:
-                                # Default fallback
-                                processed_content_block["content"] = [
-                                    {"type": "text", "text": str(block.content)}
-                                ]
-                        else:
-                            # Default empty content
-                            processed_content_block["content"] = [
-                                {"type": "text", "text": ""}
-                            ]
-
-                        processed_content.append(processed_content_block)
-
-                messages.append({"role": msg.role, "content": processed_content})
-
-    copilot_target_model = ""
-    if PREFERRED_PROVIDER == "copilot":
-        source_model = anthropic_request.original_model or anthropic_request.model
-        copilot_target_model = _copilot_model_name(source_model)
-
-    copilot_thinking_enabled = bool(
-        PREFERRED_PROVIDER == "copilot"
-        and anthropic_request.thinking
-        and anthropic_request.thinking.enabled
-    )
-
-    # Cap max_tokens for OpenAI/Gemini/Copilot models
-    # QClaw 链路不受此限制，会在 _qclaw_provider 中恢复原始值
-    max_tokens = anthropic_request.max_tokens
-    if PREFERRED_PROVIDER == "copilot":
-        max_tokens = min(max_tokens, 64000)
-        # Copilot + thinking 常见中途截断，给一个保底 completion budget
-        if copilot_thinking_enabled:
-            max_tokens = max(max_tokens, 8192)
-        logger.debug(
-            f"Capping max_tokens to 64000 for Copilot model (original value: {anthropic_request.max_tokens})"
-        )
-    elif anthropic_request.model.startswith("openai/") or anthropic_request.model.startswith("gemini/"):
-        max_tokens = min(max_tokens, 16384)
-        logger.debug(
-            f"Capping max_tokens to 16384 for OpenAI/Gemini model (original value: {anthropic_request.max_tokens})"
-        )
-
-    # Create LiteLLM request dict
-    litellm_request = {
-        "model": anthropic_request.model,  # it understands "anthropic/claude-x" format
-        "messages": messages,
-        "max_completion_tokens": max_tokens,
-        "_original_max_tokens": anthropic_request.max_tokens,  # 保留原始值供 QClaw 使用
-        "stream": anthropic_request.stream,
-    }
-    if anthropic_request.temperature is not None:
-        litellm_request["temperature"] = anthropic_request.temperature
-
-    # thinking 参数仅原生 Anthropic 支持，DeepSeek Anthropic 兼容接口不认
-    # 保持为空，让模型自行决定推理深度
-    if copilot_thinking_enabled:
-        # Anthropic thinking -> OpenAI compatible reasoning effort
-        litellm_request["reasoning"] = {"effort": "high"}
-        logger.debug(
-            f"Copilot thinking enabled: translated to reasoning.effort=high target_model={copilot_target_model or 'unknown'}"
-        )
-
-    # Add optional parameters if present
-    if anthropic_request.stop_sequences:
-        litellm_request["stop"] = anthropic_request.stop_sequences
-
-    if anthropic_request.top_p:
-        litellm_request["top_p"] = anthropic_request.top_p
-
-    if anthropic_request.top_k and PREFERRED_PROVIDER in ("anthropic", "gemini", "gemini-openai"):
-        litellm_request["top_k"] = anthropic_request.top_k
-
-    if anthropic_request.cache_control:
-        litellm_request["cache_control"] = anthropic_request.cache_control
-
-    # Convert tools to OpenAI format
-    if anthropic_request.tools:
-        openai_tools = []
-        is_gemini_model = anthropic_request.model.startswith("gemini/")
-
-        for tool in anthropic_request.tools:
-            # Convert to dict if it's a pydantic model
-            if hasattr(tool, "dict"):
-                tool_dict = tool.dict()
-                # Ensure tool_dict is a dictionary, handle potential errors if 'tool' isn't dict-like
-                try:
-                    tool_dict = dict(tool) if not isinstance(tool, dict) else tool
-                except (TypeError, ValueError):
-                    logger.error(f"Could not convert tool to dict: {tool}")
-                    continue  # Skip this tool if conversion fails
-
-            # 注：tools 声明为 List[Tool]（Pydantic 模型恒有 .dict），上面的 hasattr 分支必进，
-            # tool_dict 在此必然已绑定；pyright 无法推断，故仅抑制该诊断，不改控制流。
-            # Clean the schema if targeting a Gemini model
-            input_schema = tool_dict.get("input_schema", {})  # pyright: ignore[reportPossiblyUnboundVariable]
-            if is_gemini_model:
-                logger.debug(
-                    f"Cleaning schema for Gemini tool: {tool_dict.get('name')}"  # pyright: ignore[reportPossiblyUnboundVariable]
-                )
-                input_schema = clean_gemini_schema(input_schema)
-
-            # Create OpenAI-compatible function tool
-            openai_tool = {
-                "type": "function",
-                "function": {
-                    "name": tool_dict["name"],  # pyright: ignore[reportPossiblyUnboundVariable]
-                    "description": tool_dict.get("description", ""),  # pyright: ignore[reportPossiblyUnboundVariable]
-                    "parameters": input_schema,  # Use potentially cleaned schema
-                },
-            }
-            openai_tools.append(openai_tool)
-
-        litellm_request["tools"] = openai_tools
-
-    # Convert tool_choice to OpenAI format if present
-    if anthropic_request.tool_choice:
-        if hasattr(anthropic_request.tool_choice, "dict"):
-            # 声明类型是 Dict[str, Any]（无 .dict），该分支只对实际传入的 Pydantic 对象生效，保持原兼容逻辑
-            tool_choice_dict = anthropic_request.tool_choice.dict()  # pyright: ignore[reportAttributeAccessIssue]
-        else:
-            tool_choice_dict = anthropic_request.tool_choice
-
-        # Handle Anthropic's tool_choice format
-        choice_type = tool_choice_dict.get("type")
-        if choice_type == "auto":
-            litellm_request["tool_choice"] = "auto"
-        elif choice_type == "any":
-            litellm_request["tool_choice"] = "any"
-        elif choice_type == "tool" and "name" in tool_choice_dict:
-            litellm_request["tool_choice"] = {
-                "type": "function",
-                "function": {"name": tool_choice_dict["name"]},
-            }
-        else:
-            # Default to auto if we can't determine
-            litellm_request["tool_choice"] = "auto"
-
-    return litellm_request
-
-
-def convert_litellm_to_anthropic(
-    # 实参可能是 LiteLLM ModelResponse 或 dict，函数内已用 hasattr/isinstance 逐一分派；
-    # 原 Union[Dict[str, Any], Any] 等价于 Any，写成 Any 才能让静态检查正确反映动态分派。
-    litellm_response: Any, original_request: MessagesRequest
-) -> MessagesResponse:
-    """Convert LiteLLM (OpenAI format) response to Anthropic API response format."""
-
-    # Enhanced response extraction with better error handling
-    try:
-        # Get the clean model name to check capabilities
-        clean_model = original_request.model
-        if clean_model.startswith("anthropic/"):
-            clean_model = clean_model[len("anthropic/") :]
-        elif clean_model.startswith("openai/"):
-            clean_model = clean_model[len("openai/") :]
-
-        # Check if this is a Claude model (which supports content blocks)
-        is_claude_model = clean_model.startswith("claude-")
-
-        # Handle ModelResponse object from LiteLLM
-        if hasattr(litellm_response, "choices") and hasattr(litellm_response, "usage"):
-            # Extract data from ModelResponse object directly
-            choices = litellm_response.choices or []
-            # 防护：Copilot 在 max_tokens 过小时可能返回 choices:[]
-            if not choices:
-                choices = []
-                message = None
-            else:
-                message = choices[0].message if len(choices) > 0 else None
-            content_text = (
-                message.content if message and hasattr(message, "content") else ""
-            )
-            tool_calls = (
-                message.tool_calls
-                if message and hasattr(message, "tool_calls")
-                else None
-            )
-            finish_reason = (
-                choices[0].finish_reason if choices and len(choices) > 0 else "stop"
-            )
-            usage_info = litellm_response.usage
-            response_id = getattr(litellm_response, "id", f"msg_{uuid.uuid4()}")
-        else:
-            # For backward compatibility - handle dict responses
-            # If response is a dict, use it, otherwise try to convert to dict
-            try:
-                response_dict = (
-                    litellm_response
-                    if isinstance(litellm_response, dict)
-                    else litellm_response.dict()
-                )
-            except AttributeError:
-                # If .dict() fails, try to use model_dump or __dict__
-                try:
-                    response_dict = (
-                        litellm_response.model_dump()  # pyright: ignore[reportAttributeAccessIssue] - 已由 hasattr 保证
-                        if hasattr(litellm_response, "model_dump")
-                        else litellm_response.__dict__
-                    )
-                except AttributeError:
-                    # Fallback - manually extract attributes
-                    response_dict = {
-                        "id": getattr(litellm_response, "id", f"msg_{uuid.uuid4()}"),
-                        "choices": getattr(litellm_response, "choices", [{}]),
-                        "usage": getattr(litellm_response, "usage", {}),
-                    }
-
-            # Extract the content from the response dict
-            choices = response_dict.get("choices", [{}])
-            message = (
-                choices[0].get("message", {}) if choices and len(choices) > 0 else {}
-            )
-            content_text = message.get("content", "")
-            tool_calls = message.get("tool_calls", None)
-            finish_reason = (
-                choices[0].get("finish_reason", "stop")
-                if choices and len(choices) > 0
-                else "stop"
-            )
-            usage_info = response_dict.get("usage", {})
-            response_id = response_dict.get("id", f"msg_{uuid.uuid4()}")
-
-        # Create content list for Anthropic format
-        content = []
-
-        # ── 处理 reasoning_content（DeepSeek 等模型的思考过程）──
-        # DeepSeek 返回的 reasoning_content 是独立字段，需要转为 Anthropic 的 thinking block
-        reasoning_text = None
-        # message 可能是 Pydantic 消息对象 / dict / None，取 model_extra 用 getattr 收窄（与 hasattr+isinstance 等价）
-        _msg_extra = getattr(message, "model_extra", None)
-        if isinstance(_msg_extra, dict):
-            reasoning_text = _msg_extra.get("reasoning_content") or _msg_extra.get("reasoning_text")
-        if reasoning_text is None:
-            reasoning_text = getattr(message, "reasoning_content", None) or getattr(message, "reasoning_text", None)
-        if reasoning_text is None and isinstance(message, dict):
-            reasoning_text = message.get("reasoning_content") or message.get("reasoning_text")
-
-        # 如果请求开启了 thinking，将 reasoning_content 放入 thinking block
-        upstream_thinking = getattr(original_request, "thinking", None)
-        if reasoning_text and upstream_thinking and getattr(upstream_thinking, "enabled", False):
-            content.append({"type": "thinking", "thinking": reasoning_text})
-        elif reasoning_text:
-            # 请求未开启 thinking，但也不要丢弃——作为文本保留
-            content.append({"type": "text", "text": f"<thinking>{reasoning_text}</thinking>"})
-
-        # Add text content block if present (text might be None or empty for pure tool call responses)
-        # 过滤掉已经被 reasoning 处理的重复内容
-        if content_text is not None and content_text != "":
-            # 如果 text 内容和 reasoning 完全相同（有些模型会重复），跳过
-            if reasoning_text and content_text.strip() == reasoning_text.strip():
-                pass
-            else:
-                content.append({"type": "text", "text": content_text})
-
-        # Add tool calls if present (tool_use in Anthropic format)
-        # For ALL models, not just Claude models - convert tool_calls to tool_use blocks
-        if tool_calls:
-            logger.debug(f"Processing tool calls: {tool_calls}")
-
-            # Convert to list if it's not already
-            if not isinstance(tool_calls, list):
-                tool_calls = [tool_calls]
-
-            for idx, tool_call in enumerate(tool_calls):
-                logger.debug(f"Processing tool call {idx}: {tool_call}")
-
-                # Extract function data based on whether it's a dict or object
-                if isinstance(tool_call, dict):
-                    function = tool_call.get("function", {})
-                    tool_id = tool_call.get("id", f"tool_{uuid.uuid4()}")
-                    name = function.get("name", "")
-                    arguments = function.get("arguments", "{}")
-                else:
-                    function = getattr(tool_call, "function", None)
-                    tool_id = getattr(tool_call, "id", f"tool_{uuid.uuid4()}")
-                    name = getattr(function, "name", "") if function else ""
-                    arguments = (
-                        getattr(function, "arguments", "{}") if function else "{}"
-                    )
-
-                # Convert string arguments to dict if needed
-                if isinstance(arguments, str):
-                    try:
-                        arguments = json.loads(arguments)
-                    except json.JSONDecodeError:
-                        fixed_suffix = _close_json_fragment(arguments)
-                        if fixed_suffix:
-                            try:
-                                arguments = json.loads(arguments + fixed_suffix)
-                            except json.JSONDecodeError:
-                                logger.warning(
-                                    f"Failed to parse tool arguments as JSON: {arguments}"
-                                )
-                                arguments = {"raw": arguments}
-                        else:
-                            logger.warning(
-                                f"Failed to parse tool arguments as JSON: {arguments}"
-                            )
-                            arguments = {"raw": arguments}
-
-                # 提取 Gemini thought_signature（兼容两种来源）
-                sig = None
-                # 来源1：OpenAI 兼容端点 extra_content.google.thought_signature
-                if isinstance(tool_call, dict):
-                    extra = tool_call.get("extra_content", {})
-                    if isinstance(extra, dict):
-                        sig = extra.get("google", {}).get("thought_signature")
-                else:
-                    extra = getattr(tool_call, "extra_content", None)
-                    if isinstance(extra, dict):
-                        sig = extra.get("google", {}).get("thought_signature")
-                # 来源2：LiteLLM Gemini handler 的 provider_specific_fields
-                if not sig and function:
-                    if isinstance(function, dict):
-                        psf = function.get("provider_specific_fields", {})
-                    else:
-                        psf = getattr(function, "provider_specific_fields", {})
-                    if isinstance(psf, dict):
-                        sig = psf.get("thought_signature")
-                # 来源3：消息级别的 provider_specific_fields.thought_signatures
-                if not sig and hasattr(message, "provider_specific_fields"):
-                    psf = getattr(message, "provider_specific_fields", {})
-                    if isinstance(psf, dict):
-                        sig_list = psf.get("thought_signatures", [])
-                        if isinstance(sig_list, list) and idx < len(sig_list):
-                            sig = sig_list[idx]
-                if sig:
-                    _thought_signatures[tool_id] = sig
-                    logger.debug(f"💭 Saved thought_signature for tool {tool_id}")
-
-                logger.debug(
-                    f"Adding tool_use block: id={tool_id}, name={name}, input={arguments}"
-                )
-
-                content.append(
-                    {
-                        "type": "tool_use",
-                        "id": tool_id,
-                        "name": name,
-                        "input": arguments,
-                    }
-                )
-
-        # Get usage information - extract values safely from object or dict
-        if isinstance(usage_info, dict):
-            prompt_tokens = usage_info.get("prompt_tokens", 0) or 0
-            completion_tokens = usage_info.get("completion_tokens", 0) or 0
-        else:
-            prompt_tokens = getattr(usage_info, "prompt_tokens", 0) or 0
-            completion_tokens = getattr(usage_info, "completion_tokens", 0) or 0
-
-        # QClaw 网关不返回 usage → 用 tiktoken 本地估算
-        if prompt_tokens == 0 or completion_tokens == 0:
-            try:
-                if prompt_tokens == 0:
-                    prompt_tokens = _estimate_messages_tokens(
-                        getattr(original_request, "messages", []) or [],
-                        original_request.model,
-                        getattr(original_request, "system", None),
-                        getattr(original_request, "tools", None),
-                    )
-                if completion_tokens == 0:
-                    out_text = _extract_text_from_content(content)
-                    completion_tokens = _estimate_text_tokens(out_text, original_request.model)
-            except Exception as _e:
-                logger.debug(f"tiktoken estimate failed in convert_litellm_to_anthropic: {_e}")
-
-        # Map OpenAI finish_reason to Anthropic stop_reason
-        stop_reason = None
-        if finish_reason == "stop":
-            stop_reason = "end_turn"
-        elif finish_reason == "length":
-            stop_reason = "max_tokens"
-        elif finish_reason == "tool_calls":
-            stop_reason = "tool_use"
-        else:
-            stop_reason = "end_turn"  # Default
-
-        # Make sure content is never empty
-        if not content:
-            content.append({"type": "text", "text": ""})
-
-        # Create Anthropic-style response
-        anthropic_response = MessagesResponse.model_validate({
-            "id": response_id,
-            "model": original_request.model,
-            "role": "assistant",
-            "content": content,
-            "stop_reason": stop_reason,
-            "stop_sequence": None,
-            "usage": Usage(input_tokens=prompt_tokens, output_tokens=completion_tokens),
-        })
-
-        return anthropic_response
-
-    except Exception as e:
-        import traceback
-
-        error_traceback = traceback.format_exc()
-        error_message = (
-            f"Error converting response: {str(e)}\n\nFull traceback:\n{error_traceback}"
-        )
-        logger.error(error_message)
-
-        # In case of any error, create a fallback response
-        return MessagesResponse.model_validate({
-            "id": f"msg_{uuid.uuid4()}",
-            "model": original_request.model,
-            "role": "assistant",
-            "content": [
-                {
-                    "type": "text",
-                    "text": f"Error converting response: {str(e)}. Please check server logs.",
-                }
-            ],
-            "stop_reason": "end_turn",
-            "usage": Usage(input_tokens=0, output_tokens=0),
-        })
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# OpenAI 兼容端点：/v1/chat/completions  → 统一走 LiteLLM
-# ══════════════════════════════════════════════════════════════════════════════
-
-@app.post("/v1/chat/completions")
-async def openai_chat_completions(raw_request: Request):
-    """OpenAI 兼容端点
-
-    透传模式（qclaw / openai / copilot / gemini-openai）：直接转发请求体给后端，不做模型映射或协议转换。
-    翻译模式（anthropic / gemini）：通过 LiteLLM 进行格式翻译和模型映射。
-    """
-    request_id = _request_id_from_headers(raw_request)
-    req_model = "unknown"
-    mapped_model = "unknown"
-    body = {}
-    try:
-        body = await raw_request.json()
-        default_model = COPILOT_MEDIUM_MODEL if PREFERRED_PROVIDER == "copilot" else MEDIUM_MODEL
-        req_model = body.get("model", default_model)
-        is_stream = body.get("stream", False)
-
-        # ── 透传模式：qclaw / openai / copilot / gemini-openai ──
-        _PASSTHROUGH_PROVIDERS = ("qclaw", "openai", "copilot", "gemini-openai")
-        if PREFERRED_PROVIDER in _PASSTHROUGH_PROVIDERS:
-            passthrough_model = req_model
-            # 去掉 provider 前缀（如果有）
-            for pfx in ("qclaw/", "openai/", "copilot/", "gemini/"):
-                if passthrough_model.startswith(pfx):
-                    passthrough_model = passthrough_model[len(pfx):]
-                    break
-
-            # ── provider 特殊处理 ──
-            headers = {"Content-Type": "application/json"}
-            url = ""
-
-            if PREFERRED_PROVIDER in ("qclaw",):
-                body["model"] = passthrough_model
-                # QClaw 网关要求必须有 system message
-                msgs = body.get("messages", [])
-                if not any(m.get("role") == "system" for m in msgs):
-                    msgs.insert(0, {"role": "system", "content": "You are Claude, a helpful AI assistant."})
-                    body["messages"] = msgs
-                # 清理非标准字段，避免客户端透传的 Anthropic 专属参数导致上游 400
-                body = _clean_qclaw_body(body)
-                logger.debug(f"🐙 QClaw passthrough: body keys={list(body.keys())} model={body.get('model')}")
-                headers["Authorization"] = f"Bearer {QCLAW_API_KEY}"
-                headers["User-Agent"] = "OpenAI/JS 6.39.1"  # 上游拒绝 python-httpx 默认 UA
-                _qclaw_base = QCLAW_BASE_URL
-                url = f"{_qclaw_base}/chat/completions"
-
-            elif PREFERRED_PROVIDER == "openai":
-                body["model"] = passthrough_model
-                headers["Authorization"] = f"Bearer {OPENAI_API_KEY}"
-                base = OPENAI_BASE_URL or "https://api.openai.com/v1"
-                url = f"{base}/chat/completions"
-
-            elif PREFERRED_PROVIDER == "copilot":
-                # copilot 模型映射：haiku/sonnet/opus → COPILOT_*_MODEL
-                body["model"] = _copilot_model_name(passthrough_model)
-                headers["Authorization"] = f"Bearer {COPILOT_GHE_TOKEN}"
-                headers["Copilot-Integration-Id"] = COPILOT_INTEGRATION_ID
-                # Copilot 不接受空/None 消息 content
-                for msg in body.get("messages", []):
-                    c = msg.get("content")
-                    if c is None or (isinstance(c, str) and not c.strip()):
-                        msg["content"] = "."
-                # Copilot 不接受没有 tools 时的 tool_choice
-                if body.get("tool_choice") and not body.get("tools"):
-                    body.pop("tool_choice")
-                url = f"{COPILOT_API_BASE}/chat/completions"
-
-            elif PREFERRED_PROVIDER == "gemini-openai":
-                body["model"] = passthrough_model
-                headers["Authorization"] = f"Bearer {os.environ.get('GEMINI_API_KEY', '')}"
-                gemini_base = os.environ.get(
-                    "GEMINI_BASE_URL",
-                    "https://generativelanguage.googleapis.com/v1beta/openai",
-                )
-                url = f"{gemini_base}/chat/completions"
-
-            log_request_beautifully(
-                "POST", "/v1/chat/completions", req_model, body["model"],
-                len(body.get("messages", [])), len(body.get("tools") or []), 200
-            )
-
-            if is_stream:
-                async def passthrough_stream():
-                    last_err = None
-                    for attempt in range(3):
-                        if attempt > 0:
-                            await asyncio.sleep(0.5)
-                        client = httpx.AsyncClient(timeout=httpx.Timeout(300.0, connect=10.0), trust_env=False)
-                        try:
-                            async with client.stream("POST", url, json=body, headers=headers) as resp:
-                                if resp.status_code >= 400:
-                                    # 读 body 判断是否为可识别的限流错误（数据驱动，见 _VENDOR_ERROR_MAPS）
-                                    if resp.status_code == 429 or resp.status_code >= 500:
-                                        err_text = await resp.aread()
-                                        mapped = _map_upstream_error(err_text.decode("utf-8", "replace"))
-                                        if mapped is not None:
-                                            # 限流类：不重试，直接发 SSE error 事件让客户端（opencode 等）感知并重试，
-                                            # 避免对稳定限流盲目重试 3 次浪费时间。
-                                            _st, _et = mapped
-                                            ev = {"error": {"type": _et, "message": err_text.decode("utf-8", "replace")[:500]}}
-                                            yield json.dumps(ev).encode()
-                                            yield b"data: [DONE]\n\n"
-                                            return
-                                        if resp.status_code >= 500:
-                                            last_err = f"upstream {resp.status_code}"
-                                            continue
-                                        # 429 但非限流特征（罕见）：透传原始响应
-                                        yield err_text
-                                        yield b"data: [DONE]\n\n"
-                                        return
-                                    # 其他 4xx（400/401/403 等）：直接透传原始响应流
-                                    async for chunk in resp.aiter_bytes():
-                                        yield chunk
-                                    return
-                                async for chunk in resp.aiter_bytes():
-                                    yield chunk
-                                return
-                        except (httpx.ConnectError, httpx.ReadError, httpx.RemoteProtocolError) as e:
-                            last_err = str(e)
-                            continue
-                        finally:
-                            await client.aclose()
-                    # 所有重试失败
-                    yield json.dumps({"error": {"type": "proxy_error", "message": f"{PREFERRED_PROVIDER} upstream unavailable after retries: {last_err}"}}).encode()
-                return StreamingResponse(passthrough_stream(), media_type="text/event-stream")
-            else:
-                last_err = None
-                for attempt in range(3):
-                    if attempt > 0:
-                        await asyncio.sleep(0.5)
-                    try:
-                        async with httpx.AsyncClient(timeout=httpx.Timeout(300.0, connect=10.0), trust_env=False) as client:
-                            resp = await client.post(url, json=body, headers=headers)
-                            if resp.status_code >= 500 and attempt < 2:
-                                last_err = f"upstream {resp.status_code}"
-                                continue
-                            # QClaw 网关不返回 usage → 用 tiktoken 本地估算后注入
-                            try:
-                                resp_data = resp.json()
-                            except Exception:
-                                return JSONResponse(content={"error": "invalid upstream JSON"}, status_code=502)
-                            if isinstance(resp_data, dict) and not resp_data.get("usage"):
-                                try:
-                                    est_in = _estimate_messages_tokens(
-                                        body.get("messages", []) or [],
-                                        body.get("model", req_model),
-                                    )
-                                    # 抽出响应文本用于估算 output
-                                    _choices = resp_data.get("choices") or [{}]
-                                    _msg = _choices[0].get("message", {}) if _choices else {}
-                                    _out_text = _msg.get("content", "") or ""
-                                    _reasoning = _msg.get("reasoning_content")
-                                    if _reasoning:
-                                        _out_text += _reasoning
-                                    for _tc in _msg.get("tool_calls", []) or []:
-                                        try:
-                                            _out_text += json.dumps(_tc.get("function", {}).get("arguments", ""), ensure_ascii=False)
-                                        except Exception:
-                                            pass
-                                    est_out = _estimate_text_tokens(_out_text, body.get("model", req_model))
-                                    resp_data["usage"] = {
-                                        "prompt_tokens": est_in,
-                                        "completion_tokens": est_out,
-                                        "total_tokens": est_in + est_out,
-                                    }
-                                except Exception as _e:
-                                    logger.debug(f"tiktoken passthrough estimate failed: {_e}")
-                            return JSONResponse(content=resp_data, status_code=resp.status_code)
-                    except (httpx.ConnectError, httpx.ReadError, httpx.RemoteProtocolError) as e:
-                        last_err = str(e)
-                        continue
-                return JSONResponse(
-                    content={"error": {"type": "proxy_error", "message": f"{PREFERRED_PROVIDER} upstream unavailable after retries: {last_err}"}},
-                    status_code=502,
-                )
-
-        # ── 翻译模式：anthropic / gemini — 走 LiteLLM ──
-        mapped_model = _map_model_name(req_model)
-        litellm_req = dict(body)
-        litellm_req["model"] = mapped_model
-
-        # 应用 provider 策略（注入 api_key / api_base / extra_headers 等）
-        class _R:
-            model = req_model
-        strategy = _PROVIDER_STRATEGIES.get(PREFERRED_PROVIDER, _default_provider)
-        strategy(_R(), litellm_req, req_model)
-
-        log_request_beautifully(
-            "POST", "/v1/chat/completions", req_model, litellm_req["model"],
-            len(litellm_req.get("messages", [])), len(litellm_req.get("tools") or []), 200
-        )
-
-        async def _do_litellm_call():
-            if is_stream:
-                litellm_req["stream"] = True
-                gen = await litellm.acompletion(**litellm_req)
-                return StreamingResponse(_litellm_oai_stream(gen), media_type="text/event-stream")
-            else:
-                litellm_req.pop("stream", None)
-                resp = await litellm.acompletion(**litellm_req)
-                # 非流式分支 acompletion 必返回 ModelResponse（stream 已 pop），联合类型里的 CustomStreamWrapper 不会出现
-                return JSONResponse(content=resp.model_dump())  # pyright: ignore[reportAttributeAccessIssue]
-
-        return await _do_litellm_call()
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        # 上游错误：绕过 litellm，httpx 直连 QClaw 上游重试
-        if _is_auth_expired_error(e) and PREFERRED_PROVIDER == "qclaw":
-            try:
-                logger.info("🔄 /v1/chat/completions error → fallback httpx 直连...")
-                await asyncio.sleep(0.5)
-                async with httpx.AsyncClient(timeout=httpx.Timeout(60.0, connect=5.0), trust_env=False) as client:
-                    resp = await client.post(
-                        f"{QCLAW_BASE_URL}/chat/completions",
-                        # litellm_req 只在翻译分支绑定；qclaw 走透传分支时此处未绑定会 NameError，
-                        # 被下方 except retry_e 捕获转 502（既有行为，不做初始化以免改变语义）
-                        json=_clean_qclaw_body(litellm_req),  # pyright: ignore[reportPossiblyUnboundVariable]
-                        headers={
-                            "Authorization": f"Bearer {QCLAW_API_KEY}",
-                            "Content-Type": "application/json",
-                            "User-Agent": "OpenAI/JS 6.39.1",
-                        },
-                    )
-                    if resp.status_code != 200:
-                        raise HTTPException(status_code=502, detail=f"QClaw fallback failed: {resp.status_code}")
-                    return JSONResponse(content=resp.json())
-            except Exception as retry_e:
-                _log_exception("openai_chat_completions_fallback_failed", retry_e, {"original_error": str(e)})
-                raise HTTPException(status_code=getattr(retry_e, "status_code", 502),
-                                     detail=f"QClaw fallback failed: {str(retry_e)}")
-
-        _log_exception(
-            "openai_chat_completions_failed",
-            e,
-            {
-                "request_id": request_id,
-                "path": str(raw_request.url.path),
-                "request_model": req_model,
-                "mapped_model": mapped_model,
-                "stream": body.get("stream"),
-                "message_count": len(body.get("messages") or []),
-                "tool_count": len(body.get("tools") or []),
-                "has_reasoning": bool(body.get("reasoning")),
-                "has_thinking": bool(body.get("thinking")),
-                "max_tokens": body.get("max_tokens"),
-                "max_completion_tokens": body.get("max_completion_tokens"),
-            },
-        )
-        # 限流/资源耗尽（如 qclaw: ResourceExhausted / Worker local total request limit reached）
-        # 转成 HTTP 429 + Retry-After，让下游客户端（opencode 等）自动重试，而非 500 UnknownError。
-        if _is_rate_limit_error(e):
-            raise HTTPException(
-                status_code=429,
-                headers={"Retry-After": str(_VENDOR_RETRY_AFTER)},
-                detail=str(e),
-            )
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-async def handle_streaming(
-    response_generator,
-    original_request: MessagesRequest,
-    original_model_name: str = "",
-    request_id: str = "",
-):
-    """Handle streaming responses from LiteLLM and convert to Anthropic format."""
-    try:
-        # Send message_start event
-        message_id = f"msg_{uuid.uuid4().hex[:24]}"  # Format similar to Anthropic's IDs
-
-        # QClaw 网关不返回 usage，message_start 阶段提前用 tiktoken 估算 input_tokens
-        try:
-            est_input_tokens = _estimate_messages_tokens(
-                getattr(original_request, "messages", []) or [],
-                original_model_name or original_request.model,
-                getattr(original_request, "system", None),
-                getattr(original_request, "tools", None),
-            )
-        except Exception as _e:
-            logger.debug(f"tiktoken input estimate (stream) failed: {_e}")
-            est_input_tokens = 0
-
-        message_data = {
-            "type": "message_start",
-            "message": {
-                "id": message_id,
-                "type": "message",
-                "role": "assistant",
-                "model": original_model_name or original_request.original_model or original_request.model,
-                "content": [],
-                "stop_reason": None,
-                "stop_sequence": None,
-                "usage": {
-                    "input_tokens": est_input_tokens,
-                    "cache_creation_input_tokens": 0,
-                    "cache_read_input_tokens": 0,
-                    "output_tokens": 0,
-                },
-            },
-        }
-        yield f"event: message_start\ndata: {json.dumps(message_data)}\n\n"
-
-        # 根据请求是否开启 thinking 决定初始 content block 类型
-        upstream_thinking = getattr(original_request, "thinking", None)
-        thinking_enabled = upstream_thinking and getattr(upstream_thinking, "enabled", False)
-        if thinking_enabled:
-            # 先开 thinking block (index 0)
-            yield f"event: content_block_start\ndata: {json.dumps({'type': 'content_block_start', 'index': 0, 'content_block': {'type': 'thinking', 'thinking': ''}})}\n\n"
-            thinking_block_started = True
-            thinking_block_closed = False
-        else:
-            # 先开 text block (index 0)
-            yield f"event: content_block_start\ndata: {json.dumps({'type': 'content_block_start', 'index': 0, 'content_block': {'type': 'text', 'text': ''}})}\n\n"
-            thinking_block_started = False
-            thinking_block_closed = True  # 没开 thinking block，标记为已关闭
-
-        # Send a ping to keep the connection alive (Anthropic does this)
-        yield f"event: ping\ndata: {json.dumps({'type': 'ping'})}\n\n"
-
-        tool_index = None
-        current_tool_call = None
-        tool_content = ""
-        accumulated_text = ""  # Track accumulated text content
-        text_sent = False  # Track if we've sent any text content
-        text_block_closed = False  # Track if text block is closed
-        thinking_block_started = False  # Track if thinking content block has been started
-        accumulated_reasoning = ""  # Track accumulated reasoning content
-        text_block_index = 0  # Track current text block index (0 if no thinking, 1 if after thinking)
-        input_tokens = est_input_tokens  # 已用 tiktoken 估算（上游 QClaw 不返回）
-        output_tokens = 0
-        has_sent_stop_reason = False
-        last_tool_index = 0
-        openai_to_anthropic_tool_index: Dict[int, int] = {}
-        tool_json_buffers: Dict[int, str] = {}
-
-        # Process each chunk
-        async for chunk in response_generator:
-            try:
-                # Check if this is the end of the response with usage data
-                if hasattr(chunk, "usage") and chunk.usage is not None:
-                    if hasattr(chunk.usage, "prompt_tokens"):
-                        input_tokens = chunk.usage.prompt_tokens
-                    if hasattr(chunk.usage, "completion_tokens"):
-                        output_tokens = chunk.usage.completion_tokens
-
-                # Handle text content
-                if hasattr(chunk, "choices") and len(chunk.choices) > 0:
-                    choice = chunk.choices[0]
-
-                    # Get the delta from the choice
-                    if hasattr(choice, "delta"):
-                        delta = choice.delta
-                    else:
-                        # If no delta, try to get message
-                        delta = getattr(choice, "message", {})
-
-                    # Check for finish_reason to know when we're done
-                    finish_reason = getattr(choice, "finish_reason", None)
-
-                    # Process reasoning content first (avoid Agent context loss)
-                    reasoning_text = None
-                    # delta 可能是 Pydantic delta 对象或 dict，用 getattr 取 model_extra（与 hasattr+isinstance 等价）
-                    _delta_extra = getattr(delta, "model_extra", None)
-                    if isinstance(_delta_extra, dict):
-                        reasoning_text = (
-                            _delta_extra.get("reasoning_content")
-                            or _delta_extra.get("reasoning_text")
-                        )
-                    if reasoning_text is None:
-                        reasoning_text = getattr(delta, "reasoning_content", None)
-                    if reasoning_text is None:
-                        reasoning_text = getattr(delta, "reasoning_text", None)
-                    if isinstance(delta, dict) and reasoning_text is None:
-                        reasoning_text = delta.get("reasoning_content") or delta.get(
-                            "reasoning_text"
-                        )
-                    if reasoning_text and tool_index is None:
-                        # 检查请求是否开启了 thinking
-                        if thinking_enabled:
-                            # thinking block 已在外面初始化，直接发 delta
-                            if not thinking_block_closed:
-                                yield f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta', 'index': 0, 'delta': {'type': 'thinking_delta', 'thinking': reasoning_text}})}\n\n"
-                                accumulated_reasoning += reasoning_text
-                        else:
-                            # 请求未开启 thinking，作为 text 保留但加上标签
-                            wrapped_reasoning = f"<thinking>{reasoning_text}</thinking>"
-                            accumulated_text += wrapped_reasoning
-                            if not text_block_closed:
-                                text_sent = True
-                                yield f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta', 'index': text_block_index, 'delta': {'type': 'text_delta', 'text': wrapped_reasoning}})}\n\n"
-
-                    # Process text content
-                    delta_content = None
-                    if hasattr(delta, "content"):
-                        delta_content = delta.content  # pyright: ignore[reportAttributeAccessIssue] - delta 为 dict 时 hasattr 为假，走下面分支
-                    elif isinstance(delta, dict) and "content" in delta:
-                        delta_content = delta["content"]
-
-                    if delta_content is not None and delta_content != "":
-                        accumulated_text += delta_content
-                        if tool_index is None:
-                            if thinking_enabled and not thinking_block_closed:
-                                # thinking block 还开着，先关闭它再开 text block
-                                yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': 0})}\n\n"
-                                thinking_block_closed = True
-                                text_block_index = 1
-                                yield f"event: content_block_start\ndata: {json.dumps({'type': 'content_block_start', 'index': 1, 'content_block': {'type': 'text', 'text': ''}})}\n\n"
-                            elif thinking_enabled and thinking_block_closed:
-                                # thinking block 已关闭，确保 text block index = 1 且已开
-                                if text_block_index == 0:
-                                    text_block_index = 1
-                                    yield f"event: content_block_start\ndata: {json.dumps({'type': 'content_block_start', 'index': 1, 'content_block': {'type': 'text', 'text': ''}})}\n\n"
-                            else:
-                                # 没开启 thinking，用 index 0 的 text block（已在外面初始化）
-                                text_block_index = 0
-
-                            text_sent = True
-                            yield f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta', 'index': text_block_index, 'delta': {'type': 'text_delta', 'text': delta_content}})}\n\n"
-
-                    # Process tool calls
-                    delta_tool_calls = None
-
-                    # Handle different formats of tool calls
-                    if hasattr(delta, "tool_calls"):
-                        delta_tool_calls = delta.tool_calls  # pyright: ignore[reportAttributeAccessIssue] - delta 为 dict 时 hasattr 为假，走下面分支
-                    elif isinstance(delta, dict) and "tool_calls" in delta:
-                        delta_tool_calls = delta["tool_calls"]
-
-                    # Process tool calls if any
-                    if delta_tool_calls:
-                        # First tool call we've seen - need to handle text properly
-                        if tool_index is None:
-                            # 先关闭 thinking block（如果还开着）
-                            if thinking_enabled and not thinking_block_closed:
-                                yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': 0})}\n\n"
-                                thinking_block_closed = True
-                                if text_block_index == 0:
-                                    text_block_index = 1
-                            # 关闭 text block（仅当它确实被打开过时）
-                            if text_sent and not text_block_closed:
-                                text_block_closed = True
-                                yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': text_block_index})}\n\n"
-                            elif (
-                                accumulated_text
-                                and not text_sent
-                                and not text_block_closed
-                            ):
-                                # 发送积累的 text 再关闭
-                                text_sent = True
-                                yield f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta', 'index': text_block_index, 'delta': {'type': 'text_delta', 'text': accumulated_text}})}\n\n"
-                                text_block_closed = True
-                                yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': text_block_index})}\n\n"
-                            # 如果 text block 从未打开过（无 text 内容），不需要关闭
-                            text_block_closed = True  # 无论如何标记为已关闭
-
-                        # Convert to list if it's not already
-                        if not isinstance(delta_tool_calls, list):
-                            delta_tool_calls = [delta_tool_calls]
-
-                        for tool_call in delta_tool_calls:
-                            # Get the index of this tool call (for multiple tools)
-                            current_index = None
-                            if isinstance(tool_call, dict) and "index" in tool_call:
-                                current_index = tool_call["index"]
-                            elif hasattr(tool_call, "index"):
-                                current_index = tool_call.index  # pyright: ignore[reportAttributeAccessIssue] - 上一分支已处理 dict，此处只可能是对象
-                            else:
-                                current_index = 0
-
-                            # Check if this is a new tool or a continuation
-                            if current_index not in openai_to_anthropic_tool_index:
-                                tool_index = current_index
-                                last_tool_index += 1
-                                openai_to_anthropic_tool_index[current_index] = (
-                                    last_tool_index
-                                )
-                                tool_json_buffers[last_tool_index] = ""
-
-                                # Extract function info
-                                if isinstance(tool_call, dict):
-                                    function = tool_call.get("function", {})
-                                    name = (
-                                        function.get("name", "")
-                                        if isinstance(function, dict)
-                                        else ""
-                                    )
-                                    tool_id = tool_call.get(
-                                        "id", f"toolu_{uuid.uuid4().hex[:24]}"
-                                    )
-                                else:
-                                    function = getattr(tool_call, "function", None)
-                                    name = (
-                                        getattr(function, "name", "")
-                                        if function
-                                        else ""
-                                    )
-                                    tool_id = getattr(
-                                        tool_call,
-                                        "id",
-                                        f"toolu_{uuid.uuid4().hex[:24]}",
-                                    )
-
-                                anthropic_tool_index = openai_to_anthropic_tool_index[
-                                    current_index
-                                ]
-                                yield f"event: content_block_start\ndata: {json.dumps({'type': 'content_block_start', 'index': anthropic_tool_index, 'content_block': {'type': 'tool_use', 'id': tool_id, 'name': name, 'input': {}}})}\n\n"
-                                current_tool_call = tool_call
-                                tool_content = ""
-                            else:
-                                anthropic_tool_index = openai_to_anthropic_tool_index[
-                                    current_index
-                                ]
-
-                            # Extract function arguments
-                            arguments = None
-                            if isinstance(tool_call, dict) and "function" in tool_call:
-                                function = tool_call.get("function", {})
-                                arguments = (
-                                    function.get("arguments", "")
-                                    if isinstance(function, dict)
-                                    else ""
-                                )
-                            elif hasattr(tool_call, "function"):
-                                function = getattr(tool_call, "function", None)
-                                arguments = (
-                                    getattr(function, "arguments", "")
-                                    if function
-                                    else ""
-                                )
-
-                            # If we have arguments, send them as a delta
-                            if arguments:
-                                # Try to detect if arguments are valid JSON or just a fragment
-                                try:
-                                    # If it's already a dict, use it
-                                    if isinstance(arguments, dict):
-                                        args_json = json.dumps(arguments)
-                                    else:
-                                        # Otherwise, try to parse it
-                                        json.loads(arguments)
-                                        args_json = arguments
-                                except (json.JSONDecodeError, TypeError):
-                                    # If it's a fragment, treat it as a string
-                                    args_json = arguments
-
-                                # Add to accumulated tool content
-                                tool_content += (
-                                    args_json if isinstance(args_json, str) else ""
-                                )
-                                if isinstance(args_json, str):
-                                    tool_json_buffers[anthropic_tool_index] = (
-                                        tool_json_buffers.get(anthropic_tool_index, "")
-                                        + args_json
-                                    )
-
-                                # Send the update
-                                yield f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta', 'index': anthropic_tool_index, 'delta': {'type': 'input_json_delta', 'partial_json': args_json}})}\n\n"
-
-                    # Process finish_reason - end the streaming response
-                    if finish_reason and not has_sent_stop_reason:
-                        has_sent_stop_reason = True
-
-                        # Close any open tool call blocks
-                        if tool_index is not None:
-                            for i in range(1, last_tool_index + 1):
-                                fix_suffix = _close_json_fragment(
-                                    tool_json_buffers.get(i, "")
-                                )
-                                if fix_suffix:
-                                    yield f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta', 'index': i, 'delta': {'type': 'input_json_delta', 'partial_json': fix_suffix}})}\n\n"
-                                yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': i})}\n\n"
-
-                        # If we accumulated text but never sent or closed text block, do it now
-                        if not text_block_closed and text_sent:
-                            # text block 被打开过，关闭它
-                            yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': text_block_index})}\n\n"
-                            text_block_closed = True
-                        elif not text_block_closed and accumulated_text and not text_sent:
-                            # 有积累的 text 但没发过，先发再关
-                            text_sent = True
-                            yield f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta', 'index': text_block_index, 'delta': {'type': 'text_delta', 'text': accumulated_text}})}\n\n"
-                            yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': text_block_index})}\n\n"
-                            text_block_closed = True
-
-                        # 如果 thinking block 还没关闭，关闭它
-                        if thinking_enabled and not thinking_block_closed:
-                            yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': 0})}\n\n"
-                            thinking_block_closed = True
-
-                        # Map OpenAI finish_reason to Anthropic stop_reason
-                        stop_reason = "end_turn"
-                        if finish_reason == "length":
-                            stop_reason = "max_tokens"
-                        elif finish_reason == "tool_calls":
-                            stop_reason = "tool_use"
-                        elif finish_reason == "stop":
-                            stop_reason = "end_turn"
-
-                        # Send message_delta with stop reason and usage
-                        # 上游 QClaw 不返回 usage → 用 tiktoken 估算 output_tokens
-                        if output_tokens == 0:
-                            try:
-                                _est_text = (
-                                    accumulated_text
-                                    + (accumulated_reasoning if thinking_enabled else "")
-                                    + "".join(tool_json_buffers.values())
-                                )
-                                output_tokens = _estimate_text_tokens(
-                                    _est_text,
-                                    original_model_name or original_request.model,
-                                )
-                                logger.debug(
-                                    f"STREAM EARLY-EXIT ESTIMATE: acc_text_len={len(accumulated_text)} "
-                                    f"acc_reasoning_len={len(accumulated_reasoning)} "
-                                    f"thinking_enabled={thinking_enabled} "
-                                    f"est_output_tokens={output_tokens}"
-                                )
-                            except Exception as _e:
-                                logger.debug(f"tiktoken output estimate (stream early-exit) failed: {_e}")
-                        usage = {"output_tokens": output_tokens}
-
-                        yield f"event: message_delta\ndata: {json.dumps({'type': 'message_delta', 'delta': {'stop_reason': stop_reason, 'stop_sequence': None}, 'usage': usage})}\n\n"
-
-                        # Send message_stop event
-                        yield f"event: message_stop\ndata: {json.dumps({'type': 'message_stop'})}\n\n"
-
-                        # Send final [DONE] marker to match Anthropic's behavior
-                        yield "data: [DONE]\n\n"
-                        return
-            except Exception as e:
-                # Log error but continue processing other chunks
-                _log_exception(
-                    "anthropic_stream_chunk_failed",
-                    e,
-                    {
-                        "request_id": request_id or "unknown",
-                        "model": original_model_name
-                        or original_request.original_model
-                        or original_request.model,
-                        "stream_phase": "chunk_processing",
-                        "has_tool_calls": tool_index is not None,
-                    },
-                )
-                continue
-
-        # If we didn't get a finish reason, close any open blocks
-        if not has_sent_stop_reason:
-            # Close any open tool call blocks
-            if tool_index is not None:
-                for i in range(1, last_tool_index + 1):
-                    fix_suffix = _close_json_fragment(tool_json_buffers.get(i, ""))
-                    if fix_suffix:
-                        yield f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta', 'index': i, 'delta': {'type': 'input_json_delta', 'partial_json': fix_suffix}})}\n\n"
-                    yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': i})}\n\n"
-
-            # Close the text content block
-            # 如果 thinking 开启，先关 thinking block (index 0)，再关 text block (text_block_index)
-            if thinking_enabled:
-                if not thinking_block_closed:
-                    yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': 0})}\n\n"
-                    thinking_block_closed = True
-                # 关闭 text block（仅当被打开过）
-                if text_sent and not text_block_closed:
-                    yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': text_block_index})}\n\n"
-                    text_block_closed = True
-            else:
-                if text_sent and not text_block_closed:
-                    yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': 0})}\n\n"
-                    text_block_closed = True
-                elif not text_sent and not text_block_closed:
-                    # text block 从未被打开，不需要关闭
-                    pass
-
-            # Send final message_delta with usage
-            # 上游 QClaw 不返回 usage → 用 tiktoken 估算 output_tokens
-            if output_tokens == 0:
-                try:
-                    output_accumulated_text = (
-                        accumulated_text
-                        + (accumulated_reasoning if thinking_enabled else "")
-                        + "".join(tool_json_buffers.values())
-                    )
-                    output_tokens = _estimate_text_tokens(
-                        output_accumulated_text,
-                        original_model_name or original_request.model,
-                    )
-                    logger.debug(
-                        f"STREAM FINAL ESTIMATE: acc_text_len={len(accumulated_text)} "
-                        f"acc_reasoning_len={len(accumulated_reasoning)} "
-                        f"thinking_enabled={thinking_enabled} "
-                        f"est_output_tokens={output_tokens}"
-                    )
-                except Exception as _e:
-                    logger.debug(f"tiktoken output estimate (stream final) failed: {_e}")
-            usage = {"output_tokens": output_tokens}
-
-            yield f"event: message_delta\ndata: {json.dumps({'type': 'message_delta', 'delta': {'stop_reason': 'end_turn', 'stop_sequence': None}, 'usage': usage})}\n\n"
-
-            # Send message_stop event
-            yield f"event: message_stop\ndata: {json.dumps({'type': 'message_stop'})}\n\n"
-
-            # Send final [DONE] marker to match Anthropic's behavior
-            yield "data: [DONE]\n\n"
-
-    except Exception as e:
-        _log_exception(
-            "anthropic_stream_failed",
-            e,
-            {
-                "request_id": request_id or "unknown",
-                "model": original_model_name
-                or original_request.original_model
-                or original_request.model,
-                "stream_phase": "outer_handler",
-                # 等价于原 `output_tokens if "output_tokens" in locals() else 0`（异常可能发生在赋值前）
-                "output_tokens": locals().get("output_tokens", 0),
-            },
-        )
-
-        # Send error message_delta
-        yield f"event: message_delta\ndata: {json.dumps({'type': 'message_delta', 'delta': {'stop_reason': 'error', 'stop_sequence': None}, 'usage': {'output_tokens': 0}})}\n\n"
-
-        # Send message_stop event
-        yield f"event: message_stop\ndata: {json.dumps({'type': 'message_stop'})}\n\n"
-
-        # Send final [DONE] marker
-        yield "data: [DONE]\n\n"
-
-
-async def handle_qclaw_streaming(qclaw_response, display_model: str):
-    """QClaw OpenAI SSE 流 → Anthropic SSE 流 格式转换"""
-    import uuid as _uuid
-    msg_id = f"msg_{_uuid.uuid4().hex[:24]}"
-
-    # message_start — 使用原始模型名让 Claude Code 识别
-    yield f"event: message_start\ndata: {json.dumps({'type': 'message_start', 'message': {'id': msg_id, 'type': 'message', 'role': 'assistant', 'model': display_model, 'content': [], 'stop_reason': None, 'stop_sequence': None, 'usage': {'input_tokens': 0, 'cache_creation_input_tokens': 0, 'cache_read_input_tokens': 0, 'output_tokens': 0}}})}\n\n".encode()
-
-    # content_block_start (text)
-    yield f"event: content_block_start\ndata: {json.dumps({'type': 'content_block_start', 'index': 0, 'content_block': {'type': 'text', 'text': ''}})}\n\n".encode()
-
-    accumulated = ""
-    buffer = b""
-    async for chunk in qclaw_response.aiter_bytes():
-        buffer += chunk
-        while b"\n" in buffer:
-            line, buffer = buffer.split(b"\n", 1)
-            line = line.strip()
-            if not line:
-                continue
-            decoded = line.decode("utf-8", errors="replace")
-            if decoded.startswith("data: [DONE]"):
-                break
-            if not decoded.startswith("data: "):
-                continue
-            try:
-                data = json.loads(decoded[6:])
-                delta = data.get("choices", [{}])[0].get("delta", {})
-                content = delta.get("content", "")
-                finish = data.get("choices", [{}])[0].get("finish_reason")
-
-                if content:
-                    accumulated += content
-                    yield f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta', 'index': 0, 'delta': {'type': 'text_delta', 'text': content}})}\n\n".encode()
-
-                if finish:
-                    break
-            except:
-                continue
-
-    # content_block_stop
-    yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': 0})}\n\n".encode()
-
-    # message_delta — 用 tiktoken 估算 output_tokens（之前是 len(split()) 太粗）
-    stop_reason = "end_turn"
-    usage = {"output_tokens": _estimate_text_tokens(accumulated, display_model)}
-    yield f"event: message_delta\ndata: {json.dumps({'type': 'message_delta', 'delta': {'stop_reason': stop_reason, 'stop_sequence': None}, 'usage': usage})}\n\n".encode()
-
-    # message_stop
-    yield f"event: message_stop\ndata: {json.dumps({'type': 'message_stop'})}\n\n".encode()
-
-
-# ─── Copilot /v1/messages 上游重试（分支 B 流式/非流式共享）───
-
-# 触发重试的传输层异常：连接建立失败 / 读取中断 / 上游提前断开协议。
-_COPILOT_RETRY_EXCEPTIONS = (httpx.ConnectError, httpx.ReadError, httpx.RemoteProtocolError)
-
-_COPILOT_MESSAGES_MAX_ATTEMPTS = 3
-_COPILOT_MESSAGES_BACKOFF = 0.5
-
-
-def _copilot_status_retryable(status_code: int) -> bool:
-    """上游 HTTP 状态码是否值得重试。
-
-    与 gateways.errors 的分类族对齐（`_vendor_body_retryable` 按错误体特征判限流，
-    此处按状态码判服务端故障）：5xx 是上游瞬时故障，重试有意义；4xx 是请求本身的
-    问题，重试只会得到同样的拒绝。429（`_is_rate_limit_error` 覆盖的限流类）在本
-    路径由上游以 4xx 返回，不重试——盲目重试稳定限流只是浪费 backoff。
-    """
-    return status_code >= 500
-
-
-class _CopilotAttemptFailed(Exception):
-    """`attempt_fn` 主动声明"这次尝试失败了，按 reason 重试"。
-
-    与传输层异常（`_COPILOT_RETRY_EXCEPTIONS`）在骨架里等价处理，区别只是前者由
-    调用方按业务判据（如 `_copilot_status_retryable`）抛出，后者由 httpx 抛出。
-    """
-
-    def __init__(self, reason: str) -> None:
-        super().__init__(reason)
-        self.reason = reason
-
-
-async def _retry_copilot_messages_request(
-    client_factory: Callable[[], httpx.AsyncClient],
-    attempt_fn: Callable[[httpx.AsyncClient, int], AsyncIterator[bytes]],
-    max_attempts: int = _COPILOT_MESSAGES_MAX_ATTEMPTS,
-    backoff: float = _COPILOT_MESSAGES_BACKOFF,
-) -> AsyncIterator[bytes]:
-    """Copilot /v1/messages 上游请求的共享重试骨架（流式与非流式复用）。
-
-    `attempt_fn(client, attempt_index)` 是一个异步生成器：它在给定客户端上发一次
-    请求，产出的字节被原样转发给下游（流式路径逐 chunk 透传，非流式路径不产出字节
-    而把响应经闭包交回调用方）。它通过抛 `_CopilotAttemptFailed(reason)` 声明本次
-    失败需要重试；正常结束即视为终结，骨架停止重试。
-
-    骨架负责两个调用点原本各写一遍的三件事：
-      1. 重试前 backoff（首次不 sleep）；
-      2. 每次尝试用完即 `aclose()` 客户端（成功、失败、异常都走）；
-      3. 捕获传输层异常（`_COPILOT_RETRY_EXCEPTIONS`）转为失败理由继续下一次。
-
-    尝试全部耗尽时抛 `_CopilotAttemptFailed`，`reason` 为最后一次的失败理由，
-    由调用方翻译成各自协议下的错误（流式 → JSON 错误帧；非流式 → HTTP 502）。
-    """
-    last_err = "no attempt made"
-    for attempt_index in range(max_attempts):
-        if attempt_index > 0:
-            await asyncio.sleep(backoff)
-        client = client_factory()
-        try:
-            async for chunk in attempt_fn(client, attempt_index):
-                yield chunk
-            return
-        except _CopilotAttemptFailed as e:
-            last_err = e.reason
-        except _COPILOT_RETRY_EXCEPTIONS as e:
-            last_err = str(e)
-        finally:
-            await client.aclose()
-    raise _CopilotAttemptFailed(last_err)
-
-
-def _copilot_messages_client() -> httpx.AsyncClient:
-    """分支 B 上游客户端：长响应超时 300s、连接 10s，`trust_env=False` 绕开系统代理。"""
-    return httpx.AsyncClient(timeout=httpx.Timeout(300.0, connect=10.0), trust_env=False)
-
 
 @app.post("/v1/messages")
 async def create_message(request: MessagesRequest, raw_request: Request):
@@ -3394,11 +1717,8 @@ async def create_message(request: MessagesRequest, raw_request: Request):
             f"📊 UPSTREAM REQUEST: model={original_model} stream={body_json.get('stream')} max_tokens={upstream_max_tokens} thinking={upstream_thinking}"
         )
 
-        # ── Copilot /v1/messages 透传：直接转发 Anthropic 格式到下游 /v1/messages ──
-        # 绕过 convert_anthropic_to_litellm() → LiteLLM → /chat/completions 的双层翻译，
-        # Anthropic 原生格式零转换，thinking/tool_use/stream 等复杂结构不会丢失。
         # ── 统一模型定义解析：命中 models[] → Anthropic→OpenAI 翻译后转发到本地端口 ──
-        # 未命中则继续走下方原有 copilot 透传 / LiteLLM 路径。
+        # 未命中则不再有兜底路径（legacy 单端口模式已下线），落到函数尾直接返回 404。
         mapped = _cfg._resolve_model_alias(_MODELS_CFG, original_model)
         if mapped:
             from anthropic_convert import convert_anthropic_request_to_openai, convert_openai_response_to_anthropic
@@ -3467,335 +1787,11 @@ async def create_message(request: MessagesRequest, raw_request: Request):
                 _anthropic_resp = convert_openai_response_to_anthropic(_openai_resp, original_model)
                 return JSONResponse(content=_anthropic_resp, status_code=_resp.status_code)
 
-        if PREFERRED_PROVIDER == "copilot":
-            target_model = _copilot_model_name(original_model)
-            copilot_msgs_body = dict(body_json)
-            copilot_msgs_body["model"] = target_model
-            # 清理 Copilot 不接受的空/None content
-            for msg in copilot_msgs_body.get("messages", []):
-                c = msg.get("content")
-                if c is None or (isinstance(c, str) and not c.strip()):
-                    msg["content"] = "."
-            # Copilot 不接受没有 tools 时的 tool_choice
-            if copilot_msgs_body.get("tool_choice") and not copilot_msgs_body.get("tools"):
-                copilot_msgs_body.pop("tool_choice")
-
-            copilot_msgs_url = f"{COPILOT_API_BASE}/v1/messages"
-            copilot_headers = {
-                "Content-Type": "application/json",
-                "Authorization": f"Bearer {COPILOT_GHE_TOKEN}",
-                "Copilot-Integration-Id": COPILOT_INTEGRATION_ID,
-                "anthropic-version": raw_request.headers.get("anthropic-version", "2023-06-01"),
-            }
-            log_request_beautifully(
-                "POST", raw_request.url.path, original_model, target_model,
-                len(copilot_msgs_body.get("messages", [])),
-                len(copilot_msgs_body.get("tools") or []), 200
-            )
-
-            if copilot_msgs_body.get("stream"):
-                async def _copilot_stream_attempt(client: httpx.AsyncClient, _attempt: int) -> AsyncIterator[bytes]:
-                    """一次流式尝试：5xx 读干上游后声明失败重试，否则逐 chunk 原样透传。"""
-                    async with client.stream("POST", copilot_msgs_url, json=copilot_msgs_body, headers=copilot_headers) as resp:
-                        if _copilot_status_retryable(resp.status_code):
-                            # 必须读干，否则连接无法干净复用/关闭
-                            await resp.aread()
-                            raise _CopilotAttemptFailed(f"upstream {resp.status_code}")
-                        async for chunk in resp.aiter_bytes():
-                            yield chunk
-
-                async def copilot_messages_stream() -> AsyncIterator[bytes]:
-                    try:
-                        async for chunk in _retry_copilot_messages_request(
-                            _copilot_messages_client, _copilot_stream_attempt
-                        ):
-                            yield chunk
-                    except _CopilotAttemptFailed as e:
-                        # 流式头已发出，无法再改状态码：以裸 JSON 错误对象收尾（现状行为）
-                        yield json.dumps({"error": {"type": "proxy_error", "message": f"copilot /v1/messages upstream unavailable: {e.reason}"}}).encode()
-
-                return StreamingResponse(copilot_messages_stream(), media_type="text/event-stream")
-            else:
-                # 非流式无字节可产出：成功的响应经闭包交回，由本作用域翻译为 JSONResponse
-                final_resp: Dict[str, httpx.Response] = {}
-
-                async def _copilot_post_attempt(client: httpx.AsyncClient, attempt_index: int) -> AsyncIterator[bytes]:
-                    """一次非流式尝试：5xx 且还有剩余次数则重试；最后一次直接回传上游响应。"""
-                    resp = await client.post(copilot_msgs_url, json=copilot_msgs_body, headers=copilot_headers)
-                    if _copilot_status_retryable(resp.status_code) and attempt_index < _COPILOT_MESSAGES_MAX_ATTEMPTS - 1:
-                        raise _CopilotAttemptFailed(f"upstream {resp.status_code}")
-                    final_resp["resp"] = resp
-                    # 非流式不向下游产出字节，交回响应即算本次尝试终结；
-                    # 空序列上的 yield 只为满足骨架的异步生成器契约（循环体永不执行）
-                    for _no_bytes in ():
-                        yield _no_bytes
-
-                try:
-                    async for _ in _retry_copilot_messages_request(
-                        _copilot_messages_client, _copilot_post_attempt
-                    ):
-                        pass
-                except _CopilotAttemptFailed as e:
-                    raise HTTPException(status_code=502, detail=f"copilot /v1/messages upstream unavailable: {e.reason}")
-
-                resp = final_resp["resp"]
-                resp_data = resp.json()
-                # 还原 Claude Code 原始模型名
-                if isinstance(resp_data, dict) and "model" in resp_data:
-                    resp_data["model"] = original_model
-                return JSONResponse(content=resp_data, status_code=resp.status_code)
-
-        # Convert Anthropic request to LiteLLM format
-        litellm_request = convert_anthropic_to_litellm(request)
-
-        # Apply provider strategy（各策略自行设置 api_key/api_base/headers）
-        provider_strategy = _PROVIDER_STRATEGIES.get(PREFERRED_PROVIDER, _default_provider)
-        result = provider_strategy(request, litellm_request, original_model)
-        if result is not None:
-            return result
-
-        # For OpenAI models - modify request format to work with limitations
-        if "openai" in litellm_request["model"] and "messages" in litellm_request:
-            logger.debug(f"Processing OpenAI model request: {litellm_request['model']}")
-
-            # For OpenAI models, we need to convert content blocks to simple strings
-            # and handle other requirements
-            for i, msg in enumerate(litellm_request["messages"]):
-                # Special case - handle message content directly when it's a list of tool_result
-                # This is a specific case we're seeing in the error
-                if "content" in msg and isinstance(msg["content"], list):
-                    is_only_tool_result = True
-                    for block in msg["content"]:
-                        if (
-                            not isinstance(block, dict)
-                            or block.get("type") != "tool_result"
-                        ):
-                            is_only_tool_result = False
-                            break
-
-                    if is_only_tool_result and len(msg["content"]) > 0:
-                        logger.warning(
-                            f"Found message with only tool_result content - special handling required"
-                        )
-                        # Extract the content from all tool_result blocks
-                        all_text = ""
-                        for block in msg["content"]:
-                            all_text += "Tool Result:\n"
-                            result_content = block.get("content", [])
-
-                            # Handle different formats of content
-                            if isinstance(result_content, list):
-                                for item in result_content:
-                                    if (
-                                        isinstance(item, dict)
-                                        and item.get("type") == "text"
-                                    ):
-                                        all_text += item.get("text", "") + "\n"
-                                    elif isinstance(item, dict):
-                                        # Fall back to string representation of any dict
-                                        try:
-                                            item_text = item.get(
-                                                "text", json.dumps(item)
-                                            )
-                                            all_text += item_text + "\n"
-                                        except:
-                                            all_text += str(item) + "\n"
-                            elif isinstance(result_content, str):
-                                all_text += result_content + "\n"
-                            else:
-                                try:
-                                    all_text += json.dumps(result_content) + "\n"
-                                except:
-                                    all_text += str(result_content) + "\n"
-
-                        # Replace the list with extracted text
-                        litellm_request["messages"][i]["content"] = (
-                            all_text.strip() or "..."
-                        )
-                        logger.warning(
-                            f"Converted tool_result to plain text: {all_text.strip()[:200]}..."
-                        )
-                        continue  # Skip normal processing for this message
-
-                # 1. Handle content field - normal case
-                if "content" in msg:
-                    # Check if content is a list (content blocks)
-                    if isinstance(msg["content"], list):
-                        # Convert complex content blocks to simple string
-                        text_content = ""
-                        for block in msg["content"]:
-                            if isinstance(block, dict):
-                                # Handle different content block types
-                                if block.get("type") == "text":
-                                    text_content += block.get("text", "") + "\n"
-
-                                # Handle tool_result content blocks - extract nested text
-                                elif block.get("type") == "tool_result":
-                                    tool_id = block.get("tool_use_id", "unknown")
-                                    text_content += f"[Tool Result ID: {tool_id}]\n"
-
-                                    # Extract text from the tool_result content
-                                    result_content = block.get("content", [])
-                                    if isinstance(result_content, list):
-                                        for item in result_content:
-                                            if (
-                                                isinstance(item, dict)
-                                                and item.get("type") == "text"
-                                            ):
-                                                text_content += (
-                                                    item.get("text", "") + "\n"
-                                                )
-                                            elif isinstance(item, dict):
-                                                # Handle any dict by trying to extract text or convert to JSON
-                                                if "text" in item:
-                                                    text_content += (
-                                                        item.get("text", "") + "\n"
-                                                    )
-                                                else:
-                                                    try:
-                                                        text_content += (
-                                                            json.dumps(item) + "\n"
-                                                        )
-                                                    except:
-                                                        text_content += str(item) + "\n"
-                                    elif isinstance(result_content, dict):
-                                        # Handle dictionary content
-                                        if result_content.get("type") == "text":
-                                            text_content += (
-                                                result_content.get("text", "") + "\n"
-                                            )
-                                        else:
-                                            try:
-                                                text_content += (
-                                                    json.dumps(result_content) + "\n"
-                                                )
-                                            except:
-                                                text_content += (
-                                                    str(result_content) + "\n"
-                                                )
-                                    elif isinstance(result_content, str):
-                                        text_content += result_content + "\n"
-                                    else:
-                                        try:
-                                            text_content += (
-                                                json.dumps(result_content) + "\n"
-                                            )
-                                        except:
-                                            text_content += str(result_content) + "\n"
-
-                                # Handle tool_use content blocks
-                                elif block.get("type") == "tool_use":
-                                    tool_name = block.get("name", "unknown")
-                                    tool_id = block.get("id", "unknown")
-                                    tool_input = json.dumps(block.get("input", {}))
-                                    text_content += f"[Tool: {tool_name} (ID: {tool_id})]\nInput: {tool_input}\n\n"
-
-                                # Handle image content blocks
-                                elif block.get("type") == "image":
-                                    text_content += "[Image content - not displayed in text format]\n"
-
-                        # Make sure content is never empty for OpenAI models
-                        if not text_content.strip():
-                            text_content = "..."
-
-                        litellm_request["messages"][i]["content"] = text_content.strip()
-                    # Also check for None or empty string content
-                    elif msg["content"] is None:
-                        litellm_request["messages"][i]["content"] = (
-                            "..."  # Empty content not allowed
-                        )
-
-                # 2. Remove any fields OpenAI doesn't support in messages
-                for key in list(msg.keys()):
-                    if key not in [
-                        "role",
-                        "content",
-                        "name",
-                        "tool_call_id",
-                        "tool_calls",
-                    ]:
-                        logger.warning(
-                            f"Removing unsupported field from message: {key}"
-                        )
-                        del msg[key]
-
-            # 3. Final validation - check for any remaining invalid values and dump full message details
-            for i, msg in enumerate(litellm_request["messages"]):
-                # Log the message format for debugging
-                logger.debug(
-                    f"Message {i} format check - role: {msg.get('role')}, content type: {type(msg.get('content'))}"
-                )
-
-                # If content is still a list or None, replace with placeholder
-                if isinstance(msg.get("content"), list):
-                    logger.warning(
-                        f"CRITICAL: Message {i} still has list content after processing: {json.dumps(msg.get('content'))}"
-                    )
-                    # Last resort - stringify the entire content as JSON
-                    litellm_request["messages"][i]["content"] = (
-                        f"Content as JSON: {json.dumps(msg.get('content'))}"
-                    )
-                elif msg.get("content") is None:
-                    logger.warning(
-                        f"Message {i} has None content - replacing with placeholder"
-                    )
-                    litellm_request["messages"][i]["content"] = (
-                        "..."  # Fallback placeholder
-                    )
-
-        # Only log basic info about the request, not the full details
-        logger.debug(
-            f"Request for model: {litellm_request.get('model')}, stream: {litellm_request.get('stream', False)}"
+        # models[] 未命中：legacy 单端口模式已下线，无兜底路径，显式返回 404
+        raise HTTPException(
+            status_code=404,
+            detail=f"模型 '{original_model}' 未在 models[] 中配置路由",
         )
-
-        # Handle streaming mode
-        if request.stream:
-            # Use LiteLLM for streaming
-            num_tools = len(request.tools) if request.tools else 0
-
-            log_request_beautifully(
-                "POST",
-                raw_request.url.path,
-                display_model,
-                litellm_request.get("model"),
-                len(litellm_request["messages"]),
-                num_tools,
-                200,  # Assuming success at this point
-            )
-            # Ensure we use the async version for streaming
-            response_generator = await litellm.acompletion(**litellm_request)
-
-            return StreamingResponse(
-                handle_streaming(response_generator, request, original_model, request_id),
-                media_type="text/event-stream",
-            )
-        else:
-            # Use LiteLLM for regular completion
-            num_tools = len(request.tools) if request.tools else 0
-
-            log_request_beautifully(
-                "POST",
-                raw_request.url.path,
-                display_model,
-                litellm_request.get("model"),
-                len(litellm_request["messages"]),
-                num_tools,
-                200,  # Assuming success at this point
-            )
-            start_time = time.time()
-            litellm_response = litellm.completion(**litellm_request)
-            logger.debug(
-                f"✅ RESPONSE RECEIVED: Model={litellm_request.get('model')}, Time={time.time() - start_time:.2f}s"
-            )
-
-            # Convert LiteLLM response to Anthropic format
-            anthropic_response = convert_litellm_to_anthropic(litellm_response, request)
-
-            # 还原 Claude Code 原始模型名
-            if original_model and hasattr(anthropic_response, "model"):
-                anthropic_response.model = original_model
-
-            return anthropic_response
 
     except Exception as e:
         _log_exception(
@@ -3815,18 +1811,6 @@ async def create_message(request: MessagesRequest, raw_request: Request):
             },
         )
 
-        # 检测 QClaw 网关 upstream auth 过期 (9002)
-        # litellm 内部缓存的状态重置不彻底，绕过 litellm 直接用 httpx 重试
-        if _is_auth_expired_error(e) and PREFERRED_PROVIDER == "qclaw":
-            await _reset_litellm_clients()
-            logger.info("🔄 Retrying via httpx passthrough (bypass litellm)...")
-            try:
-                return await _passthrough_to_qclaw(litellm_request, request, original_model, request_id)
-            except Exception as retry_e:
-                _log_exception("anthropic_messages_fallback_failed", retry_e, {"original_error": str(e)})
-                raise HTTPException(status_code=getattr(retry_e, "status_code", 502),
-                                     detail=f"QClaw fallback failed: {str(retry_e)}")
-
         # Format error for response
         error_message = f"Error: {str(e)}"
 
@@ -3838,82 +1822,16 @@ async def create_message(request: MessagesRequest, raw_request: Request):
 @app.post("/v1/messages/count_tokens")
 async def count_tokens(request: TokenCountRequest, raw_request: Request):
     try:
-        # Log the incoming token count request
         original_model = request.original_model or request.model
-
-        # Get the display name for logging, just the model name without provider prefix
-        display_model = original_model
-        if "/" in display_model:
-            display_model = display_model.split("/")[-1]
-
-        # Clean model name for capability check
-        clean_model = request.model
-        if clean_model.startswith("anthropic/"):
-            clean_model = clean_model[len("anthropic/") :]
-        elif clean_model.startswith("openai/"):
-            clean_model = clean_model[len("openai/") :]
-
-        # Convert the messages to a format LiteLLM can understand
-        converted_request = convert_anthropic_to_litellm(
-            MessagesRequest(
-                model=request.model,
-                max_tokens=100,  # Arbitrary value not used for token counting
-                messages=request.messages,
-                system=request.system,
-                tools=request.tools,
-                tool_choice=request.tool_choice,
-                thinking=request.thinking,
-            )
+        display_model = original_model.split("/")[-1] if "/" in original_model else original_model
+        log_request_beautifully(
+            "POST", raw_request.url.path, display_model, display_model,
+            len(request.messages), len(request.tools) if request.tools else 0, 200,
         )
-
-        # Use LiteLLM's token_counter function
-        try:
-            # Import token_counter function
-            from litellm import token_counter
-
-            # Log the request beautifully
-            num_tools = len(request.tools) if request.tools else 0
-
-            log_request_beautifully(
-                "POST",
-                raw_request.url.path,
-                display_model,
-                converted_request.get("model"),
-                len(converted_request["messages"]),
-                num_tools,
-                200,  # Assuming success at this point
-            )
-
-            # Prepare token counter arguments
-            token_counter_args = {
-                "model": converted_request["model"],
-                "messages": converted_request["messages"],
-            }
-
-            # Add custom base URL for OpenAI models if configured
-            if request.model.startswith("openai/") and OPENAI_BASE_URL:
-                token_counter_args["api_base"] = OPENAI_BASE_URL
-
-            # Count tokens
-            token_count = token_counter(**token_counter_args)
-
-            # Return Anthropic-style response
-            return TokenCountResponse(input_tokens=token_count)
-
-        except ImportError:
-            logger.error("Could not import token_counter from litellm")
-            # Fallback：用 tiktoken 本地估算（之前硬编码 1000 误差太大）
-            try:
-                est = _estimate_messages_tokens(
-                    converted_request.get("messages", []) or [],
-                    converted_request.get("model", request.model),
-                    system=getattr(request, "system", None),
-                    tools=getattr(request, "tools", None),
-                )
-                return TokenCountResponse(input_tokens=est)
-            except Exception:
-                return TokenCountResponse(input_tokens=1000)  # 终极兜底
-
+        token_count = _estimate_messages_tokens(
+            request.messages, request.model, system=request.system, tools=request.tools,
+        )
+        return TokenCountResponse(input_tokens=token_count)
     except Exception as e:
         import traceback
 
@@ -4046,13 +1964,7 @@ if __name__ == "__main__":
     if len(sys.argv) > 1 and sys.argv[1] == "--help":
         print("Run with: python server.py [--port 8082]")
         print("")
-        print("Set PREFERRED_PROVIDER environment variable to choose backend:")
-        print("  openai       OpenAI compatible API (default)")
-        print("  anthropic    Anthropic Claude API")
-        print("  google       Google Gemini API")
-        print("  qclaw        QClaw upstream (mmgrcalltoken.3g.qq.com, auto-decrypt API key)")
-        print("")
-        print("Example: PREFERRED_PROVIDER=qclaw python server.py")
+        print("Backend routing is driven by targets.json models[] (no legacy provider switch).")
         sys.exit(0)
 
     port = 8081

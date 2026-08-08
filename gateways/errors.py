@@ -43,22 +43,6 @@ def _is_auth_expired_error(exc: Exception) -> bool:
     return "9002" in msg or "该功能暂不可用" in msg
 
 
-def _is_rate_limit_error(exc: Exception) -> bool:
-    """识别 LiteLLM 抛出的限流类异常（含 qclaw 的 ResourceExhausted / Worker local ...）。
-
-    命中后调用方应返回 HTTP 429 + Retry-After，让下游客户端（如 opencode）自动重试。
-    关键字复用 _VENDOR_ERROR_MAPS，保持单点维护。
-    """
-    from litellm.exceptions import RateLimitError as _LiteLLMRateLimitError  # litellm.RateLimitError 的同一个类，走公开导出路径
-    import litellm
-    if isinstance(exc, (_LiteLLMRateLimitError, getattr(litellm, "RouterRateLimitError", ()))):
-        return True
-    text = str(exc)
-    if not text:
-        return False
-    return any(k in text for k, _s, _t, _d in _VENDOR_ERROR_MAPS)
-
-
 def _map_upstream_error(body_text: str) -> Optional[Tuple[int, str]]:
     """根据错误映射表把上游错误体转成 (http_status, sse_error_type)。
 
@@ -88,7 +72,6 @@ def _vendor_body_retryable(body_text: str) -> bool:
 # 导出供 server.py 重新导出的公共符号
 __all__ = [
     "_is_auth_expired_error",
-    "_is_rate_limit_error",
     "_VENDOR_ERROR_MAPS",
     "_VENDOR_ERROR_PATTERNS",
     "_VENDOR_RETRY_AFTER",
