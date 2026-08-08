@@ -26,10 +26,16 @@ import uuid
 
 
 def convert_anthropic_request_to_openai(anthropic_body: dict) -> dict:
-    """Anthropic /v1/messages 请求体 → OpenAI /v1/chat/completions 请求体"""
+    """Anthropic /v1/messages 请求体 → OpenAI /v1/chat/completions 请求体
+
+    消息循环借鉴 LiteLLM（litellm/llms/anthropic/experimental_pass_through/
+    adapters/transformation.py）的 bucket 架构：一条 Anthropic 消息可能产生
+    多条 OpenAI 消息（tool_result 独立成 role:"tool"），flush 顺序
+    tool 消息在前、user 消息在后。assistant 的 tool_use → 顶层 tool_calls。
+    """
     messages = []
 
-    # system prompt
+    # system prompt（多文本块合并成纯字符串）
     system = anthropic_body.get("system")
     if system:
         if isinstance(system, str):
@@ -42,29 +48,82 @@ def convert_anthropic_request_to_openai(anthropic_body: dict) -> dict:
             if text_parts:
                 messages.append({"role": "system", "content": "\n\n".join(text_parts)})
 
-    # conversation messages
+    # conversation messages（bucket 架构：tool 消息独立，user 内容合并）
     for msg in anthropic_body.get("messages", []):
         role = msg.get("role", "user")
         content = msg.get("content", "")
-        if isinstance(content, list):
-            # content blocks → extract text
-            parts = []
+        if role == "assistant":
+            # assistant：text 块合并成纯字符串 + tool_use → 顶层 tool_calls
+            text_parts: list[str] = []
+            tool_calls: list[dict] = []
+            if isinstance(content, str):
+                text_parts.append(content)
+            elif isinstance(content, list):
+                for block in content:
+                    if isinstance(block, dict):
+                        if block.get("type") == "text":
+                            text_parts.append(str(block.get("text", "")))
+                        elif block.get("type") == "tool_use":
+                            # Anthropic tool_use → OpenAI tool_calls（顶层字段）
+                            tool_calls.append({
+                                "id": str(block.get("id", "")),
+                                "type": "function",
+                                "function": {
+                                    "name": str(block.get("name", "")),
+                                    "arguments": json.dumps(block.get("input", {})),
+                                },
+                            })
+            assistant_msg: dict[str, object] = {"role": "assistant"}
+            assistant_content: str = "".join(text_parts) if text_parts else ""
+            assistant_msg["content"] = assistant_content
+            if tool_calls:
+                assistant_msg["tool_calls"] = tool_calls
+            messages.append(assistant_msg)
+        elif role == "user" and isinstance(content, list):
+            # user 消息：text/image 合并到 user content，tool_result 独立成 role:"tool"
+            tool_messages = []
+            user_parts = []
             for block in content:
                 if isinstance(block, dict):
                     if block.get("type") == "text":
-                        parts.append({"type": "text", "text": block.get("text", "")})
-                    elif block.get("type") == "tool_use":
-                        parts.append({
-                            "type": "function",
-                            "id": block.get("id", ""),
-                            "function": {"name": block.get("name", ""), "arguments": json.dumps(block.get("input", {}))},
-                        })
+                        user_parts.append(block.get("text", ""))
                     elif block.get("type") == "tool_result":
-                        parts.append({"type": "text", "text": block.get("content", "")})
+                        # tool_result → role:"tool"（必须独立，不能塞 user content）
+                        # 单 item 拍平成纯字符串（许多 OpenAI 兼容上游拒绝 list 形式 tool content）
+                        tr_content = block.get("content", "")
+                        if isinstance(tr_content, list):
+                            # 多 item 合并成单条 tool 消息（每个 tool_use 只能有一个 tool_result）
+                            text_bits = []
+                            for c in tr_content:
+                                if isinstance(c, str):
+                                    text_bits.append(c)
+                                elif isinstance(c, dict) and c.get("type") == "text":
+                                    text_bits.append(c.get("text", ""))
+                            tr_text = "\n".join(text_bits)
+                        else:
+                            tr_text = str(tr_content)
+                        tool_messages.append({
+                            "role": "tool",
+                            "tool_call_id": block.get("tool_use_id", ""),
+                            "content": tr_text,
+                        })
+                    elif block.get("type") == "image":
+                        # Anthropic image → OpenAI image_url（data URL）
+                        source = block.get("source", {})
+                        if source.get("type") == "base64":
+                            media = source.get("media_type", "image/jpeg")
+                            data = source.get("data", "")
+                            user_parts.append(f"data:{media};base64,{data}")
+                        elif source.get("type") == "url":
+                            user_parts.append(source.get("url", ""))
                 elif isinstance(block, str):
-                    parts.append({"type": "text", "text": block})
-            messages.append({"role": role, "content": parts})
+                    user_parts.append(block)
+            # flush 顺序：tool 消息在前，user 消息在后（OpenAI 要求 tool 紧跟 assistant tool_calls）
+            messages.extend(tool_messages)
+            if user_parts:
+                messages.append({"role": "user", "content": "\n".join(user_parts)})
         else:
+            # user 字符串 或其他（system 已在上面处理）
             messages.append({"role": role, "content": str(content)})
 
     openai_req = {
@@ -80,26 +139,42 @@ def convert_anthropic_request_to_openai(anthropic_body: dict) -> dict:
         openai_req["top_p"] = anthropic_body["top_p"]
     if anthropic_body.get("top_k") is not None:
         openai_req["top_k"] = anthropic_body["top_k"]
+    # stop_sequences → stop（OpenAI 参数名）
+    if anthropic_body.get("stop_sequences"):
+        openai_req["stop"] = anthropic_body["stop_sequences"]
 
     # stream
     if anthropic_body.get("stream"):
         openai_req["stream"] = True
         openai_req["stream_options"] = {"include_usage": True}
 
-    # tools
+    # tools（Anthropic tools[{name,description,input_schema}] → OpenAI tools）
     tools = anthropic_body.get("tools")
     if tools:
         openai_tools = []
         for t in tools:
-            openai_tools.append({
-                "type": "function",
-                "function": {
-                    "name": t.get("name", ""),
-                    "description": t.get("description", ""),
-                    "parameters": t.get("input_schema", {}),
-                },
-            })
+            function_chunk = {"name": t.get("name", "")}
+            if t.get("description"):
+                function_chunk["description"] = t["description"]
+            if t.get("input_schema"):
+                function_chunk["parameters"] = t["input_schema"]
+            openai_tools.append({"type": "function", "function": function_chunk})
         openai_req["tools"] = openai_tools
+
+    # tool_choice 映射
+    tool_choice = anthropic_body.get("tool_choice")
+    if tool_choice and isinstance(tool_choice, dict):
+        tc_type = tool_choice.get("type")
+        if tc_type == "auto":
+            openai_req["tool_choice"] = "auto"
+        elif tc_type == "none":
+            openai_req["tool_choice"] = "none"
+        elif tc_type == "any":
+            openai_req["tool_choice"] = "required"
+        elif tc_type == "tool" and tool_choice.get("name"):
+            openai_req["tool_choice"] = {
+                "type": "function", "function": {"name": tool_choice["name"]}
+            }
 
     return openai_req
 
