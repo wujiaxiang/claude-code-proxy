@@ -82,3 +82,4 @@ logs/
 # 本地 target 配置（端口/模型/上游定义，按约定不入库，真实凭据在 secrets.json）
 targets.json
 .env.bak
+targets.json.bak

@@ -5,7 +5,11 @@
 2. 流量统计信息：请求总数 / 成功率 / 运行时长 + 可视化（进度条）
 3. /api/targets 端点：返回所有 target 的 label/isFree/enabled 等
 
-运行前提：claude-code-proxy 服务运行中（8081 FastAPI 端口）。
+运行前提：claude-code-proxy 服务运行中。
+架构统一后端口分工：
+  - 8079：dashboard 页面 + 全部 /api/* 管理 API（本文件绝大多数测试的目标）
+  - 8081：仅 Anthropic 翻译（/v1/messages、count_tokens、/v1/models）
+  - 8082 等 target 端口：代理 /dashboard 与 /api/* 到 8079（代理可用性测试）
 用法: python test_dashboard.py
 """
 import http.client
@@ -15,7 +19,8 @@ import sys
 import uuid
 
 HOST = "127.0.0.1"
-PORT = 8082
+PORT = 8082          # target 端口（经代理访问 dashboard）
+DASHBOARD_PORT = 8079  # dashboard + 管理 API 独立端口
 
 
 def _get_dashboard():
@@ -74,7 +79,7 @@ def test_vendor_stats_breakdown():
 
 def test_api_targets_endpoint():
     """GET /api/targets 应返回所有 target 的 label 列表（含 8 个 label）。"""
-    conn = http.client.HTTPConnection("127.0.0.1", 8081, timeout=15)
+    conn = http.client.HTTPConnection("127.0.0.1", DASHBOARD_PORT, timeout=15)
     conn.request("GET", "/api/targets")
     resp = conn.getresponse()
     body = resp.read().decode("utf-8", errors="replace")
@@ -90,7 +95,7 @@ def test_api_targets_endpoint():
 
 
 def _aggregate_status():
-    conn = http.client.HTTPConnection("127.0.0.1", 8081, timeout=15)
+    conn = http.client.HTTPConnection("127.0.0.1", DASHBOARD_PORT, timeout=15)
     conn.request("GET", "/api/aggregate/status")
     resp = conn.getresponse()
     body = resp.read().decode("utf-8", errors="replace")
@@ -174,7 +179,7 @@ def test_paid_is_stable():
 
 
 def test_api_proxy_via_target_port():
-    """8082 等 target 端口应代理 /api/* 到 8081（dashboard 管理接口经任意端口可访问）。"""
+    """8082 等 target 端口应代理 /api/* 到 8079（dashboard 管理接口经任意端口可访问）。"""
     for port in (8082, 8090):
         conn = http.client.HTTPConnection("127.0.0.1", port, timeout=15)
         conn.request("GET", "/api/targets")
@@ -251,7 +256,7 @@ def test_no_model_delete_button():
 
 def test_model_edit_endpoint():
     """编辑态端点：返回全部模型 + 展示开关 + 无删除按钮 + 无保存按钮（保存走 modal 底部）。"""
-    conn = http.client.HTTPConnection("127.0.0.1", 8081, timeout=15)
+    conn = http.client.HTTPConnection("127.0.0.1", DASHBOARD_PORT, timeout=15)
     conn.request("GET", "/api/targets/openrouter/models?edit=1")
     resp = conn.getresponse()
     body = resp.read().decode("utf-8", errors="replace")
@@ -265,7 +270,7 @@ def test_model_edit_endpoint():
 
 def test_api_targets_crack_env():
     """crack target 的 /api/targets 应返回 crackEnv 环境检测信息。"""
-    conn = http.client.HTTPConnection("127.0.0.1", 8081, timeout=15)
+    conn = http.client.HTTPConnection("127.0.0.1", DASHBOARD_PORT, timeout=15)
     conn.request("GET", "/api/targets")
     resp = conn.getresponse()
     body = resp.read().decode("utf-8", errors="replace")
@@ -325,7 +330,7 @@ def test_8081_model_stats_recorded():
 def test_edit_modal_fetches_downstream_models():
     """编辑弹框应拉取下游真实模型列表（openrouter 336 个），并提供搜索框。"""
     for label, min_models in (("openrouter", 20), ("nvidia", 20), ("opencode-zen", 10)):
-        conn = http.client.HTTPConnection("127.0.0.1", 8081, timeout=30)
+        conn = http.client.HTTPConnection("127.0.0.1", DASHBOARD_PORT, timeout=30)
         conn.request("GET", f"/api/targets/{label}/models?edit=1")
         resp = conn.getresponse()
         body = resp.read().decode("utf-8", errors="replace")
@@ -341,7 +346,7 @@ def test_edit_modal_fetches_downstream_models():
 
 def test_edit_modal_fallback_no_key():
     """无 key 的下游（gemini-openai）拉取失败时应降级 targets.json 配置。"""
-    conn = http.client.HTTPConnection("127.0.0.1", 8081, timeout=30)
+    conn = http.client.HTTPConnection("127.0.0.1", DASHBOARD_PORT, timeout=30)
     conn.request("GET", "/api/targets/gemini/models?edit=1")
     resp = conn.getresponse()
     body = resp.read().decode("utf-8", errors="replace")
@@ -371,7 +376,7 @@ def test_base_url_shown():
 
 def test_model_master_toggle():
     """编辑弹框应有总开关（全开/全关/部分开 indeterminate）。"""
-    conn = http.client.HTTPConnection("127.0.0.1", 8081, timeout=30)
+    conn = http.client.HTTPConnection("127.0.0.1", DASHBOARD_PORT, timeout=30)
     conn.request("GET", "/api/targets/codebuddy/models?edit=1")
     resp = conn.getresponse()
     body = resp.read().decode("utf-8", errors="replace")
@@ -437,7 +442,7 @@ def test_dashboard_dangling_banner():
     assert 'id="dangling-bar"' in body, "dashboard 应包含 dangling-bar 容器 div"
 
     # 验证 API 端点返回空项（当前配置无悬空引用）
-    conn = http.client.HTTPConnection("127.0.0.1", 8081, timeout=15)
+    conn = http.client.HTTPConnection("127.0.0.1", DASHBOARD_PORT, timeout=15)
     conn.request("GET", "/api/config/dangling")
     resp = conn.getresponse()
     data = json.loads(resp.read().decode("utf-8", errors="replace"))
@@ -455,7 +460,7 @@ def test_dashboard_models_endpoint_shape():
     还是包含 .model-table 和 model 行的标准结构。
     """
     # copilot-enterprise（8082，handler=copilot）支持上游模型拉取
-    conn = http.client.HTTPConnection("127.0.0.1", 8081, timeout=30)
+    conn = http.client.HTTPConnection("127.0.0.1", DASHBOARD_PORT, timeout=30)
     conn.request("GET", "/api/targets/copilot-enterprise/models")
     resp = conn.getresponse()
     body = resp.read().decode("utf-8", errors="replace")
@@ -471,7 +476,7 @@ def test_dashboard_models_endpoint_shape():
 #   r.breakers[port].{state, reason, tripped_at}
 #   r.virtual_models[vmId][memberKey].error_types  (dict[str,int])
 # 这些字段全部来自 AggregatorEngine.get_stats()，直接构造引擎断言即可，
-# 不依赖 FastAPI / 真实服务（本文件其余测试才需要 8081/8082 在跑）。
+# 不依赖 FastAPI / 真实服务（本文件其余测试才需要 8079/8082 在跑）。
 import random  # noqa: E402
 from pathlib import Path  # noqa: E402
 
@@ -579,10 +584,10 @@ def test_aggregate_status_no_breakers_empty_state():
 def test_api_aggregate_status_returns_tripped_at():
     """接口层：/api/aggregate/status 响应结构含高危事件区所需字段。
 
-    需要 8081 在跑（与本文件其余测试同前提）。聚合网关未配置时（configured=False）
+    需要 8079 在跑（与本文件其余测试同前提）。聚合网关未配置时（configured=False）
     仅断言该显式契约，不误报失败。
     """
-    conn = http.client.HTTPConnection("127.0.0.1", 8081, timeout=15)
+    conn = http.client.HTTPConnection("127.0.0.1", DASHBOARD_PORT, timeout=15)
     conn.request("GET", "/api/aggregate/status")
     resp = conn.getresponse()
     body = resp.read().decode("utf-8", errors="replace")
@@ -611,7 +616,7 @@ def test_api_aggregate_status_returns_tripped_at():
 
 def test_config_export_complete():
     """全量配置导出：单 JSON 含 targets（含 server 段）/secrets 两段，覆盖全部 11 个 target。"""
-    conn = http.client.HTTPConnection("127.0.0.1", 8081, timeout=15)
+    conn = http.client.HTTPConnection("127.0.0.1", DASHBOARD_PORT, timeout=15)
     conn.request("GET", "/api/config/export")
     resp = conn.getresponse()
     body = resp.read().decode("utf-8", errors="replace")
@@ -635,7 +640,7 @@ def test_config_export_complete():
 
 def test_config_export_contains_secrets_values():
     """导出必须含真实凭据值（迁移诉求：导入后即可用），不能是打码/空。"""
-    conn = http.client.HTTPConnection("127.0.0.1", 8081, timeout=15)
+    conn = http.client.HTTPConnection("127.0.0.1", DASHBOARD_PORT, timeout=15)
     conn.request("GET", "/api/config/export")
     resp = conn.getresponse()
     body = resp.read().decode("utf-8", errors="replace")
@@ -653,7 +658,7 @@ def test_config_export_contains_secrets_values():
 
 def test_config_import_roundtrip():
     """导入往返：导出 → 改 targets 一个字段 → 导入 → 验证文件与热重载生效 → 还原。"""
-    conn = http.client.HTTPConnection("127.0.0.1", 8081, timeout=15)
+    conn = http.client.HTTPConnection("127.0.0.1", DASHBOARD_PORT, timeout=15)
     conn.request("GET", "/api/config/export")
     resp = conn.getresponse()
     data = json.loads(resp.read().decode("utf-8"))
@@ -676,7 +681,7 @@ def test_config_import_roundtrip():
         first["enabled"] = not orig_enabled
 
         payload = json.dumps(data).encode("utf-8")
-        conn = http.client.HTTPConnection("127.0.0.1", 8081, timeout=15)
+        conn = http.client.HTTPConnection("127.0.0.1", DASHBOARD_PORT, timeout=15)
         conn.request("POST", "/api/config/import", body=payload,
                      headers={"Content-Type": "application/json"})
         resp = conn.getresponse()
@@ -690,7 +695,7 @@ def test_config_import_roundtrip():
         assert "envWritten" not in result, "v2 导入响应不应再有 envWritten 字段"
 
         # 验证热重载生效：/api/targets 返回的 enabled 已翻转
-        conn = http.client.HTTPConnection("127.0.0.1", 8081, timeout=15)
+        conn = http.client.HTTPConnection("127.0.0.1", DASHBOARD_PORT, timeout=15)
         conn.request("GET", "/api/targets")
         resp = conn.getresponse()
         targets = json.loads(resp.read().decode("utf-8"))
@@ -706,7 +711,7 @@ def test_config_import_roundtrip():
     finally:
         # 还原：恢复被翻转的 enabled 字段，再导入原样数据（保证测试幂等，不污染真实配置）
         first["enabled"] = orig_enabled
-        conn = http.client.HTTPConnection("127.0.0.1", 8081, timeout=15)
+        conn = http.client.HTTPConnection("127.0.0.1", DASHBOARD_PORT, timeout=15)
         conn.request("POST", "/api/config/import", body=json.dumps(data).encode("utf-8"),
                      headers={"Content-Type": "application/json"})
         resp = conn.getresponse()
@@ -726,7 +731,7 @@ def test_config_import_rejects_bad_version():
         "secrets": {},
         "env": {},
     }).encode("utf-8")
-    conn = http.client.HTTPConnection("127.0.0.1", 8081, timeout=15)
+    conn = http.client.HTTPConnection("127.0.0.1", DASHBOARD_PORT, timeout=15)
     conn.request("POST", "/api/config/import", body=payload,
                  headers={"Content-Type": "application/json"})
     resp = conn.getresponse()
@@ -750,7 +755,7 @@ def test_config_import_rejects_invalid_targets():
         "secrets": {},
         "env": {},
     }).encode("utf-8")
-    conn = http.client.HTTPConnection("127.0.0.1", 8081, timeout=15)
+    conn = http.client.HTTPConnection("127.0.0.1", DASHBOARD_PORT, timeout=15)
     conn.request("POST", "/api/config/import", body=payload,
                  headers={"Content-Type": "application/json"})
     resp = conn.getresponse()
@@ -759,6 +764,45 @@ def test_config_import_rejects_invalid_targets():
     assert resp.status == 422, f"非法 targets 应 422，实际 {resp.status}"
     after = targets_path.read_text(encoding="utf-8") if targets_path.exists() else None
     assert before == after, "校验失败时不应改动 targets.json"
+
+
+# ─── 端口拆分契约：dashboard + 管理 API 在 8079，8081 只剩翻译 ───
+# server.dashboardPort=8079 承载 /dashboard + /api/*；
+# 8081 只剩 Anthropic 翻译（/v1/messages + count_tokens + /v1/models）。
+
+def _get(port, path, timeout=15):
+    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=timeout)
+    conn.request("GET", path)
+    resp = conn.getresponse()
+    body = resp.read().decode("utf-8", errors="replace")
+    conn.close()
+    return resp.status, body
+
+
+def test_dashboard_on_8079():
+    """dashboard 应搬到独立端口 8079（当前 8079 无服务 → 连接拒绝 = RED）。"""
+    status, body = _get(DASHBOARD_PORT, "/dashboard")
+    assert status == 200, f"8079 /dashboard HTTP {status}"
+    assert "card-toggle" in body, "8079 dashboard 应含卡片头 (card-toggle)"
+    assert "model-table" in body, "8079 dashboard 应含模型表 (model-table)"
+    assert "聚合网关" in body, "8079 dashboard 应含分类栏"
+
+
+def test_dashboard_api_on_8079():
+    """管理 API 应随 dashboard 搬到 8079（当前连接拒绝 = RED）。"""
+    status, body = _get(DASHBOARD_PORT, "/api/targets")
+    assert status == 200, f"8079 /api/targets HTTP {status}"
+    data = json.loads(body)
+    targets = data.get("targets", [])
+    assert isinstance(targets, list) and targets, "8079 /api/targets 应返回非空 targets 数组"
+    labels = {t.get("label", "") for t in targets}
+    assert "copilot" in labels, f"8079 /api/targets 缺少 copilot，实际 {sorted(labels)}"
+
+
+def test_dashboard_not_on_8081():
+    """拆分后 8081 只留 Anthropic 翻译，/dashboard 应 404（当前返回 200 = RED）。"""
+    status, _ = _get(8081, "/dashboard")
+    assert status == 404, f"8081 /dashboard 应 404（已拆到 {DASHBOARD_PORT}），实际 {status}"
 
 
 def main():
