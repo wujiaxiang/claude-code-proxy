@@ -295,7 +295,7 @@ $env:Path = "C:\Program Files\QClaw\v0.2.33.617\resources\git\cmd;C:\Windows\Sys
 **网关级陷阱（详见各网关文档）**：
 
 - **qclaw**（升级路径/模型注册/body 清理/注入循环/usage 过滤）→ [docs/qclaw.md](docs/qclaw.md) §8 已知陷阱
-- **codebuddy**（仅流式 11101/refreshToken 轮换）→ [docs/codebuddy.md](docs/codebuddy.md) §6 已知陷阱
+- **codebuddy**（仅流式 11101/refreshToken 轮换/**system 必须放顶层 `system` 字段**——messages[0] 的 role:"system" 会触发上游 content_filter）→ [docs/codebuddy.md](docs/codebuddy.md) §6 已知陷阱
 - **trae-work**（模型列表同步/传图白名单）→ [docs/trae-work.md](docs/trae-work.md) §5.3
 
 ---

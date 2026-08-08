@@ -87,6 +87,9 @@
 - **可粘贴 base_url**：卡片详情显示局域网 IP + 端口 + 后缀（crack/gemini 统一 /v1，free/paid 透传 routePrefix）
 - **Windows 启动脚本子目录化**：scripts/windows/（VBS/BAT/PS1 内部动态定位项目根，不再硬编码路径）
 
+### Fixed
+- **codebuddy system 消息位置敏感触发 content_filter（2026-08-08，cd09d52）**：腾讯上游对 **`messages[0]` 里 role:"system" 消息**做结构检查 100% 触发 content_filter（HTTP 200 空 SSE + `finish_reason=content_filter`），**同一段 system 内容放顶层 `system` 字段则不触发**——与内容无关，是位置敏感。现象：走 8081 的 sonnet（hy3:agg → 8084）100% 失败零输出，同会话 opus/haiku 走其他池（qclaw/openrouter）正常。排除链（二分+反证法）：非偶发、非长对话、非单一关键词、非聚合网关——决定性对照是直连 8084 时 `messages[0]` vs 顶层字段两种放法。修复：`anthropic_convert.py` 的 `convert_anthropic_request_to_openai` 把 system 移出 messages[]，非空时写顶层 `system` 字段。验证：用户完整请求（29 条历史 + 完整 Claude Code system prompt）经 8081 全链路 content_filter=0、完整响应。文档：docs/codebuddy.md §6.3（含排除链表与同类风险检查）、AGENTS.md 网关级陷阱同步
+
 ### Changed
 - 8082 从 PREFERRED_PROVIDER 动态切换改为固定 copilot
 - qclaw 配置从 .env 迁入 targets.json 的 8085 条目

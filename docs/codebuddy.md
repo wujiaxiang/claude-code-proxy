@@ -290,6 +290,42 @@ EOF
 - **安全边界**：只替换 OMO 框架自身注入的**身份短语**，不动客户端内容/工具字段；替换目标是等义的中性描述（不伪造身份、不编码混淆、不删除安全字段）。若未来腾讯扩展黑名单拦其他角色（如 Atlas），只需在元组追加一行，无需改逻辑。
 - **历史路径**：曾实现 content_filter 识别转 422 明确错误（38d6087），因 opencode fallback 只认网络类错误而无效，已回退（110d370）恢复静默透传；随后以热重写（b1cdd25 子代理 → ff49601 主代理 + 列表驱动）作为最终方案。
 
+### 6.3 system 消息位置敏感（messages[0] 的 role:"system" → content_filter；顶层 system 字段 → 正常）
+
+> **背景**：2026-08-08 实测发现，腾讯 codebuddy 上游对**消息结构位置**敏感——**system 放在 `messages[0]`（role:"system" 消息）100% 触发 content_filter**（HTTP 200 空 SSE + `finish_reason=content_filter`），**同一段 system 内容放顶层 `system` 字段则不触发**。与 §6.2 的"精确短语内容拦截"是**两种独立机制**（内容黑名单 vs 结构/位置敏感）。修复在 8081 翻译层（`anthropic_convert.py`），经 8081→8080→8084 完整链路验证。
+
+#### 现象（用户侧）
+
+- 走 8081 的 sonnet（映射 hy3:agg → codebuddy 8084）**100% content_filter**、零输出
+- 同会话 opus/haiku 走**其他聚合池**（qclaw / openrouter）**正常**——池成员不同，暴露的是 codebuddy 特有行为
+- 直连 8084 发**同样的多轮对话**也 content_filter → 排除聚合网关 / 路由 / 翻译转发环节
+
+#### 根因定位（二分 + 反证法排除链）
+
+| 实验 | 结果 | 排除 |
+|---|---|---|
+| 直连 8084 + 简单 "hi" | ✅ 正常 | 非偶发 / 限流 |
+| 直连 8084 + 用户完整 29 条对话历史 | ❌ content_filter | 非聚合网关问题 |
+| 直连 8084 + 同长度正常对话（天气） | ✅ 正常 | 非"长对话"本身 |
+| 直连 8084 + 单独技术词（security/proxy/token 等） | ✅ 正常 | 非单一关键词 |
+| 直连 8084 + 完整 system + "hi"（system 在 messages[0]） | ❌ content_filter | **锁定为位置而非内容** |
+| 直连 8084 + 同一 system 放顶层 `system` 字段 | ✅ 正常 | **决定性对照** |
+
+**结论**：触发变量是 **system 的存放位置**——腾讯对 `messages[0]` 里 role:"system" 消息做结构检查，与内容无关（同一段 system 放顶层字段即通过）。
+
+#### 解决方案
+
+- **代码位置**：`anthropic_convert.py` → `convert_anthropic_request_to_openai`（commit `cd09d52`）
+- **改动**：system prompt（字符串或多文本块）不再 append 进 `messages[]`，改存 `system_out`，非空时写入 **OpenAI 请求顶层 `system` 字段**；`messages[]` 第一条从 role:"user" 开始
+- **验证**：用户完整请求（29 条历史 + 完整 Claude Code system prompt）经 8081 完整链路 → `content_filter=0`、完整 258 段 text_delta（此前 filter=1、空响应）；codebuddy.log 入站 body 显示 `"system": "x-context-header..."` 在顶层
+- **历史路径**：曾误判为"对话内容触发审查"（反证后被推翻），靠 messages[0] vs 顶层字段的**结构对照实验**锁定根因——排查 content_filter 时先做结构对照再怀疑内容
+
+#### 同类风险检查（写码必读）
+
+- `server.py` `_handle_target_request` 的 `cleanQclawBody` 分支会给 QClaw 注入 `messages[0] role:"system"`——**仅 QClaw 路径**，QClaw 上游无此问题，**不要**为统一而删改
+- 客户端（opencode 等）**直连 8084** 时若自己把 system 放 `messages[0]`，同样会触发——透传链路不改体，无法拦截；已知规避：走 8081（翻译层已把 system 提顶）
+- 未来新增 codebuddy 相关 body 构造逻辑时，**一律把 system 放顶层字段**，勿回退到 messages[0]
+
 ---
 
 ## 6. 已知陷阱
@@ -311,5 +347,6 @@ EOF
 | `crack_common.py` | `CREDENTIAL_SCHEMAS["codebuddy"]`（凭据 schema）+ 注册表 |
 | `crack_daily.py` | `daily_codebuddy`：成长任务领取 + token 剩 <30 天刷新（refreshToken 轮换回写） |
 | `server.py` | 11101 检测 + `_aggregate_codebuddy_stream` 非流式聚合；codebuddy 走纯 passthrough，**不**清理/注入 reasoning 字段（若未来加 codebuddy 特判须遵循 §6 的 opt-in 规则） |
+| `anthropic_convert.py` | 8081 翻译层：system prompt 移**顶层 `system` 字段**（规避 messages[0] role:"system" 触发的 content_filter，§6.3） |
 | `config_store.py` | `VALID_HANDLERS` 含 `passthrough` |
 | `targets.json` | codebuddy target 定义（8084、`copilot.tencent.com`、`routePrefix=/v2`、secretRef） |
