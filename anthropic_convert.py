@@ -34,19 +34,22 @@ def convert_anthropic_request_to_openai(anthropic_body: dict) -> dict:
     tool 消息在前、user 消息在后。assistant 的 tool_use → 顶层 tool_calls。
     """
     messages = []
+    system_out = ""
 
-    # system prompt（多文本块合并成纯字符串）
+    # system prompt（多文本块合并成纯字符串；放顶层 system 字段而非 messages[0]——
+    # 实测腾讯 codebuddy 上游对 messages[0] 的 role:"system" 消息敏感触发 content_filter，
+    # 顶层 system 字段不触发。2026-08-08）
     system = anthropic_body.get("system")
     if system:
         if isinstance(system, str):
-            messages.append({"role": "system", "content": system})
+            system_out = system
         elif isinstance(system, list):
             text_parts = []
             for block in system:
                 if isinstance(block, dict) and block.get("type") == "text":
                     text_parts.append(block.get("text", ""))
             if text_parts:
-                messages.append({"role": "system", "content": "\n\n".join(text_parts)})
+                system_out = "\n\n".join(text_parts)
 
     # conversation messages（bucket 架构：tool 消息独立，user 内容合并）
     for msg in anthropic_body.get("messages", []):
@@ -131,6 +134,8 @@ def convert_anthropic_request_to_openai(anthropic_body: dict) -> dict:
         "messages": messages,
         "max_completion_tokens": anthropic_body.get("max_tokens", 4096),
     }
+    if system_out:
+        openai_req["system"] = system_out
 
     # optional fields
     if anthropic_body.get("temperature") is not None:
