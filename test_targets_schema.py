@@ -39,7 +39,7 @@ def test_migrate_old_array_format():
 
 
 def test_load_new_object_format():
-    """新格式（顶层对象）原样加载。"""
+    """新格式（顶层对象）加载：顶层 models/modelDefaults 迁移进 anthropic target（T3 架构统一）。"""
     new = {"modelDefaults": {"defaultPort": 8085}, "targets": [
         {"label": "qclaw", "listenPort": 8085, "category": "crack", "handler": "qclaw",
          "targetHost": "mmgrcalltoken.3g.qq.com", "targetPort": 443, "targetProtocol": "https",
@@ -51,9 +51,14 @@ def test_load_new_object_format():
         p = Path(f.name)
     try:
         cfg = config_store.load_targets(p)
-        assert cfg["modelDefaults"]["defaultPort"] == 8085
         assert cfg["targets"][0]["label"] == "qclaw"
-        assert len(cfg["models"]) == 1 and cfg["models"][0]["name"] == "sonnet"
+        # T3: 顶层 models/modelDefaults 迁移进 anthropic target，顶层置空
+        assert cfg["models"] == [], f"顶层 models 应已迁移置空，实际: {cfg['models']}"
+        anth = config_store._get_anthropic_target(cfg)
+        assert anth is not None, "应自动创建 anthropic target"
+        assert anth["modelDefaults"]["defaultPort"] == 8085, f"嵌套 modelDefaults 应保留原值: {anth.get('modelDefaults')}"
+        assert len(anth["models"]) == 1 and anth["models"][0]["name"] == "sonnet", \
+            f"嵌套 models 应含原顶层 models: {anth.get('models')}"
     finally:
         p.unlink(missing_ok=True)
 
@@ -265,9 +270,9 @@ def _load_cfg_with(raw: dict) -> dict:
         p.unlink(missing_ok=True)
 
 
-#   精简后 server 段只有三个顶层键（8081 legacy 清理）。旧键 preferredProvider /
-#   legacyModels / copilot / qclaw 已从 DEFAULT_SERVER_CONFIG 移除。
-SLIM_SERVER_KEYS = {"listenPort", "log", "cache"}
+#   精简后 server 段键（8081 legacy 清理 + T3 dashboardPort 加入）。
+#   旧键 preferredProvider / legacyModels / copilot / qclaw 已从 DEFAULT_SERVER_CONFIG 移除。
+SLIM_SERVER_KEYS = {"listenPort", "dashboardPort", "log", "cache"}
 REMOVED_SERVER_KEYS = ("preferredProvider", "legacyModels", "copilot", "qclaw")
 
 
@@ -291,8 +296,9 @@ def test_server_section_defaults_when_absent():
     srv = cfg["server"]
     assert set(srv) == set(config_store.DEFAULT_SERVER_CONFIG), \
         f"server 顶层键应与 DEFAULT_SERVER_CONFIG 一致，实际 {sorted(srv)}"
-    assert len(srv) == 3, f"server 应有 3 个顶层键，实际 {len(srv)}: {sorted(srv)}"
+    assert len(srv) == len(SLIM_SERVER_KEYS), f"server 应有 {len(SLIM_SERVER_KEYS)} 个顶层键，实际 {len(srv)}: {sorted(srv)}"
     assert srv["listenPort"] == 8081, srv["listenPort"]
+    assert srv["dashboardPort"] == 8079, srv["dashboardPort"]
     assert srv["log"]["file"] == "", repr(srv["log"]["file"])
     assert srv["log"]["debug"] is False, srv["log"]["debug"]
     assert srv["cache"]["enabled"] is True and srv["cache"]["maxSize"] == 500, srv["cache"]
@@ -708,6 +714,85 @@ def test_deepseek_path_rewrite():
     assert got_models == "/models", \
         f"deepseek /v1/models 应重写为 /models，实际: {got_models!r}"
     print("PASS test_deepseek_path_rewrite: deepseek path rewrite correct")
+
+
+# ─── T3: 8081 作为 targets[] 条目（handler="anthropic" + 嵌套 models/modelDefaults）───
+#   架构统一：顶层 modelDefaults/models 重构进 targets[] 的 8081 target 对象。
+#   config_store 当前不认 handler="anthropic"（不在 VALID_HANDLERS、不豁免 targetHost、
+#   _resolve_model_alias 只读顶层 models）→ 以下前两个测试 RED。
+def test_anthropic_target_no_target_host():
+    """handler="anthropic" 的 8081 target 无 targetHost 应校验通过（类似 aggregator 豁免）。
+
+    RED 依据：_REQUIRED_FIELDS 含 targetHost，仅 handler == "aggregator" 被 continue 跳过；
+    且 VALID_HANDLERS 不含 "anthropic"。故当前会报
+    targets[0].targetHost 缺少必需字段 + targets[0].handler 非法 → 断言 == [] 失败。
+    """
+    cfg = {"targets": [
+        {"label": "anthropic-compatible", "listenPort": 8081, "category": "free",
+         "handler": "anthropic", "enabled": True},
+    ]}
+    errors = validate_targets(cfg)
+    assert errors == [], f"anthropic target 无 targetHost 应通过校验，实际报错: {errors}"
+    print("PASS test_anthropic_target_no_target_host: anthropic target exempt from targetHost")
+
+
+def test_anthropic_target_nested_models():
+    """8081 target 内嵌 models[] + modelDefaults 应校验通过，且能被别名解析命中。
+
+    RED 依据：① handler="anthropic" 当前非法且缺 targetHost（同上）；
+    ② _resolve_model_alias 只认顶层 models（dict 时取 models["models"]），
+    传入完整 cfg 时看不到 targets[0]["models"] 里的嵌套映射 → 返回 None。
+    """
+    nested_models = [
+        {"name": "sonnet", "aliases": ["claude-sonnet"],
+         "target": {"port": 8082, "model": "claude-sonnet-5"}},
+        {"name": "haiku", "aliases": [],
+         "target": {"port": 8084, "model": "claude-haiku-4.5"}},
+        {"name": "opus", "aliases": [],
+         "target": {"port": 8080, "model": "agg:opus"}},
+    ]
+    cfg = {"targets": [
+        {"label": "anthropic-compatible", "listenPort": 8081, "category": "free",
+         "handler": "anthropic", "enabled": True,
+         "modelDefaults": {"defaultPort": 8082},
+         "models": nested_models},
+    ]}
+    errors = validate_targets(cfg)
+    assert errors == [], f"带嵌套 models 的 anthropic target 应通过校验，实际报错: {errors}"
+    hit_name = config_store._resolve_model_alias(cfg, "sonnet")
+    assert hit_name == {"port": 8082, "model": "claude-sonnet-5"}, \
+        f"应从 8081 target 的嵌套 models 命中 name=sonnet，实际: {hit_name}"
+    hit_alias = config_store._resolve_model_alias(cfg, "claude-sonnet")
+    assert hit_alias == {"port": 8082, "model": "claude-sonnet-5"}, \
+        f"应从嵌套 models 命中 alias=claude-sonnet，实际: {hit_alias}"
+    hit_opus = config_store._resolve_model_alias(cfg, "opus")
+    assert hit_opus == {"port": 8080, "model": "agg:opus"}, \
+        f"应从嵌套 models 命中 name=opus，实际: {hit_opus}"
+    assert config_store._resolve_model_alias(cfg, "nope-xyz") is None, "未命中应为 None"
+    print("PASS test_anthropic_target_nested_models: nested models resolved from 8081 target")
+
+
+def test_legacy_top_level_models_still_valid():
+    """回归锁定：旧格式（顶层 modelDefaults/models）仍能通过校验并被别名解析命中。
+
+    重构引入嵌套结构后此测试必须保持 GREEN（自动迁移/向后兼容不得破坏旧格式）。
+    """
+    cfg = {"targets": [
+        {"label": "copilot", "listenPort": 8082, "category": "crack", "handler": "copilot",
+         "targetHost": "api.githubcopilot.com", "crackTool": "crack_copilot.py", "models": []},
+    ], "modelDefaults": {"defaultPort": 8082},
+       "models": [
+        {"name": "sonnet", "aliases": ["claude-sonnet"],
+         "target": {"port": 8082, "model": "claude-sonnet-5"}},
+        {"name": "haiku", "aliases": [], "target": {"port": 8084, "model": "claude-haiku-4.5"}},
+    ]}
+    errors = validate_targets(cfg)
+    assert errors == [], f"旧顶层格式应继续通过校验，实际报错: {errors}"
+    assert config_store._resolve_model_alias(cfg, "sonnet") == {"port": 8082, "model": "claude-sonnet-5"}, \
+        "顶层 models 的 name 解析应保持可用"
+    assert config_store._resolve_model_alias(cfg, "claude-sonnet") == {"port": 8082, "model": "claude-sonnet-5"}, \
+        "顶层 models 的 alias 解析应保持可用"
+    print("PASS test_legacy_top_level_models_still_valid: legacy top-level models still work")
 
 
 if __name__ == "__main__":

@@ -16,7 +16,7 @@ TARGETS_PATH = Path(__file__).parent / "targets.json"
 SECRETS_PATH = Path(__file__).parent / "secrets.json"
 
 VALID_CATEGORIES = ("crack", "free", "paid", "aggregate")
-VALID_HANDLERS = ("passthrough", "copilot", "qclaw", "gemini-native", "trae-work", "aggregator", "deepseek")
+VALID_HANDLERS = ("passthrough", "copilot", "qclaw", "gemini-native", "trae-work", "aggregator", "deepseek", "anthropic")
 
 _REQUIRED_FIELDS = ("label", "listenPort", "category", "handler", "targetHost")
 
@@ -26,6 +26,7 @@ _REQUIRED_FIELDS = ("label", "listenPort", "category", "handler", "targetHost")
 # 只剩 listenPort/log/cache 三个运行时键。
 DEFAULT_SERVER_CONFIG = {
     "listenPort": 8081,               # 原 ANTHROPIC_PORT env
+    "dashboardPort": 8079,            # dashboard 独立端口（与 8081 入口分离，架构统一）
     "log": {                          # 原 DEBUG/LOG_FILE/LOG_RETENTION_DAYS/LOG_ROTATE_WHEN/LOG_ROTATE_INTERVAL
         "debug": False,
         "file": "",
@@ -122,7 +123,49 @@ def load_targets(path: Path = TARGETS_PATH) -> dict:
         "server": _merge_server_config(user_server) if isinstance(user_server, dict)
                   else _merge_server_config({}),
     }
+    # T3 架构统一：顶层 modelDefaults/models 迁移进 anthropic target（内存，不写盘）
+    _migrate_top_level_models_to_anthropic(result)
     return result
+
+
+def _migrate_top_level_models_to_anthropic(cfg: dict) -> None:
+    """把顶层 modelDefaults/models 迁移进 targets[] 的 anthropic target（原地修改，内存不写盘）。
+
+    迁移条件：顶层 modelDefaults 或 models 非空，且 targets[] 中尚无 handler=="anthropic" 的 target。
+    幂等：已有 anthropic target 则跳过（不覆盖其嵌套字段，不删顶层键）。
+
+    迁移后：创建 anthropic target（label="anthropic", listenPort=ANTHROPIC_PORT,
+    handler="anthropic", category="free", models=顶层models, modelDefaults=顶层modelDefaults），
+    并从 cfg 顶层移除 models 键（modelDefaults 保留顶层兼容旧读取路径，置空 dict）。
+    下次 save_targets 时自然落盘。
+    """
+    top_models = cfg.get("models")
+    top_md = cfg.get("modelDefaults")
+    has_top_models = isinstance(top_models, list) and len(top_models) > 0
+    has_top_md = isinstance(top_md, dict) and bool(top_md)
+    if not (has_top_models or has_top_md):
+        return  # 顶层无旧格式数据，无需迁移
+    if _get_anthropic_target(cfg) is not None:
+        return  # 已有 anthropic target，幂等跳过
+
+    anth_target: dict = {
+        "label": "anthropic",
+        "listenPort": ANTHROPIC_PORT,
+        "category": "free",
+        "handler": "anthropic",
+        "enabled": True,
+    }
+    if has_top_models:
+        anth_target["models"] = top_models
+    if has_top_md:
+        anth_target["modelDefaults"] = top_md
+    cfg.setdefault("targets", []).append(anth_target)
+    # 移除顶层旧键（已迁入嵌套）；modelDefaults 保留空 dict 维持结构兼容
+    if has_top_models:
+        cfg["models"] = []
+    if has_top_md:
+        cfg["modelDefaults"] = {}
+    logger.info("load_targets: 顶层 modelDefaults/models 已迁移进 anthropic target（内存，下次 save 落盘）")
 
 
 def _err(errors: list, path: str, msg: str) -> None:
@@ -147,8 +190,10 @@ def validate_targets(cfg: dict) -> list:
         disabled = t.get("enabled") is False
         if not disabled:
             for field in _REQUIRED_FIELDS:
-                if field == "targetHost" and t.get("handler") == "aggregator":
-                    continue  # 聚合 target 无真实上游 host，仅由 virtualModels 池定义
+                # aggregator 与 anthropic 均无真实上游 host：
+                # aggregator 仅由 virtualModels 池定义；anthropic 是 8081 翻译入口自身
+                if field == "targetHost" and t.get("handler") in ("aggregator", "anthropic"):
+                    continue
                 if not t.get(field):
                     _err(errors, f"{base}.{field}", f"{base} 缺少必需字段: {field}")
             if t.get("category") not in VALID_CATEGORIES:
@@ -170,7 +215,7 @@ def validate_targets(cfg: dict) -> list:
                  f"端口 {port} 被多个 target 占用 ({ports[port]}, {label})")
         ports[port] = label
 
-    # modelDefaults.defaultPort 校验
+    # modelDefaults.defaultPort 校验（顶层旧格式）
     model_defaults = cfg.get("modelDefaults", {})
     default_port = model_defaults.get("defaultPort")
     if default_port is not None:
@@ -178,8 +223,30 @@ def validate_targets(cfg: dict) -> list:
             _err(errors, "modelDefaults.defaultPort",
                  "modelDefaults.defaultPort must be a non-negative integer")
 
-    # models 结构校验与全局唯一性
-    _validate_models(cfg.get("models", []), errors)
+    # models 结构校验与全局唯一性（顶层旧格式）
+    # 顶层与 anthropic target 的嵌套 models 共享同一个 seen set，
+    # 避免迁移期间两处出现同名模型时漏报重复。
+    global_seen: set = set()
+    _validate_models(cfg.get("models", []), errors, seen=global_seen)
+
+    # anthropic target 的嵌套 models / modelDefaults 校验（T3 架构统一）
+    for i, t in enumerate(targets):
+        if t.get("handler") != "anthropic":
+            continue
+        base = f"targets[{i}]"
+        # 嵌套 modelDefaults.defaultPort
+        nested_md = t.get("modelDefaults")
+        if nested_md is not None:
+            if not isinstance(nested_md, dict):
+                _err(errors, f"{base}.modelDefaults", f"{base}.modelDefaults must be an object")
+            else:
+                ndp = nested_md.get("defaultPort")
+                if ndp is not None and (isinstance(ndp, bool) or not isinstance(ndp, int) or ndp < 0):
+                    _err(errors, f"{base}.modelDefaults.defaultPort",
+                         f"{base}.modelDefaults.defaultPort must be a non-negative integer")
+        # 嵌套 models（复用 _validate_models，共享 global_seen）
+        if "models" in t:
+            _validate_models(t.get("models", []), errors, path_prefix=base, seen=global_seen)
 
     # server 段校验（缺失/空 dict 不报错，默认值兜底）
     _validate_server_config(cfg.get("server"), errors)
@@ -200,6 +267,10 @@ def _validate_server_config(server, errors: list) -> None:
     port = server.get("listenPort")
     if port is not None and (isinstance(port, bool) or not isinstance(port, int) or port < 0):
         _err(errors, "server.listenPort", "server.listenPort must be a non-negative integer")
+
+    dport = server.get("dashboardPort")
+    if dport is not None and (isinstance(dport, bool) or not isinstance(dport, int) or dport < 0):
+        _err(errors, "server.dashboardPort", "server.dashboardPort must be a non-negative integer")
 
     log = server.get("log")
     if log is not None:
@@ -239,15 +310,24 @@ def _validate_server_config(server, errors: list) -> None:
                          f"server.cache.{k} must be a non-negative integer")
 
 
-def _validate_models(models: list, errors: list) -> None:
-    """校验 models 结构和全局 name/alias 唯一性（追加结构化 {path,msg}）。"""
+def _validate_models(models: list, errors: list, path_prefix: str = "",
+                     seen: Optional[set] = None) -> None:
+    """校验 models 结构和全局 name/alias 唯一性（追加结构化 {path,msg}）。
+
+    path_prefix 非空时用于嵌套 models（如 anthropic target 的 targets[i].models），
+    此时 path 前缀为 f"{path_prefix}.models[j]"；默认空 → 顶层 "models[j]"。
+    seen 可传入共享 set 做跨命名空间唯一性检查（默认 None → 新建局部 set）。
+    """
     if not isinstance(models, list):
-        _err(errors, "models", "models must be a list")
+        base_key = f"{path_prefix}.models" if path_prefix else "models"
+        _err(errors, base_key, f"{base_key} must be a list")
         return
 
-    seen = set()
+    if seen is None:
+        seen = set()
+    base_list = f"{path_prefix}.models" if path_prefix else "models"
     for i, m in enumerate(models):
-        base = f"models[{i}]"
+        base = f"{base_list}[{i}]"
         if not isinstance(m, dict):
             _err(errors, base, f"{base} must be a dict")
             continue
@@ -291,18 +371,63 @@ def _validate_models(models: list, errors: list) -> None:
                 _err(errors, f"{base}.target.model", f"{base}.target.model must be a non-empty string")
 
 
+def _get_anthropic_target(targets_or_cfg) -> Optional[dict]:
+    """从配置中找到 handler=="anthropic" 的 target（8081 翻译入口）。
+
+    接受两种输入：
+      - 完整 cfg dict（含 "targets" 键）→ 从 cfg["targets"] 中查找
+      - targets list → 直接遍历查找
+
+    返回该 target dict（浅引用，调用方可读取嵌套 models/modelDefaults），
+    未找到返回 None。幂等：多个 anthropic target 时返回第一个。
+    """
+    if isinstance(targets_or_cfg, dict):
+        targets = targets_or_cfg.get("targets", [])
+    elif isinstance(targets_or_cfg, list):
+        targets = targets_or_cfg
+    else:
+        return None
+    for t in targets:
+        if isinstance(t, dict) and t.get("handler") == "anthropic":
+            return t
+    return None
+
+
 def _resolve_model_alias(models, requested_model: str) -> Optional[dict]:
     """
     统一别名解析纯函数：遍历 models 列表，若 requested_model == m["name"]
     或 requested_model in m["aliases"]，返回 m["target"]（{"port": int, "model": str}）。
-    均未命中返回 None。models 参数允许传 list 或 dict（dict 时取 models["models"]，缺 key 视为空列表）。
+    均未命中返回 None。
+
+    models 参数支持三种输入（优先级从前到后）：
+      1. 完整 cfg dict（含 "targets" 键）→ 优先从 handler=="anthropic" 的 target
+         的嵌套 models[] 解析；若该 target 不存在或未命中，回退到顶层 models[]
+      2. dict 含 "models" 键（顶层旧格式或 _MODELS_CFG 结构）→ 取 models["models"]
+      3. models list → 直接遍历
+
     函数内对缺失字段容错（缺 name/aliases 时跳过该条，不抛异常）。
     """
-    if isinstance(models, dict):
+    # 输入是完整 cfg dict（含 targets）→ 优先从 anthropic target 的嵌套 models 解析
+    if isinstance(models, dict) and isinstance(models.get("targets"), list):
+        anth_t = _get_anthropic_target(models)
+        if anth_t is not None:
+            nested = anth_t.get("models")
+            if isinstance(nested, list):
+                hit = _match_in_models_list(nested, requested_model)
+                if hit is not None:
+                    return hit
+        # 回退到顶层 models（兼容旧格式 / 混合配置）
+        models = models.get("models", [])
+    elif isinstance(models, dict):
         models = models.get("models", [])
     elif not isinstance(models, list):
         models = []
 
+    return _match_in_models_list(models, requested_model)
+
+
+def _match_in_models_list(models: list, requested_model: str) -> Optional[dict]:
+    """在 models list 中按 name/aliases 匹配，命中返回 target dict，否则 None。"""
     for m in models:
         if not isinstance(m, dict):
             continue
@@ -313,7 +438,6 @@ def _resolve_model_alias(models, requested_model: str) -> Optional[dict]:
         aliases = m.get("aliases")
         if isinstance(aliases, list) and requested_model in aliases:
             return m.get("target")
-
     return None
 
 
