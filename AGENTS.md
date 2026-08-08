@@ -46,7 +46,7 @@ tail -f /root/shared-workspace/claude-code-proxy/proxy.log
 # & ".\.venv\Scripts\python.exe" server.py
 ```
 
-> systemd 细节：`ExecStart=.venv/bin/python3 server.py`，`Restart=always`（kill -9 也会被自动拉起）、`RestartSec=10`，日志追加到 `proxy.log`。**DEBUG 默认关闭**（无 `debug.conf`、`targets.json` 的 `server.log.debug` 为 `false`），日志级别为 INFO，`logger.debug()` 不输出——网关独立日志（`codebuddy.log` / `traework.log`）的逐请求诊断也随之静默，仅 INFO 及以上（如热重写命中）仍记录。需要排查时临时开：`systemctl edit claude-code-proxy` 加 `Environment=DEBUG=true` → `systemctl restart` → **查完记得恢复**（DEBUG 会把每个请求体/SSE 统计写盘，长期开启徒增磁盘与噪音）。
+> systemd 细节：`ExecStart=.venv/bin/python3 server.py`，`Restart=always`（kill -9 也会被自动拉起）、`RestartSec=10`，日志追加到 `proxy.log`。**DEBUG 默认关闭**（`targets.json` 的 `server.log.debug` 为 `false`），日志级别为 INFO，`logger.debug()` 不输出——网关独立日志（`codebuddy.log` / `traework.log`）的逐请求诊断也随之静默，仅 INFO 及以上（如热重写命中）仍记录。需要排查时临时开：`systemctl edit claude-code-proxy` 加 `Environment=DEBUG=true`（环境变量优先；或改 `targets.json` 的 `server.log.debug` 为 `true`）→ `systemctl restart` → **查完记得恢复**（DEBUG 会把每个请求体/SSE 统计写盘，长期开启徒增磁盘与噪音）。
 
 > **注意**：代理进程跑在独立 mount namespace，`/tmp` 与 shell 隔离——跨进程共享状态（如 crack_daily 时间戳）放仓库内 `.cache/`，勿用 `/tmp`。
 

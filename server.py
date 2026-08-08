@@ -110,8 +110,9 @@ import config_store as _cfg
 _CFG = _cfg.load_targets()
 _SERVER_CFG = _CFG.get("server", _cfg.DEFAULT_SERVER_CONFIG)
 
-# Debug mode
-DEBUG = bool(_SERVER_CFG["log"]["debug"])
+# Debug mode：环境变量 DEBUG 优先（兼容 systemctl edit 临时开），未设置时回退 targets.json
+# server.log.debug（配置统一）。注意：logger 初始化在下方读取本值，勿在此之后改动。
+DEBUG = os.environ.get("DEBUG", str(_SERVER_CFG["log"]["debug"])).lower() == "true"
 LOG_FILE = _SERVER_CFG["log"]["file"]  # 非空则同时输出到文件
 LOG_RETENTION_DAYS = int(_SERVER_CFG["log"]["retentionDays"])
 LOG_ROTATE_WHEN = _SERVER_CFG["log"]["rotateWhen"]
