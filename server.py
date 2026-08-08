@@ -342,10 +342,12 @@ async def lifespan(app):
                 print(f"🔑 [{t['label']}] token {'已就绪' if has else '缺失（跳过破解，dashboard 可补）'}")
 
     # ── 启动所有 target 驱动端口（8082 copilot, 8084 codebuddy, 8085 qclaw, 8090-8094 等）──
-    # 8081 Anthropic 由 uvicorn FastAPI 处理（不在此处启动）
+    # 8081 Anthropic 由 uvicorn FastAPI 处理（不在此处启动）；排除 handler=="anthropic"
     for t in _TARGETS:
         if not t.get("enabled", True):
             print(f"⏭️  [{t['label']}] disabled, skip")
+            continue
+        if t.get("handler") == "anthropic":
             continue
         srv = await _vendor_server("0.0.0.0", t["listenPort"], t)
         _target_servers[t["listenPort"]] = srv
@@ -400,6 +402,12 @@ async def lifespan(app):
         _http_client = None
 
 app = FastAPI(lifespan=lifespan)
+
+# ─── 管理面 FastAPI app（dashboard + 管理 API，独立端口）───
+# dashboard_app 复用主 app 的全局状态（_TARGETS/_MODELS_CFG/_SECRETS），
+# 数据由主 app 的 lifespan / _reload_targets 维护，无需独立 lifespan。
+# 路由挂载由 T7 完成（当前为空挂骨架，仅占端口监听）。
+dashboard_app = FastAPI()
 
 from fastapi.exceptions import RequestValidationError
 
@@ -703,8 +711,16 @@ def _load_vendor_targets():
         for e in errors:
             logger.warning(f"targets.json 配置错误: {e['path']}: {e['msg']}")
     _TARGETS = cfg.get("targets", [])
-    _MODELS_CFG["models"] = cfg.get("models", [])
-    _MODELS_CFG["modelDefaults"] = cfg.get("modelDefaults", {"defaultPort": 8082})
+    # 8081 的 models/modelDefaults 现在嵌套在 handler=="anthropic" 的 target 内
+    # （config_store.load_targets 已把旧顶层格式内存迁移进该 target）。
+    # _get_anthropic_target 接受 targets list 或 cfg dict，这里传 _TARGETS。
+    _anthropic_t = _cfg._get_anthropic_target(_TARGETS)
+    if _anthropic_t is not None:
+        _MODELS_CFG["models"] = _anthropic_t.get("models", [])
+        _MODELS_CFG["modelDefaults"] = _anthropic_t.get("modelDefaults", {"defaultPort": 8082})
+    else:
+        _MODELS_CFG["models"] = []
+        _MODELS_CFG["modelDefaults"] = {"defaultPort": 8082}
     _SECRETS = _cfg.load_secrets()
     # 私密凭据统一收敛：COPILOT_GHE_TOKEN 与 targets.json copilot-enterprise 的
     # secretRef 同源（crack_copilot.py 提取的企业 GHE PAT 写 copilot_token），
@@ -753,8 +769,15 @@ async def _reload_targets() -> list:
         logger.error(f"配置校验失败，拒绝重载: {summary}")
         return [f"❌ 校验失败: {summary}"]
     _TARGETS = cfg.get("targets", [])
-    _MODELS_CFG["models"] = cfg.get("models", [])
-    _MODELS_CFG["modelDefaults"] = cfg.get("modelDefaults", {"defaultPort": 8082})
+    # 8081 的 models/modelDefaults 嵌套在 handler=="anthropic" 的 target 内
+    # （与 _load_vendor_targets 同源，热重载时同步更新 _MODELS_CFG）。
+    _anthropic_t = _cfg._get_anthropic_target(_TARGETS)
+    if _anthropic_t is not None:
+        _MODELS_CFG["models"] = _anthropic_t.get("models", [])
+        _MODELS_CFG["modelDefaults"] = _anthropic_t.get("modelDefaults", {"defaultPort": 8082})
+    else:
+        _MODELS_CFG["models"] = []
+        _MODELS_CFG["modelDefaults"] = {"defaultPort": 8082}
     # P2: 重建 ModelRegistry 单一事实源（dashboard 渲染改读它，targets.json 结构不变）
     _MODEL_REGISTRY = ModelRegistry({
         "targets": _TARGETS,
@@ -800,8 +823,8 @@ async def _reload_targets() -> list:
                 "startedAt": datetime.now().isoformat(),
             }
 
-    # diff 端口
-    wanted = {t["listenPort"]: t for t in _TARGETS if t.get("enabled", True)}
+    # diff 端口（排除 handler=="anthropic"：8081 由 uvicorn FastAPI 承载，不走 TCP 透传引擎）
+    wanted = {t["listenPort"]: t for t in _TARGETS if t.get("enabled", True) and t.get("handler") != "anthropic"}
     for port in list(_target_servers.keys()):
         if port not in wanted:
             _target_servers[port].close()
@@ -951,6 +974,10 @@ def _crack_env_check(target: dict) -> dict:
 
 _ANTHROPIC_PORT = int(_SERVER_CFG["listenPort"])
 
+# dashboard / 管理 API 服务端口（8079，与翻译端点 8081 分离）。
+# target 端口的 /dashboard、/api/* 反向代理转发的目标端口。
+_DASHBOARD_PORT = int(_SERVER_CFG.get("dashboardPort", 8079))
+
 
 # 值混合 int 计数与 str 时间戳，故不加值类型约束（与 _TARGET_STATS 同风格）
 _ANTHROPIC_STATS: dict = {"totalRequests": 0, "passthroughOk": 0, "passthroughError": 0, "startedAt": datetime.now().isoformat()}
@@ -1003,7 +1030,7 @@ async def _handle_target_request(reader, writer, target):  # pyright: ignore[rep
         # ── /dashboard：代理到 8081 FastAPI ──
         if path == "/dashboard" and method == "GET":
             async with httpx.AsyncClient(timeout=httpx.Timeout(5.0), trust_env=False) as c:
-                resp = await c.get("http://127.0.0.1:8081/dashboard")
+                resp = await c.get(f"http://127.0.0.1:{_DASHBOARD_PORT}/dashboard")
                 writer.write(b"HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: %d\r\n\r\n%s" % (len(resp.content), resp.content))
                 await writer.drain()
             writer.close(); return
@@ -1019,8 +1046,8 @@ async def _handle_target_request(reader, writer, target):  # pyright: ignore[rep
         ):
             async with httpx.AsyncClient(timeout=httpx.Timeout(30.0), trust_env=False) as c:
                 fwd = {k: v for k, v in headers.items() if k.lower() not in ("host", "connection", "content-length")}
-                fwd["host"] = "127.0.0.1:8081"
-                req = c.build_request(method, f"http://127.0.0.1:8081{raw_path}", headers=fwd, content=body if body else None)
+                fwd["host"] = f"127.0.0.1:{_DASHBOARD_PORT}"
+                req = c.build_request(method, f"http://127.0.0.1:{_DASHBOARD_PORT}{raw_path}", headers=fwd, content=body if body else None)
                 resp = await c.send(req, stream=True)
                 if "text/event-stream" in resp.headers.get("content-type", ""):
                     writer.write(f"HTTP/1.1 {resp.status_code} {resp.reason_phrase or 'OK'}\r\n".encode())
@@ -1073,7 +1100,7 @@ async def _handle_target_request(reader, writer, target):  # pyright: ignore[rep
             err_payload = json.dumps({
                 "error": {
                     "type": "missing_token",
-                    "message": f"请到 dashboard (http://127.0.0.1:8081/dashboard) 填写 {target.get('secretRef', label)} token",
+                    "message": f"请到 dashboard (http://127.0.0.1:{_DASHBOARD_PORT}/dashboard) 填写 {target.get('secretRef', label)} token",
                 }
             })
             writer.write(b"HTTP/1.1 401 Unauthorized\r\nContent-Type: application/json\r\nContent-Length: %d\r\n\r\n%s" % (len(err_payload.encode()), err_payload.encode()))
@@ -1858,7 +1885,9 @@ async def root():
 #      /api/*，与拆分前的注册顺序不一致。
 from dashboard.routes import dashboard_router  # noqa: E402
 
-app.include_router(dashboard_router)
+# 管理面路由挂到独立的 dashboard_app（8079），与主 app（8081）分离。
+# 挂到 dashboard_app 后，/dashboard 与 /api/* 在 8079 可用，8081 不再提供这些端点。
+dashboard_app.include_router(dashboard_router)
 
 
 # Catch-all route to handle OAuth and other unexpected endpoints
@@ -1953,7 +1982,27 @@ if __name__ == "__main__":
         if idx + 1 < len(sys.argv):
             port = int(sys.argv[idx + 1])
 
-    # Configure uvicorn to run with minimal logs
-    uvicorn.run(app, host="0.0.0.0", port=port, log_level="error")
+    # ─── 双 uvicorn 并发启动 ───
+    # 主 app（8081，Anthropic 翻译入口）+ dashboard_app（8079，管理面独立端口）。
+    # --port 仅控制主 app；dashboard 端口由 targets.json server.dashboardPort 决定（默认 8079）。
+    # dashboard_app 复用主 app 全局状态（_TARGETS/_MODELS_CFG/_SECRETS），无需独立 lifespan。
+    # 一个 server 崩溃不 zombie 另一个：gather 内 try/except 记录日志后整体退出（systemd 会拉起）。
+    dashboard_port = int(_SERVER_CFG.get("dashboardPort", 8079))
+
+    main_cfg = uvicorn.Config(app, host="0.0.0.0", port=port, log_level="error")
+    dash_cfg = uvicorn.Config(
+        dashboard_app, host="0.0.0.0", port=dashboard_port, log_level="error"
+    )
+    main_server = uvicorn.Server(main_cfg)
+    dash_server = uvicorn.Server(dash_cfg)
+
+    async def _serve_both():
+        try:
+            await asyncio.gather(main_server.serve(), dash_server.serve())
+        except Exception as e:  # noqa: BLE001 — 启动期兜底，任一 server 异常都需记录并退出
+            logger.error(f"❌ uvicorn server 异常退出: {e}", exc_info=True)
+            raise
+
+    asyncio.run(_serve_both())
 
 

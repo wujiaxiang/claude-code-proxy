@@ -1110,7 +1110,7 @@ async def dashboard():
             ("base_url", _base_url),
             ("分类", badge_map.get(category, category)),
             ("handler", t.get("handler", "passthrough")),
-            ("上游", f"{t.get('targetProtocol','https')}://{t['targetHost']}:{t.get('targetPort',443)}{t.get('routePrefix','')}"),
+            ("上游", f"{t.get('targetProtocol','https')}://{t.get('targetHost','')}:{t.get('targetPort',443)}{t.get('routePrefix','')}" if t.get('targetHost') else "内置翻译入口（无上游）"),
         ]
         if t.get("isFree") is not None:
             kv.append(("isFree", "是（免费）" if t["isFree"] else "否（收费）"))
