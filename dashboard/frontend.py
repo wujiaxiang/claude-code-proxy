@@ -1055,14 +1055,15 @@ async def dashboard():
             except Exception:
                 r = {"label": t["label"], "listenPort": port, "upstream": "?", "models": [], "total": 0, "ok": 0, "translated": 0, "err": 0, "alive": False, "startedAt": "", "modelStats": {}}
         category = t.get("category", "free")
-        badge_map = {"crack": "破解", "free": "免费", "paid": "收费"}
-        badge_class_map = {"crack": "blue", "free": "green", "paid": "orange"}
+        is_anthropic = t.get("handler") == "anthropic"
+        badge_map = {"crack": "破解", "free": "免费", "paid": "收费", "anthropic": "Anthropic 入口"}
+        badge_class_map = {"crack": "blue", "free": "green", "paid": "orange", "anthropic": "purple"}
         # ── 模型标签分类：破解/非破解 · 免费/收费（破解默认免费，可被 isFree 覆盖）· 稳定性（破解/收费高，免费低）──
         is_crack = category == "crack"
         # 显式设置 isFree 时以配置为准（如企业版 Copilot isFree=false → 收费）；
-        # 未设置时按 category 推断：paid=收费，其余免费
-        is_free = t.get("isFree") if t.get("isFree") is not None else (category != "paid")
-        is_stable = category in ("crack", "paid")  # 破解与收费服务稳定性高
+        # 未设置时按 category 推断：paid=收费，其余免费；anthropic 入口无 isFree 语义
+        is_free = t.get("isFree") if t.get("isFree") is not None else (category != "paid" and not is_anthropic)
+        is_stable = is_anthropic or category in ("crack", "paid")  # 入口/破解/收费服务稳定性高
         # 元数据标签：kind_badge 已显示"破解/免费/收费"，这里只保留稳定性 + 协议，避免语义重复
         meta_badges = [
             ("稳定性高" if is_stable else "稳定性低", "b-meta-stable" if is_stable else "b-meta-unstable"),
@@ -1071,7 +1072,7 @@ async def dashboard():
         # 其余 target（crack/透传/trae-work）客户端均走 OpenAI 协议
         if t.get("handler") == "gemini-native":
             meta_badges.append(("Gemini协议", "b-meta-gemini"))
-        elif t.get("handler") == "anthropic":
+        elif is_anthropic:
             meta_badges.append(("Anthropic 协议", "b-meta-anthropic"))
         else:
             meta_badges.append(("OpenAI 协议", "b-meta-oa"))
@@ -1087,11 +1088,12 @@ async def dashboard():
         _base_url = f"http://{_lan_ip}:{port}{_base_suffix}"
         kv = [
             ("base_url", _base_url),
-            ("分类", badge_map.get(category, category)),
+            ("分类", badge_map.get("anthropic" if is_anthropic else category, category)),
             ("handler", t.get("handler", "passthrough")),
             ("上游", f"{t.get('targetProtocol','https')}://{t.get('targetHost','')}:{t.get('targetPort',443)}{t.get('routePrefix','')}" if t.get('targetHost') else "内置翻译入口（无上游）"),
         ]
-        if t.get("isFree") is not None:
+        # anthropic 入口无 isFree 语义，不展示
+        if t.get("isFree") is not None and not is_anthropic:
             kv.append(("isFree", "是（免费）" if t["isFree"] else "否（收费）"))
         if t.get("enabled") is False:
             kv.append(("状态", "预留（未监听）"))
@@ -1166,18 +1168,20 @@ async def dashboard():
 
         card = _build_card_html(
             name=f"{t['label']}",
-            note="统一透传引擎 · targets.json 驱动",
-            kind_badge=badge_map.get(category, category),
+            note="Anthropic 翻译入口 · models[] 路由" if is_anthropic else "统一透传引擎 · targets.json 驱动",
+            kind_badge=badge_map.get("anthropic" if is_anthropic else category, category),
             status_badge="运行中" if r["alive"] else ("未监听" if t.get("enabled") is False else "离线"),
-            status_badge_class=badge_class_map.get(category, "gray") if r["alive"] else "red",
+            status_badge_class=badge_class_map.get("anthropic" if is_anthropic else category, "gray") if r["alive"] else "red",
             kv_items=kv,
             models=t.get("models", []),
             model_stats=r.get("modelStats") if r.get("alive") else None,
             stats_detail=_make_stats_detail(r),
-            description=f"category={category} · handler={t.get('handler','passthrough')} · isFree={t.get('isFree')}",
+            description=("Anthropic 翻译入口：/v1/messages 按 models[] 路由转发本地端口"
+                         if is_anthropic else
+                         f"category={category} · handler={t.get('handler','passthrough')} · isFree={t.get('isFree')}"),
             accent_class=f"accent-{port}",
             raw_html=raw_html,
-            label=t["label"],
+            label=None if is_anthropic else t["label"],
             port=port,
             meta_badges=meta_badges,
             # 上游是否支持 /models：优先读 ModelRegistry 单一事实源（P2），
