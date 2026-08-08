@@ -30,22 +30,16 @@ _test_server_cfg = _cfg.load_targets().get("server", _cfg.DEFAULT_SERVER_CONFIG)
 
 # ─── 配置 ───
 PROXY = os.environ.get("PROXY_HOST", "127.0.0.1")
-PORT = int(os.environ.get("PROXY_PORT", "8082"))
+# Anthropic 协议测试打 8081（翻译入口，handler=anthropic）；OpenAI 透传测试打 8082
+ANTHROPIC_PORT = int(os.environ.get("ANTHROPIC_PORT", "8081"))
+OAI_PORT = int(os.environ.get("PROXY_PORT", "8082"))
 TIMEOUT = 60
 
-# ─── 8082 固定为 copilot target（横向扩展模式）───
-# 模型名：Anthropic 别名经 copilot target 的 modelMapping 映射
-_PROVIDER = os.environ.get("PREFERRED_PROVIDER", str(_test_server_cfg["preferredProvider"])).lower()
-if _PROVIDER == "qclaw":
-    # 直接打 8085（qclaw 端口）时用 pool-* 模型
-    OAI_MODEL_BIG = os.environ.get("BIG_MODEL", _test_server_cfg["legacyModels"]["big"])
-    OAI_MODEL_MED = os.environ.get("MEDIUM_MODEL", _test_server_cfg["legacyModels"]["medium"])
-    OAI_MODEL_SMALL = os.environ.get("SMALL_MODEL", _test_server_cfg["legacyModels"]["small"])
-else:
-    # 默认：8082 = copilot，经 modelMapping 映射
-    OAI_MODEL_BIG = "opus"
-    OAI_MODEL_MED = "sonnet"
-    OAI_MODEL_SMALL = "haiku"
+# ─── 模型名 ───
+# 8081 翻译入口按 models[] 路由（sonnet/haiku/opus → 聚合网关 8080）；8082 透传用真实模型
+OAI_MODEL_BIG = "opus"
+OAI_MODEL_MED = "sonnet"
+OAI_MODEL_SMALL = "haiku"
 
 # ─── 统计 ───
 passed = 0
@@ -57,9 +51,16 @@ warn = 0
 # 基础请求工具
 # ============================================================
 
+def _port_for(path):
+    """OpenAI 透传（/v1/chat/completions）打 8082；其余（/v1/messages*、/ 连通性）打 8081 翻译入口。"""
+    if path == "/v1/chat/completions":
+        return OAI_PORT
+    return ANTHROPIC_PORT
+
+
 def request(path, body=None, method="POST"):
     """发送 HTTP 请求，返回 (status, raw_bytes, headers_dict)。"""
-    conn = http.client.HTTPConnection(PROXY, PORT, timeout=TIMEOUT)
+    conn = http.client.HTTPConnection(PROXY, _port_for(path), timeout=TIMEOUT)
     headers = {"Content-Type": "application/json"} if body else {}
     body_bytes = json.dumps(body).encode() if body else None
     conn.request(method, path, body=body_bytes, headers=headers)
@@ -72,7 +73,7 @@ def request(path, body=None, method="POST"):
 
 def request_stream(path, body):
     """发送流式请求，读取完整 SSE 流并返回 (status, decoded_text, headers_dict)。"""
-    conn = http.client.HTTPConnection(PROXY, PORT, timeout=TIMEOUT)
+    conn = http.client.HTTPConnection(PROXY, _port_for(path), timeout=TIMEOUT)
     conn.request("POST", path, json.dumps(body).encode(), {"Content-Type": "application/json"})
     resp = conn.getresponse()
     raw = b""
@@ -818,7 +819,7 @@ def main():
     parser.add_argument("--no-streaming", action="store_true", help="跳过流式测试")
     args = parser.parse_args()
 
-    print(f"代理: http://{PROXY}:{PORT}  provider={_PROVIDER}")
+    print(f"代理: http://{PROXY}  Anthropic(8081翻译)={ANTHROPIC_PORT}  OpenAI(8082透传)={OAI_PORT}")
     print(f"模型: big={OAI_MODEL_BIG}  med={OAI_MODEL_MED}  small={OAI_MODEL_SMALL}")
 
     # 选择运行场景

@@ -1746,22 +1746,30 @@ async def create_message(request: MessagesRequest, raw_request: Request):
                 _req = client.build_request("POST", f"http://127.0.0.1:{_fwd_port}/v1/chat/completions", headers=_fwd_headers, content=openai_payload)
                 _resp = await client.send(_req, stream=_is_stream)
                 if _is_stream:
+                    # 注意：必须在此 async with 块内完成全部字节读取——StreamingResponse
+                    # 返回后 async with 立即退出（client 关闭），生成器若在外部迭代
+                    # _resp 会 ReadError。故此处先收集全部 data 行，再转 Anthropic SSE。
+                    from anthropic_stream_convert import convert_openai_sse_to_anthropic
+                    line_buf = _SseLineBuffer()
+                    data_lines: list = []
+                    try:
+                        async for chunk in _resp.aiter_bytes():
+                            for line in line_buf.feed(chunk):
+                                # 只取 data: 载荷行（event: / 空行丢弃），喂转换器
+                                if line.startswith(b"data:"):
+                                    data_lines.append(line[5:].strip().decode("utf-8", errors="replace"))
+                    finally:
+                        await _resp.aclose()
+                    # 流结束吐残留（无末尾 \n 的最后一行，防御性透传）
+                    tail = line_buf.flush()
+                    if tail and tail.startswith(b"data:"):
+                        data_lines.append(tail[5:].strip().decode("utf-8", errors="replace"))
+                    # 转换 + 输出 Anthropic SSE（转换器内部处理 [DONE] 哨兵）
+                    _anthropic_frames = list(convert_openai_sse_to_anthropic(data_lines, original_model))
+
                     async def _models_stream():
-                        # 用 _SseLineBuffer 重组跨 chunk 半截帧后再透传（只重组不改写内容）：
-                        # 下游本地端口已按 normalizeSse 处理过字段，此处不再清洗（避免双重处理），
-                        # 但转发本地端口同样可能被 TCP 切帧，重组保证客户端收到的始终是完整 SSE 行。
-                        line_buf = _SseLineBuffer()
-                        try:
-                            async for chunk in _resp.aiter_bytes():
-                                for line in line_buf.feed(chunk):
-                                    yield line
-                        finally:
-                            await _resp.aclose()
-                        # 流结束吐残留（无末尾 \n 的最后一行，正常 SSE 不应出现，防御性透传）
-                        tail = line_buf.flush()
-                        if tail:
-                            yield tail
-                        yield b"data: [DONE]\n\n"
+                        for frame in _anthropic_frames:
+                            yield frame
                     return StreamingResponse(_models_stream(), media_type="text/event-stream")
                 _body_bytes = await _resp.aread()
                 try:

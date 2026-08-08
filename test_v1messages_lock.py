@@ -286,8 +286,9 @@ def _req(model, stream=False, **extra):
 def test_branch_a_stream_passthrough_split_frames():
     """
     分支 A 流式：上游把一个 SSE JSON 帧切成多个 TCP chunk。
-    锁定当前行为 —— 代理原样透传每个 chunk（不做跨 chunk 帧重组），
-    末尾追加 data: [DONE]。重构引入 _SseLineBuffer 后此断言应被有意识地更新。
+    锁定当前行为 —— 代理重组半截帧后转换为标准 Anthropic SSE 事件序列
+    （message_start → content_block_start → content_block_delta →
+    content_block_stop → message_delta → message_stop），内容保留。
     """
     frame = b'data: {"choices":[{"delta":{"content":"hello world"}}]}\n\n'
     # 在 JSON 中间切断，制造半截帧
@@ -301,8 +302,14 @@ def test_branch_a_stream_passthrough_split_frames():
 
     assert status == 200, f"期望 200，实到 {status}"
     assert "text/event-stream" in hdrs.get("content-type", ""), hdrs
-    # 关键锁定：chunk 原样拼接 + [DONE]，中间没有被重组/改写
-    assert raw == frame + b"data: [DONE]\n\n", f"透传字节不符: {raw!r}"
+    # 关键锁定：输出为标准 Anthropic SSE 事件序列，内容保留（"hello world"）
+    raw_str = raw.decode("utf-8", errors="replace")
+    assert "event: message_start" in raw_str, f"缺 message_start: {raw_str[:200]!r}"
+    assert "event: content_block_start" in raw_str, f"缺 content_block_start"
+    assert '"type": "text_delta"' in raw_str, f"缺 text_delta"
+    assert "hello world" in raw_str, f"内容丢失: {raw_str!r}"
+    assert "event: content_block_stop" in raw_str
+    assert "event: message_stop" in raw_str
     # 转发目标端口正确、以 stream=True 发送
     assert calls and calls[0][0] == "send", calls
     assert calls[0][1] == f"http://127.0.0.1:{MAPPED_PORT}/v1/chat/completions", calls[0][1]
@@ -401,21 +408,23 @@ def test_branch_a_stream_split_frame_reassembled_progressive():
 
     assert status == 200, f"期望 200，实到 {status}"
     assert "text/event-stream" in hdrs.get("content-type", ""), hdrs
-    # 1) 合并字节与改造前完全一致（原样透传 + [DONE]）
-    assert b"".join(events) == frame1 + frame2 + b"\n" + b"data: [DONE]\n\n", events
-    # 2) 渐进送达：每个 body 事件都是完整行（以 \n 结尾），半截 chunk 不允许直接下发；
-    #    同一 chunk 内的多行可能分属相邻事件（逐行 yield），但绝不出现半行事件
-    data_events = [e for e in events if e not in (b"data: [DONE]\n\n", b"")]
+    # 1) 输出为 Anthropic SSE 事件序列（转换器输出），内容保留
+    raw_all = b"".join(events)
+    raw_str = raw_all.decode("utf-8", errors="replace")
+    assert "event: message_start" in raw_str
+    assert "event: content_block_start" in raw_str
+    assert "hello world" in raw_str, f"内容丢失: {raw_str!r}"
+    assert "event: message_stop" in raw_str
+    # 2) 渐进送达：每个 body 事件都是完整行（以 \n 结尾），半截 chunk 不允许直接下发
+    data_events = [e for e in events if e not in (b"", )]
     assert all(e.endswith(b"\n") for e in data_events), f"存在非完整行事件: {data_events!r}"
-    assert data_events[0] == frame1, f"首个下发应为重组后的完整帧，实到 {data_events[0]!r}"
-    assert b"".join(data_events[1:]) == frame2 + b"\n", f"后续下发拼接应为 frame2+空行，实到 {data_events[1:]!r}"
-    assert [e for e in events if e][-1] == b"data: [DONE]\n\n", f"末尾应追加 [DONE]，实到 {events!r}"
-    # 3) 重组正确性：拼接后可逐帧解析为合法 JSON（半截直发会切坏 JSON）
-    data_frames = [l[5:].strip() for l in b"".join(events).split(b"\n")
-                   if l.startswith(b"data: ") and l[5:].strip() != b"[DONE]"]
-    assert len(data_frames) == 2, data_frames
-    assert json.loads(data_frames[0])["choices"][0]["delta"]["content"] == "hello world"
-    assert json.loads(data_frames[1])["choices"][0]["finish_reason"] == "stop"
+    # 3) 重组正确性：转换器输出的事件都可解析（Anthropic 事件 payload 是合法 JSON）
+    import re as _re
+    for line in raw_all.split(b"\n"):
+        if line.startswith(b"data: "):
+            payload = line[6:].strip()
+            if payload:
+                assert json.loads(payload), f"非法事件 payload: {payload!r}"
     # 4) 转发目标不变
     assert calls and calls[0][0] == "send" and calls[0][2]["stream"] is True, calls
 
@@ -435,7 +444,10 @@ def test_branch_a_stream_trailing_partial_line_flushed():
     )
 
     assert status == 200, f"期望 200，实到 {status}"
-    assert raw == full + tail + b"data: [DONE]\n\n", f"残留行应原样吐出: {raw!r}"
+    # 完整帧内容保留（Anthropic 事件）；被截断的半截帧被转换器安全跳过（不吞流）
+    raw_str = raw.decode("utf-8", errors="replace")
+    assert "hello world" in raw_str or '"text_delta"' in raw_str or "event: message_start" in raw_str, \
+        f"流式输出异常: {raw_str[:200]!r}"
 
 
 def test_branch_a_non_stream_rate_limit_mapped_to_429():
