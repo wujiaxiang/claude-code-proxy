@@ -49,14 +49,17 @@ def _as_int(raw: str) -> int:
 
 # 映射表：.env 键 → (server 段路径, 转换器)。路径为 server 段内的点号寻址。
 # 未列出的键一律忽略：私密凭据归 secrets.json，路径探测/运行时透传保持 env。
+#
+# 已废弃、不再迁移的旧键（server 段已精简，这些值现从 targets 推导或由代码默认承担）：
+#   PREFERRED_PROVIDER                       （server.preferredProvider 已删）
+#   COPILOT_GHE_HOST / COPILOT_INTEGRATION_ID
+#   COPILOT_BIG_MODEL / COPILOT_MEDIUM_MODEL / COPILOT_SMALL_MODEL
+#                                            （server.copilot 已删，从 copilot target 推导）
+#   BIG_MODEL / MEDIUM_MODEL / SMALL_MODEL   （server.legacyModels 已删，validator 已退化）
+#   QCLAW_BASE_URL                           （server.qclaw 已删，从 8085 target 推导）
+# 它们若仍存在于旧 .env，会被归入下方「忽略」清单打印，不写入配置。
 _MAPPINGS = (
-    ("PREFERRED_PROVIDER", ("preferredProvider",), _as_str),
     ("ANTHROPIC_PORT", ("listenPort",), _as_int),
-    ("COPILOT_GHE_HOST", ("copilot", "gheHost"), _as_str),
-    ("COPILOT_INTEGRATION_ID", ("copilot", "integrationId"), _as_str),
-    ("COPILOT_BIG_MODEL", ("copilot", "bigModel"), _as_str),
-    ("COPILOT_MEDIUM_MODEL", ("copilot", "mediumModel"), _as_str),
-    ("COPILOT_SMALL_MODEL", ("copilot", "smallModel"), _as_str),
     ("DEBUG", ("log", "debug"), _as_bool),
     ("LOG_FILE", ("log", "file"), _as_str),
     ("LOG_RETENTION_DAYS", ("log", "retentionDays"), _as_int),
@@ -66,10 +69,6 @@ _MAPPINGS = (
     ("CACHE_MAX_SIZE", ("cache", "maxSize"), _as_int),
     ("CACHE_TTL_SECONDS", ("cache", "ttlSeconds"), _as_int),
     ("CACHE_MAX_ITEM_SIZE_KB", ("cache", "maxItemSizeKb"), _as_int),
-    ("BIG_MODEL", ("legacyModels", "big"), _as_str),
-    ("MEDIUM_MODEL", ("legacyModels", "medium"), _as_str),
-    ("SMALL_MODEL", ("legacyModels", "small"), _as_str),
-    ("QCLAW_BASE_URL", ("qclaw", "baseUrl"), _as_str),
 )
 
 

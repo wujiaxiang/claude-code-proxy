@@ -2,6 +2,19 @@
 
 ## [Unreleased]
 
+### Removed
+- **legacy 单端口模式彻底下线（2026-08-08）**：8081 早期是「一个端口按 `PREFERRED_PROVIDER` 选后端 + LiteLLM 翻译」的单端口代理，多端口架构上线后这条路径已长期无人走，本次连同其全部依赖一次性删除。
+  - **删除 legacy `/v1/chat/completions` 端点**：8081 不再提供 OpenAI 协议入口（各 target 端口自己的 `/v1/chat/completions` 不受影响）
+  - **删除 `PREFERRED_PROVIDER` 机制**：连同 `targets.server` 段的 `preferredProvider` / `legacyModels` / `copilot` / `qclaw` 四个旧键一并移除。`DEFAULT_SERVER_CONFIG` 现在只剩 `listenPort` / `log` / `cache` 三个键；旧配置里残留这些键不会报错，深合并时静默丢弃
+  - **移除 LiteLLM 依赖**：`import litellm`、`convert_anthropic_to_litellm` 及整个 `_PROVIDER_STRATEGIES` 策略族、OAI↔Anthropic 转换（`_convert_oai_to_anthropic`）、`_close_json_fragment` 全部删除。`gateways/translate.py` 从 ~370 行缩到 ~130 行，只剩 token 估算族 + `clean_gemini_schema`
+  - **删除 `/v1/messages` 的分支 B / 分支 C**：分支 B（copilot 原生透传）与分支 C（LiteLLM 翻译）移除，只保留分支 A：查 `models[]` 拿 `{port, model}` → `anthropic_convert` 翻译 → httpx 转发本地端口 → 译回 Anthropic。**未在 `models[]` 配路由的模型直接返回 404**，不再有兜底路径
+  - **validator 模型映射退化**：`MessagesRequest` 的模型 validator 不再做 provider 前缀改写/大中小模型映射，只保留 `original_model` 记录
+
+### Changed
+- **`/v1/messages/count_tokens` 改纯 tiktoken 估算**：不再经 LiteLLM 转换，直接走 `_estimate_messages_tokens`（含 system 与 tools 的文本提取），无网络调用、无第三方翻译层
+- **`COPILOT_*` 配置函数化**：原 `server.copilot` 段的 GHE host / integration id / 大中小模型名改为每次调用实时推导，`gateways/copilot.py` 新增 `_copilot_api_base()` / `_copilot_integration_id()` / `_copilot_big_model()` 等，数据源是 copilot target（8082/8083）的 `targetHost` / `extraHeaders` / `modelRoles`。同理原 `server.qclaw.baseUrl` 由 qclaw target 的 `targetHost` 承载。配置从此单一事实源在 target 定义里，不再两处各写一份
+- **文档同步**：`AGENTS.md` / `README.md` / `README-zh.md` / `docs/architecture.md` 移除 LiteLLM 依赖、provider 策略机制、四个 server 段旧键的描述，8081 路由说明改为单一路径 + 404 语义
+
 ### Added
 - **配置架构整合：`.env` 废弃 → `targets.json` 顶层 `server` 段（2026-08-07）**：配置文件从三个（targets.json / secrets.json / .env）收敛为两个（targets.json / secrets.json）。原 `.env` 的非私密运行配置整体并入 `targets.json` 顶层新增的 `server` 段，`.env` 已删除（备份 `.env.bak`）
   - **`server` 段 schema**（`config_store.py` 的 `DEFAULT_SERVER_CONFIG`，用户段与默认做一层深合并）：`listenPort`（原 ANTHROPIC_PORT，默认 8081）/ `preferredProvider`（原 PREFERRED_PROVIDER，默认 openai，**仍被模型映射消费**，非死代码）/ `legacyModels{big,medium,small}`（原 BIG/MEDIUM/SMALL_MODEL）/ `log{debug,file,retentionDays,rotateWhen,rotateInterval}`（原 DEBUG/LOG_*）/ `cache{enabled,maxSize,ttlSeconds,maxItemSizeKb}`（原 CACHE_*）/ `copilot{gheHost,integrationId,bigModel,mediumModel,smallModel}`（原 COPILOT_*）/ `qclaw{baseUrl}`（原 QCLAW_BASE_URL）

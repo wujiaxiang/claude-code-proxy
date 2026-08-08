@@ -10,7 +10,7 @@
 **claude-code-proxy** 是一个 FastAPI 代理服务，让 Anthropic 客户端（如 Claude Code）能用多种后端（OpenAI / Gemini / Copilot Enterprise / QClaw / CodeBuddy / Trae Work）。
 
 - **主入口**：`server.py`（框架层 + 入口，~4200 行，已下沉 HTTP 引擎/翻译层/模型注册表/错误翻译到 `server_http.py` 与 `gateways/*`）+ 网关实现层（`gateways/`）+ 管理面板层（`dashboard/`）。**配置驱动**——所有端口/供应商/模型由 `targets.json` 定义，改配置不动 server.py；改具体网关注辑进 `gateways/<网关>.py`，改 dashboard 进 `dashboard/<子模块>.py`
-- **依赖**：Python 3.10+ / fastapi / uvicorn / httpx / litellm / python-dotenv / tiktoken / pydantic（虚拟环境 `.venv/`，Windows 用 `.venv\Scripts\python.exe`）
+- **依赖**：Python 3.10+ / fastapi / uvicorn / httpx / python-dotenv / tiktoken / pydantic（虚拟环境 `.venv/`，Windows 用 `.venv\Scripts\python.exe`）。注：LiteLLM 已彻底移除（legacy 单端口翻译层下线），token 估算改纯 tiktoken
 - **配置模块**：`config_store.py`（targets.json 加载/迁移/校验、secrets.json 读写、热重载）
 
 ---
@@ -56,7 +56,7 @@ tail -f /root/shared-workspace/claude-code-proxy/proxy.log
 
 | 文件 | 写入方 | 内容 |
 |------|--------|------|
-| `proxy.log` | root logger | 启动诊断、配置热重载、路由、错误码翻译、LiteLLM 翻译层、其他所有端口 |
+| `proxy.log` | root logger | 启动诊断、配置热重载、路由、错误码翻译、8081 `/v1/messages` 翻译转发、其他所有端口 |
 | `codebuddy.log` | `codebuddy_logger` | 8084 逐请求 model/stream/system 预览/body 摘要、SSE 帧统计、content_filter 拦截、聚合失败 |
 | `traework.log` | `traework_logger` | 8086 同类细节 |
 
@@ -88,14 +88,11 @@ tail -f codebuddy.log                 # 查
 
 > **配置文件现在只有两个**：`targets.json`（运行配置 + Target 定义）+ `secrets.json`（私密凭据）。`.env` 已废弃删除（备份 `.env.bak`），原运行配置并入 `targets.json` 顶层 `server` 段。旧部署用一次性脚本 `scripts/migrate_env_to_targets.py` 把旧 `.env` 迁进 `server` 段。
 
-- **`targets.json` 顶层 `server` 段**（主服务运行配置，可选，缺失或子键缺失自动补默认）：承载原 `.env` 的非私密运行配置。字段（默认值见 `config_store.py` 的 `DEFAULT_SERVER_CONFIG`，用户 server 段与之做一层深合并）：
+- **`targets.json` 顶层 `server` 段**（主服务运行配置，可选，缺失或子键缺失自动补默认）：承载原 `.env` 的非私密运行配置。**只剩三个键**（默认值见 `config_store.py` 的 `DEFAULT_SERVER_CONFIG`，用户 server 段与之做一层深合并；早期还有四个键（默认 provider 选择、legacy 大中小模型名、copilot 配置、qclaw baseUrl），已随 legacy 单端口模式一并删除，配置里残留也会被合并逻辑静默丢弃，不报错。详见 CHANGELOG）：
   - `listenPort`（默认 `8081`）：原 `ANTHROPIC_PORT`，anthropic-compatible 入口端口
-  - `preferredProvider`（默认 `"openai"`）：原 `PREFERRED_PROVIDER`。**仍实际使用**——被模型映射消费，控制默认 provider 归属。（此前文档误标"已废弃无实际作用"，现更正：由 `server.preferredProvider` 承载并生效）
-  - `legacyModels`（`{big, medium, small}`，默认 `gpt-4.1 / gpt-4.1 / gpt-4.1-mini`）：原 `BIG_MODEL/MEDIUM_MODEL/SMALL_MODEL`，仍被模型映射消费
   - `log`（`{debug, file, retentionDays, rotateWhen, rotateInterval}`，默认 `false / "" / 7 / "midnight" / 1`）：原 `DEBUG/LOG_FILE/LOG_RETENTION_DAYS/LOG_ROTATE_WHEN/LOG_ROTATE_INTERVAL`
   - `cache`（`{enabled, maxSize, ttlSeconds, maxItemSizeKb}`，默认 `true / 500 / 3600 / 100`）：原 `CACHE_ENABLED/CACHE_MAX_SIZE/CACHE_TTL_SECONDS/CACHE_MAX_ITEM_SIZE_KB`
-  - `copilot`（`{gheHost, integrationId, bigModel, mediumModel, smallModel}`，默认 `copilot-api.bmw.ghe.com / copilot-developer-cli / claude-sonnet-4.6 / claude-sonnet-4.6 / claude-haiku-4.5`）：原 `COPILOT_GHE_HOST/COPILOT_INTEGRATION_ID/COPILOT_BIG|MEDIUM|SMALL_MODEL`
-  - `qclaw`（`{baseUrl}`，默认 `https://mmgrcalltoken.3g.qq.com/aizone/v1`）：原 `QCLAW_BASE_URL`（`QCLAW_API_KEY` 是私密凭据，留在 secrets.json）
+  - 已删除的 copilot 段（GHE host / integration id / 大中小模型名）改为**函数化**（`gateways/copilot.py` 的 `_copilot_api_base()`/`_copilot_integration_id()`/`_copilot_*_model()`），每次调用从 copilot target（8082/8083）的 `targetHost`/`extraHeaders`/`modelRoles` 实时推导；已删除的 qclaw 段 baseUrl 同理由 qclaw target 的 `targetHost` 承载。两者都不再需要独立配置项
 - **`targets.json`**（Target 定义，核心配置）：必填 `label / listenPort / category / handler / targetHost`；category ∈ `crack|free|paid|aggregate`；handler ∈ `passthrough|copilot|qclaw|gemini-native|trae-work|aggregator`；crack 类必须有 `crackTool`；label/端口不能冲突；`enabled=false` 跳过必填校验（预留位）。secrets 优先级：`secrets.json > apikeyEnv 环境变量 > 客户端透传`。**热重载**：mtime 轮询 2s，改完即生效（含端口动态增删）。可选行为开关：`cleanCodebuddyBody` / `cleanQclawBody` / `normalizeSse`（SSE 帧规范化，修不合规上游）/ `normalizeFinishReason`。完整 schema 见 [docs/architecture.md](docs/architecture.md)
 - **`secrets.json`**（私密 key/token，gitignored，dashboard 可热编辑）：**私密凭据唯一事实源**。破解工具提取的 key/token 写入此文件。当前字段：`copilot_token, copilot_personal_token, codebuddy_token, codebuddy_refresh_token, codebuddy_uid, codebuddy_nickname, trae_work_token, trae_work_refresh_token, trae_work_user_id, trae_work_bound_device_id, qclaw_api_key, qclaw_login_key, qclaw_guid, qclaw_user_id, qclaw_nickname, qclaw_openclaw_token, qclaw_device_token`。注：`copilot_token` 同时供 8082 企业 GHE target（secretRef）与 server.py 翻译层 `COPILOT_GHE_TOKEN`（同源 token，热重载同步）
 - **全量配置导出/导入**（`GET /api/config/export` + `POST /api/config/import`，dashboard「📦 导出配置 / 📥 导入配置」按钮）：两个 gitignored 配置源打包成**单个 JSON**（v2 格式：`{version, exportedAt, targets, secrets}`，`version=2`；运行配置已并入 `targets.server` 段，不再有独立 `env` 段），实现"从 GitHub 下载代码 → 导入一个配置文件 → 达到现有配置效果"的迁移诉求。**物理文件保持分离**（热重载粒度 + 私密凭据隔离是刻意设计，勿合并）。导入校验 version + `validate_targets`（失败 422 且不写任何文件），成功则写两文件 + `_reload_targets()`（端口 diff）+ `_refresh_secrets()` 即时生效。导出含完整私密凭据，需妥善保管
@@ -173,7 +170,7 @@ tail -f codebuddy.log                 # 查
 
 - **API Key 自动解密**：启动时从 `%APPDATA%\QClaw\app-store.json` + `Local State` 解密（DPAPI→AES-256-GCM），`QCLAW_API_KEY` 环境变量优先级最高；客户端登录过一次即可自动拿到 Key
 - **三条铁律**：① User-Agent 必须 `OpenAI/JS 6.39.1`；② 所有 httpx 客户端 `trust_env=False`；③ body 按 `_QCLAW_ALLOWED_KEYS` 白名单清理
-- 模型必须先 `litellm.register_model`（`_qclaw_all_models`）；网关过滤 usage 字段 → 代理 tiktoken 本地估算注入
+- 网关过滤 usage 字段 → 代理 tiktoken 本地估算注入（`_estimate_messages_tokens`）
 
 🔗 解密链路 / 铁律全文 / 排查指南 → [docs/qclaw.md](docs/qclaw.md)；19000 网关逆向结论（PID 反查，唯一方案是寄生注入）→ [QCLAW_19000_GATEWAY_REVERSE.md](QCLAW_19000_GATEWAY_REVERSE.md)
 
@@ -185,10 +182,10 @@ tail -f codebuddy.log                 # 查
 
 ### 目录结构
 
-- **server.py**（框架层 + 入口，~4200 行）：连接池、日志基础设施、路径重写（`_HANDLER_PATH_MAP`）、Anthropic Pydantic 模型、核心 API 端点（`/v1/chat/completions`、`/v1/messages`）、配置热重载、多端口分发核心（`_handle_target_request`/`_vendor_server`）、catch_all 兜底。已下沉的部分：HTTP 引擎→`server_http.py`、翻译层→`gateways/translate.py`、模型注册表→`gateways/models.py`、错误翻译→`gateways/errors.py`（server.py 顶部 re-export 这些符号，历史调用点零改动）
+- **server.py**（框架层 + 入口，~4200 行）：连接池、日志基础设施、路径重写（`_HANDLER_PATH_MAP`）、Anthropic Pydantic 模型、核心 API 端点（`/v1/messages`、`/v1/messages/count_tokens`、`/v1/models`；legacy `/v1/chat/completions` 已删除）、配置热重载、多端口分发核心（`_handle_target_request`/`_vendor_server`）、catch_all 兜底。已下沉的部分：HTTP 引擎→`server_http.py`、翻译层→`gateways/translate.py`、模型注册表→`gateways/models.py`、错误翻译→`gateways/errors.py`（server.py 顶部 re-export 这些符号，历史调用点零改动）
   - ⚠️ 顶部有主模块别名代码（`if __name__ == "__main__" and "server" not in sys.modules: sys.modules["server"] = sys.modules["__main__"]`），**禁止删除**（防止 gateways/dashboard 的延迟 import 触发 server 双加载）
 - **server_http.py**（~370 行）：HTTP 转发引擎核心工具（`_parse_http_request`/`_write_response`/`_SseLineBuffer`/`_write_error_response`/`_write_response_with_status_override`）。server.py 通过 re-export 保持 `from server import _write_response` 对 gateways/* 继续有效
-- **gateways/translate.py**（~370 行）：翻译层——`_PROVIDER_STRATEGIES` 全族 + OAI↔Anthropic 转换（`_convert_oai_to_anthropic`）+ token 估算族 + `_close_json_fragment`/`clean_gemini_schema`。provider 策略字典用 PEP 562 惰性引用避免循环导入
+- **gateways/translate.py**（~130 行）：token 估算族（`_get_tokenizer`/`_extract_text_from_content`/`_estimate_messages_tokens`/`_estimate_text_tokens`，纯 tiktoken）+ `clean_gemini_schema`。原 `_PROVIDER_STRATEGIES` 全族与 OAI↔Anthropic 转换已随 legacy 单端口模式删除；8081 现用的 Anthropic↔OpenAI 转换在 `anthropic_convert.py`
 - **gateways/models.py**（~680 行）：模型注册表全族（`_get_target_models`/`_build_models_list`/`_fetch_downstream_models`/`_fetch_live_models`/`_scan_dangling_refs`/`ModelRegistry` 等）。跨模块依赖：函数内 `from server import X` 延迟导入 + `import server as _srv` 访问热重载全局（`_TARGETS`/`_SECRETS`/`_MODELS_CFG`）；`_DOWNSTREAM_MODELS_CACHE` 归本模块所有，server.py 经 `import gateways.models as _gmodels` 实时读取
 - **gateways/errors.py**（~100 行）：错误翻译族（`_map_upstream_error`/`_vendor_body_retryable`/`_is_rate_limit_error`/`_is_auth_expired_error` + `_VENDOR_ERROR_MAPS`/`_VENDOR_ERROR_PATTERNS`/`_VENDOR_RETRY_AFTER`）
 - **gateways/qclaw.py**：QClaw 解密 + body 清洗 + 透传（`_qclaw_provider`）；改 QClaw 逻辑进这里
@@ -216,19 +213,24 @@ tail -f codebuddy.log                 # 查
 2. 热重载可变全局（`_TARGETS`/`_SECRETS`/`_AGGREGATOR_ENGINE` 等）跨模块访问必须用 `import server as _srv` + `_srv.X` 模块属性方式，**禁止 `from server import X`**（值拷贝会在热重载后读到旧快照）
 3. 新增网关 = 在 `gateways/` 建一个模块 + server.py 注册（开闭原则）
 
-### Provider 策略机制（开闭原则）
+### 8081 `/v1/messages` 路由（唯一路径）
 
-`_PROVIDER_STRATEGIES` 字典注册了每个 provider 的处理函数（`_qclaw_provider`、`_copilot_provider` 等）。新增 provider 只需：
-1. 在 `valid_providers` 元组中加名字
-2. 写一个 `_xxx_provider(req, litellm_req, orig)` 函数
-3. 注册到 `_PROVIDER_STRATEGIES`
+legacy 单端口模式（按环境变量选 provider + 第三方库翻译 + copilot 原生透传三分支）已彻底下线，现在只剩一条路径：
 
-### 透传 vs 翻译
+1. `_cfg._resolve_model_alias(_MODELS_CFG, model)` 查 `models[]` 拿 `{port, model}`
+2. 命中 → `anthropic_convert.convert_anthropic_request_to_openai` 翻译 → httpx 转发到 `127.0.0.1:<port>/v1/chat/completions`
+3. 流式用 `_SseLineBuffer` 重组半截帧后透传（只重组不改写，下游本地端口已按 `normalizeSse` 处理过）；非流式经 `convert_openai_response_to_anthropic` 译回 Anthropic 格式
+4. 上游 4xx/5xx 先过 `_map_upstream_error` 识别限流特征（翻译为标准 429），未命中原样透传上游错误体与状态码
+5. **未命中 `models[]` → 直接 404**（无兜底路径，模型必须先在 `models[]` 里配路由）
 
-- **透传**（qclaw/openai/copilot）：`/v1/chat/completions` 直接 httpx 转发，不经 LiteLLM，保留原始请求体
-- **翻译**（anthropic/gemini）：经 LiteLLM 做格式转换和模型映射
+`/v1/messages/count_tokens` 改纯 tiktoken 估算（`_estimate_messages_tokens`），不再经任何翻译层。
+
+### 各 target 端口的协议处理
+
+- **透传**（passthrough 类，如 qclaw/openrouter/nvidia）：直接 httpx 转发，保留原始请求体
 - **gemini-native**（8092）：接受 OpenAI 请求，代理内部转换为 Google 原生 `generateContent` API
 - **trae-work**（8086）：接受 OpenAI 请求，代理内部转换为 Trae `llm_utils_chat` API
+- **copilot**（8082/8083）：部分模型走 Responses API 桥接（`/chat/completions` ↔ `/responses` 双向转换）
 
 ### f-string 内嵌 JS 的花括号转义（重要防御）
 
@@ -321,6 +323,6 @@ $env:Path = "C:\Program Files\QClaw\v0.2.33.617\resources\git\cmd;C:\Windows\Sys
 ## 13. Agent 行为准则
 
 1. **改配置改 `targets.json`**（运行配置在顶层 `server` 段，Target 定义在 `targets` 数组）**或 `secrets.json`**（私密凭据），不要改 VBS 或硬编码环境变量。
-2. **新增功能先看 Provider 策略机制**（`_PROVIDER_STRATEGIES`）或 `CRACK_STATUS_HANDLERS` / `DAILY_HANDLERS` 注册表，遵循开闭原则。
+2. **新增功能先看注册表机制**（`CRACK_STATUS_HANDLERS` / `DAILY_HANDLERS` / `_HANDLER_PATH_MAP`），遵循开闭原则；新增网关 = `gateways/` 加模块 + server.py 注册，别往 server.py 塞分支。
 3. **QClaw 相关改动**注意三个约束：`User-Agent`、`trust_env=False`、body 清理。
 4. **改 dashboard** 注意 f-string 花括号转义三条规则（§7），改完 `python -c "import ast; ast.parse(open('server.py').read())"` 验证 + 重启代理截图确认。

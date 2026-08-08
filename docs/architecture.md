@@ -8,7 +8,7 @@
 | 端口 | 供应商 | 分类 | handler | 协议 | 用途 |
 |------|--------|------|---------|------|------|
 | **8080** | aggregator | aggregate | aggregator | OpenAI | 聚合网关（虚拟模型路由 / 会话粘性 / 重试降级 / 配额熔断） |
-| **8081** | anthropic-compatible | — | FastAPI | Anthropic | Anthropic 入口 + dashboard（`/v1/messages` 翻译为 OpenAI 后内部请求 8082） |
+| **8081** | anthropic-compatible | — | FastAPI | Anthropic | Anthropic 入口 + dashboard（`/v1/messages` 按 `models[]` 解析目标端口，翻译为 OpenAI 后转发到该本地端口） |
 | **8082** | copilot | crack | copilot | OpenAI | GitHub Copilot Enterprise 破解透传（企业 PAT） |
 | **8083** | copilot | crack | copilot | OpenAI | 个人版 Copilot（上游 api.githubcopilot.com，与 8082 企业版账号隔离） |
 | **8084** | codebuddy | crack | passthrough | OpenAI | CodeBuddy 破解透传 |
@@ -45,7 +45,7 @@ Anthropic 协议：base_url = http://192.168.2.128:8081，api_key = "dummy"
 
 ```jsonc
 {
-  "modelDefaults": { "defaultPort": 8082 },   // 8081 未命中模型定义时的默认转发端口
+  "modelDefaults": { "defaultPort": 8082 },   // 直连端口未命中时的默认端口（8081 未命中直接 404，不用它）
   "models": [                                  // 全局模型定义（名称/别名 → 下游端口+真实模型）
     { "name": "sonnet", "aliases": [], "target": { "port": 8080, "model": "agg:sonnet" } },
     { "name": "haiku", "aliases": [], "target": { "port": 8082, "model": "claude-haiku-4.5" } }
@@ -86,12 +86,6 @@ Anthropic 协议：base_url = http://192.168.2.128:8081，api_key = "dummy"
 {
   "server": {
     "listenPort": 8081,                 // 原 ANTHROPIC_PORT，anthropic-compatible 入口端口
-    "preferredProvider": "openai",      // 原 PREFERRED_PROVIDER，仍被模型映射消费（控制默认 provider 归属）
-    "legacyModels": {                   // 原 BIG_MODEL/MEDIUM_MODEL/SMALL_MODEL，仍被模型映射消费
-      "big": "gpt-4.1",
-      "medium": "gpt-4.1",
-      "small": "gpt-4.1-mini"
-    },
     "log": {                            // 原 DEBUG/LOG_FILE/LOG_RETENTION_DAYS/LOG_ROTATE_WHEN/LOG_ROTATE_INTERVAL
       "debug": false,
       "file": "",
@@ -104,22 +98,14 @@ Anthropic 协议：base_url = http://192.168.2.128:8081，api_key = "dummy"
       "maxSize": 500,
       "ttlSeconds": 3600,
       "maxItemSizeKb": 100
-    },
-    "copilot": {                        // 原 COPILOT_GHE_HOST/COPILOT_INTEGRATION_ID/COPILOT_BIG|MEDIUM|SMALL_MODEL
-      "gheHost": "copilot-api.bmw.ghe.com",
-      "integrationId": "copilot-developer-cli",
-      "bigModel": "claude-sonnet-4.6",
-      "mediumModel": "claude-sonnet-4.6",
-      "smallModel": "claude-haiku-4.5"
-    },
-    "qclaw": {                          // 原 QCLAW_BASE_URL（QCLAW_API_KEY 是私密凭据，留在 secrets.json）
-      "baseUrl": "https://mmgrcalltoken.3g.qq.com/aizone/v1"
     }
   }
 }
 ```
 
-> `preferredProvider` 此前文档误标"已废弃无实际作用"，现更正：由 `server.preferredProvider` 承载并生效（被模型映射消费）。
+> **只剩这三个键。** 早期这里还有四个键（选择默认 provider、legacy 大中小模型名、copilot 配置、qclaw baseUrl），它们随 legacy 单端口模式一并删除，已不在 `DEFAULT_SERVER_CONFIG` 中；旧配置里残留会被深合并逻辑静默丢弃，不报错。
+>
+> 原 copilot 段的 GHE host / integration id / 大中小模型名已**函数化**（`gateways/copilot.py` 的 `_copilot_api_base()` / `_copilot_integration_id()` / `_copilot_*_model()`），每次调用从 copilot target（8082/8083）的 `targetHost` / `extraHeaders` / `modelRoles` 实时推导；原 qclaw 段的 baseUrl 同理由 qclaw target 的 `targetHost` 承载。两者都不再需要独立配置项。
 
 ### 全量配置导出/导入（v2）
 
@@ -341,7 +327,7 @@ dashboard「聚合网关」分组的 8080 卡片由前端 `loadAggregateStatus()
 
 - **命中且 `target.port` 等于请求到达的端口** → 只改写模型名继续原上游转发
 - **命中且指向另一端口**（含聚合网关 `agg:xxx`）→ 整体改路由到该端口
-- **未命中** → 8081 走 `modelDefaults.defaultPort` 原样透传模型名（直连端口未命中 = 原样透传给自己上游）
+- **未命中** → 8081 直接返回 404（legacy 单端口模式下线后不再有兜底路径，模型必须先在 `models[]` 里配路由）；直连端口未命中则原样透传模型名给自己上游
 
 示例（targets.json 顶层）：
 
@@ -374,7 +360,7 @@ dashboard「聚合网关」分组的 8080 卡片由前端 `loadAggregateStatus()
 | handler | 行为 |
 |---------|------|
 | `passthrough` | 原样透传（注入认证 + 可选模型映射） |
-| `copilot` | 模型映射（opus/sonnet/haiku → COPILOT_*_MODEL）+ `Copilot-Integration-Id` + body 清理 |
+| `copilot` | 模型映射（opus/sonnet/haiku → 从 target 的 `modelRoles` 实时推导）+ `Copilot-Integration-Id` + body 清理 |
 | `qclaw` | 去前缀、自动补 system message、body 清理、注入 `User-Agent: OpenAI/JS 6.39.1` |
 | `gemini-native` | **OpenAI ↔ Gemini 原生转换**（见下） |
 

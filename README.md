@@ -29,19 +29,17 @@ A proxy server that exposes one Anthropic-compatible entry (8081) plus one OpenA
 3. **Create `targets.json`** (port/provider/category/handler/model config) and `secrets.json` (private tokens, gitignored).
    See [docs/architecture.md](docs/architecture.md) for the full schema.
 
-4. **(Optional) Add a top-level `server` section to `targets.json`** for global runtime settings. The whole section and any of its keys can be omitted, in which case defaults apply:
+4. **(Optional) Add a top-level `server` section to `targets.json`** for global runtime settings. Only three keys remain; the whole section and any of its keys can be omitted, in which case defaults apply:
 
    | Key | Default | Was |
    |-----|---------|-----|
    | `listenPort` | `8081` | `ANTHROPIC_PORT` |
-   | `preferredProvider` | `"openai"` | `PREFERRED_PROVIDER` (still consumed by model mapping) |
-   | `legacyModels` `{big, medium, small}` | `gpt-4.1` / `gpt-4.1` / `gpt-4.1-mini` | `BIG_MODEL` / `MEDIUM_MODEL` / `SMALL_MODEL` |
    | `log` `{debug, file, retentionDays, rotateWhen, rotateInterval}` | `false` / `""` / `7` / `"midnight"` / `1` | `DEBUG` / `LOG_FILE` / `LOG_RETENTION_DAYS` / `LOG_ROTATE_WHEN` / `LOG_ROTATE_INTERVAL` |
    | `cache` `{enabled, maxSize, ttlSeconds, maxItemSizeKb}` | `true` / `500` / `3600` / `100` | `CACHE_ENABLED` / `CACHE_MAX_SIZE` / `CACHE_TTL_SECONDS` / `CACHE_MAX_ITEM_SIZE_KB` |
-   | `copilot` `{gheHost, integrationId, bigModel, mediumModel, smallModel}` | `copilot-api.bmw.ghe.com` / `copilot-developer-cli` / `claude-sonnet-4.6` / `claude-sonnet-4.6` / `claude-haiku-4.5` | `COPILOT_GHE_HOST` / `COPILOT_INTEGRATION_ID` / `COPILOT_BIG\|MEDIUM\|SMALL_MODEL` |
-   | `qclaw` `{baseUrl}` | `https://mmgrcalltoken.3g.qq.com/aizone/v1` | `QCLAW_BASE_URL` |
 
    > `.env` has been removed (backup `.env.bak`); its runtime config now lives in `targets.server`. Migrate an old `.env` with `scripts/migrate_env_to_targets.py`. Private tokens stay in `secrets.json`.
+   >
+   > Four keys that used to live here were dropped along with the legacy single-port mode. Leftovers in an existing config are silently ignored by the merge, not an error. Copilot's GHE host, integration id and model roles are now derived at call time from the copilot target's `targetHost` / `extraHeaders` / `modelRoles`, and QClaw's base URL from the qclaw target's `targetHost`. See [CHANGELOG.md](CHANGELOG.md) for the removal details.
 
 5. **Run the server**:
    ```bash
@@ -114,7 +112,7 @@ Windows Server 计划任务 + VBS + BAT 三层自启架构，启动脚本在 [`s
 
 ## How It Works 🧩
 
-1. **8081 (Anthropic)** 接收 `/v1/messages` → 翻译为 OpenAI 格式 → 内部请求 8082 → 译回 Anthropic
+1. **8081 (Anthropic)** takes `/v1/messages`, resolves the model against `models[]`, translates it to OpenAI format, forwards it to that local target port, then translates the reply back to Anthropic. A model that isn't in `models[]` gets a 404 (there is no fallback path). `/v1/messages/count_tokens` is a pure tiktoken estimate.
 2. **target 端口 (OpenAI)** 共享统一转发引擎：HTTP 解析 / 认证注入 / 路径重写 / 429 翻译 / 重试
 3. **gemini-native (8092)** 接受 OpenAI 请求，内部转换为 Google 原生 `generateContent` API
 4. **模型统计** 每个 target 按模型记录 请求/成功率/错误/429，dashboard 可视化

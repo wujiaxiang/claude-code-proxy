@@ -40,13 +40,15 @@ cd claude-code-proxy
 python3 -m venv .venv && .venv/bin/pip install -r requirements.txt   # 或 uv sync
 
 # 配置 targets.json（端口/供应商/分类/handler/模型）与 secrets.json（token）
-# 运行配置（可选）写进 targets.json 顶层 server 段：listenPort / preferredProvider / legacyModels / log / cache / copilot / qclaw
+# 运行配置（可选）写进 targets.json 顶层 server 段，只剩三个键：listenPort / log / cache
 # .env 已废弃删除（备份 .env.bak），旧部署用 scripts/migrate_env_to_targets.py 迁移进 server 段
 
 .venv/bin/python server.py   # 启动 8081 + targets.json 定义的全部端口
 ```
 
-> 端口-供应商绑定由 `targets.json` 决定。`preferredProvider` 现由 `targets.json` 顶层 `server.preferredProvider` 承载（默认 `openai`），仍被模型映射消费以决定默认 provider 归属。
+> 端口-供应商绑定由 `targets.json` 决定。8081 的模型路由由顶层 `models[]` 决定（模型 → 端口 + 下游模型名），没配的模型直接 404。
+>
+> legacy 单端口模式（按环境变量选 provider + LiteLLM 翻译）已彻底下线，相关的四个 server 段旧键一并删除；残留在旧配置里也只会被静默忽略，不报错。
 
 ## 客户端接入
 
@@ -94,7 +96,7 @@ api_key  = dummy（crack 类）；真实 key（free/paid 透传）
 | Sonnet 系列 | `MEDIUM_MODEL` | `modelMapping.sonnet` |
 | Haiku 系列 | `SMALL_MODEL` | `modelMapping.haiku` |
 
-基于**子串包含**匹配，短名 `sonnet` / `haiku` / `opus` 也有效。copilot 使用 `COPILOT_*_MODEL` 环境变量（见 docs/crack-tools.md）。
+基于**子串包含**匹配，短名 `sonnet` / `haiku` / `opus` 也有效。copilot 模型角色（opus/sonnet/haiku 对应的真实模型名）现从 copilot target（8082/8083）的 `modelRoles` 字段实时推导（见 `gateways/copilot.py` 的 `_copilot_*_model()`），不再使用环境变量。
 
 ## 调试
 
@@ -118,7 +120,7 @@ tail -f proxy.log
 
 ## 测试
 
-统一测试套件 [test_suite.py](test_suite.py)，整合自历史三个文件（`test_claude_api.py` / `test_messages_endpoint.py` / `tests.py`），覆盖翻译链路 `/v1/messages` 和透传链路 `/v1/chat/completions`。
+统一测试套件 [test_suite.py](test_suite.py)，整合自历史三个文件（`test_claude_api.py` / `test_messages_endpoint.py` / `tests.py`），覆盖 8081 的翻译链路 `/v1/messages` 和 target 端口的透传链路 `/v1/chat/completions`（注：8081 自身的 legacy `/v1/chat/completions` 端点已删除）。
 
 ```bash
 # 启动服务后运行全部测试（15 大类，38 个测试点）
@@ -131,16 +133,6 @@ python test_suite.py --oai          # 仅 OpenAI 透传端点
 python test_suite.py --no-streaming # 跳过流式测试
 ```
 
-环境变量可覆盖默认模型名（QClaw 模式用 `pool-*`）：
-
-```bash
-PREFERRED_PROVIDER=qclaw \
-BIG_MODEL=pool-glm-5.2 \
-MEDIUM_MODEL=pool-deepseek-v4-pro \
-SMALL_MODEL=pool-deepseek-v4-flash \
-python test_suite.py
-```
-
 测试覆盖：连通性、模型名还原、System Prompt、流式 SSE 事件序列、多轮对话、参数透传、Stop Sequences、Tools、Tool Choice、**Thinking**（adaptive/enabled/budget/历史 422 bug/工具组合）、Token 计数、错误处理、性能基准、**OpenAI `/v1/chat/completions` 透传端点**（11 个场景）。
 
 ---
@@ -149,23 +141,27 @@ python test_suite.py
 
 ```
 Claude Code / Cline
-  ──Anthropic 格式──▶ :8082/v1/messages
-                         │
-                         ├─ copilot       → httpx 透传 → Copilot Enterprise /v1/messages（零转换）
-                         ├─ anthropic     → LiteLLM → DeepSeek / Anthropic
-                         ├─ gemini        → LiteLLM → Gemini 原生
-                         ├─ gemini-openai → httpx   → Gemini OpenAI 端点
-                         ├─ openai        → LiteLLM → OpenAI / 兼容
-                         └─ qclaw         → LiteLLM → mmgrcalltoken.3g.qq.com（上游直连）
+  --Anthropic 格式--> :8081/v1/messages
+                         |
+                         |  查 models[]：模型 -> 端口 + 下游模型名
+                         |    命中   -> Anthropic->OpenAI 翻译 -> httpx 转发本地端口 -> 译回 Anthropic
+                         |    未命中 -> 404（无兜底路径）
+                         v
+                    本地 target 端口（8082~8094）
 
 任意 Agent / 自定义工具
-  ──OpenAI 格式──▶ :8082/v1/chat/completions
-                         │
-                         ├─ anthropic / gemini → LiteLLM（翻译模式）
-                         └─ qclaw / openai / copilot / gemini-openai → httpx（透传模式，直连上游）
+  --OpenAI 格式--> :8082 copilot-enterprise  -> httpx（部分模型走 Responses API 桥接）
+                   :8083 copilot             -> httpx（同上，个人版账号）
+                   :8084 codebuddy           -> httpx + body 清洗 / SSE 规范化 / 非流式聚合
+                   :8085 qclaw               -> httpx + body 白名单清洗 + Key 自动解密
+                   :8086 trae-work           -> OpenAI <-> llm_utils_chat 协议转换
+                   :8092 gemini              -> OpenAI <-> Gemini generateContent 原生转换
+                   :8090/8091/8093/8094      -> httpx 透传（客户端自带 key）
+
+                   :8080 aggregator          -> 虚拟模型路由 / 会话粘性 / 熔断降级 -> 上面各真实端口
 ```
 
-> **注：** Copilot provider 在两个端点上均使用 httpx 直连下游对应端点。`/v1/messages` → 下游 `/v1/messages`（Anthropic 原生 SSE），`/v1/chat/completions` → 下游 `/chat/completions`（OpenAI SSE）。完全绕过 LiteLLM，无协议翻译损耗。其他 provider 的 `/v1/messages` 仍走 LiteLLM 翻译。
+> **注：** 8081 只有这一条路径。按 provider 分流 + LiteLLM 翻译的 legacy 单端口模式已彻底删除，legacy `/v1/chat/completions` 端点也一并移除。`/v1/messages/count_tokens` 改用 tiktoken 本地估算，不再经任何翻译层。
 
 完整配置参考 `targets.json`（顶层 `server` 段为运行配置，`targets` 数组为 Target 定义）与 `secrets.json`（私密凭据），schema 见 [docs/architecture.md](docs/architecture.md)
 
