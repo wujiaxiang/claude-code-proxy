@@ -535,6 +535,15 @@ DASHBOARD_STYLE = """
   .trend-bar-col .tb-label { font-size: 10px; color: var(--text-tertiary); margin-top: 5px; font-family: var(--font-mono); font-variant-numeric: tabular-nums; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 100%; }
   .trend-bar-col .tb-count { font-size: 10px; color: var(--text-secondary); margin-bottom: 2px; font-family: var(--font-mono); font-variant-numeric: tabular-nums; }
   .trend-empty { font-size: 13px; color: var(--text-tertiary); font-style: italic; text-align: center; padding: 30px 0; }
+
+  /* ── 页面级 tab（统计 / 监控分开）── */
+  .page-tabs { display: flex; gap: 6px; margin-bottom: 18px; padding: 4px; background: rgba(13,13,20,0.6); border: 1px solid var(--border); border-radius: 12px; width: fit-content; }
+  .page-tab { font-size: 12.5px; font-weight: 600; letter-spacing: 0.3px; padding: 7px 18px; border-radius: 8px; border: 1px solid transparent; color: var(--text-tertiary); background: transparent; cursor: pointer; transition: all 0.18s ease; }
+  .page-tab:hover { color: var(--text-primary); background: rgba(148,163,184,0.08); }
+  .page-tab.active { color: #fff; background: linear-gradient(135deg, rgba(34,211,238,0.85), rgba(59,130,246,0.8)); box-shadow: 0 4px 14px rgba(34,211,238,0.25); }
+  .page-panel { display: none; }
+  .page-panel.active { display: block; }
+  @media (prefers-reduced-motion: reduce) { .page-tab { transition: none; } }
 """
 
 
@@ -1495,6 +1504,15 @@ async def dashboard():
 <body>
   <h1>🔀 LLM Gateway — 管理总览</h1>
   <div class="sub">8081 Anthropic 翻译入口（models[] 路由）→ 本地 target 端口 · 管理面 8079 · 统一 targets.json 驱动 <span class="refresh-time">· 手动刷新 · {datetime.now().strftime("%H:%M:%S")}</span></div>
+
+  <!-- 页面级 tab 栏（网关监控 / 用量统计 分开） -->
+  <div class="page-tabs" role="tablist">
+    <button class="page-tab active" data-tab="monitor" role="tab" aria-selected="true" onclick="switchPageTab('monitor')">网关监控</button>
+    <button class="page-tab" data-tab="stats" role="tab" aria-selected="false" onclick="switchPageTab('stats')">用量统计</button>
+  </div>
+
+  <!-- 监控面板（默认显示）：KPI + dangling-bar + 所有网关卡片 -->
+  <div class="page-panel active" id="panel-monitor">
   <div class="overview-bar">
     <div class="kpi-grid">
       <div class="kpi-card">
@@ -1531,11 +1549,16 @@ async def dashboard():
     <span id="ov-msg" class="ov-msg" role="status"></span>
   </div>
   <div class="dangling-bar" id="dangling-bar" role="status" aria-live="polite"></div>
+  {cards_html}
+  </div>
+
+  <!-- 统计面板（默认隐藏）：4 张趋势卡 -->
+  <div class="page-panel" id="panel-stats">
   {_trend_7_html}
   {_trend_30_html}
   {_anth_trend_html}
   {_agg_trend_html}
-  {cards_html}
+  </div>
 
   <!-- 模型编辑 modal -->
   <div class="modal-overlay" id="model-modal" role="dialog" aria-modal="true" aria-label="编辑模型展示">
@@ -1587,6 +1610,19 @@ async def dashboard():
 
 
 <script>
+// ── 页面级 tab 切换（网关监控 / 用量统计）──
+function switchPageTab(name) {{
+  var tabs = document.querySelectorAll('.page-tab');
+  for (var i = 0; i < tabs.length; i++) {{
+    tabs[i].classList.toggle('active', tabs[i].getAttribute('data-tab') === name);
+    tabs[i].setAttribute('aria-selected', tabs[i].getAttribute('data-tab') === name ? 'true' : 'false');
+  }}
+  var panels = document.querySelectorAll('.page-panel');
+  for (var j = 0; j < panels.length; j++) {{
+    panels[j].classList.toggle('active', panels[j].id === 'panel-' + name);
+  }}
+}}
+
 // ═══ 三个编辑 modal 共享基础设施（mm* 前缀，docs §2.2）═══
 // 统一消息提示：kind ∈ ok | warn | err | info
 function mmMsg(el, kind, text) {{
