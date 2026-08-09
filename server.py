@@ -409,6 +409,14 @@ async def lifespan(app):
         _flush_usage_accum()
     except Exception as _fe:
         logger.warning(f"usage final flush failed: {_fe}")
+    try:
+        _flush_anthropic_accum()
+    except Exception as _fe:
+        logger.warning(f"anthropic usage final flush failed: {_fe}")
+    try:
+        _flush_aggregator_accum()
+    except Exception as _fe:
+        logger.warning(f"aggregator usage final flush failed: {_fe}")
 
     # 停掉透明反代服务器
     for srv in _target_servers.values():
@@ -512,12 +520,52 @@ def _load_token_saver_cfg(anthropic_target) -> None:
 _USAGE_TARGET_PSEUDO_MODEL = "__target__"
 _TODAY_ACCUM: Dict[str, Dict[Any, Dict[str, int]]] = {"targets": {}, "models": {}}
 
+# 8081 翻译入口独立统计累加器（落 anthropic_daily 表，与底层 usage_daily 隔离）
+# 为什么单独一张表：8081 是翻译入口，它的一次请求会在下游 target 端口再记一次；
+# 混进 usage_daily 会双计。独立表让 dashboard 能分别展示"入口视角"与"端口视角"。
+_ANTHROPIC_ACCUM: Dict[str, int] = {"totalRequests": 0, "passthroughOk": 0, "passthroughError": 0}
+
+# 8080 聚合网关独立统计累加器（落 aggregator_daily 表；member 用 "port:model" 字符串做 key）
+# key=(vm_id, "port:model")；由 engine.note_request 经 _bump_aggregator_usage 旁路灌入。
+_AGGREGATOR_ACCUM: Dict[tuple, Dict[str, Any]] = {}
+
 
 def _bump_usage_target(label: str, field: str, n: int = 1):
     """累加 target 维度用量（label 级汇总）。旁路观测，绝不因异常影响主链路。"""
     try:
         d = _TODAY_ACCUM["targets"].setdefault(label, {"totalRequests": 0, "translated429": 0})
         d[field] = d.get(field, 0) + n
+    except Exception:
+        pass
+
+
+def _bump_anthropic_usage(field: str, n: int = 1):
+    """累加 8081 翻译入口用量。旁路观测，绝不因异常影响主链路。"""
+    try:
+        _ANTHROPIC_ACCUM[field] = _ANTHROPIC_ACCUM.get(field, 0) + n
+    except Exception:
+        pass
+
+
+def _bump_aggregator_usage(vm_id, port, model, outcome, error_type):
+    """聚合网关 note_request 旁路累加（engine.py 调用）。旁路观测，异常绝不回抛。"""
+    try:
+        if not vm_id:
+            return
+        key = (str(vm_id), f"{port}:{model}")
+        d = _AGGREGATOR_ACCUM.setdefault(key, {
+            "requests": 0, "ok": 0, "degraded": 0, "err": 0,
+            "error_types": {}, "latency_sum_ms": 0, "latency_count": 0,
+        })
+        d["requests"] += 1
+        if outcome == "ok":
+            d["ok"] += 1
+        elif outcome == "degraded":
+            d["degraded"] += 1
+        else:
+            d["err"] += 1
+            if error_type:
+                d["error_types"][str(error_type)] = d["error_types"].get(str(error_type), 0) + 1
     except Exception:
         pass
 
@@ -560,6 +608,36 @@ def _flush_usage_accum(ustore=None) -> int:
     return written
 
 
+def _flush_anthropic_accum() -> int:
+    """把 _ANTHROPIC_ACCUM 增量 UPSERT 进 anthropic_daily；swap-then-write。"""
+    global _ANTHROPIC_ACCUM
+    if not any(_ANTHROPIC_ACCUM.values()):
+        return 0
+    from gateways import usage_store as _ustore
+    accum = dict(_ANTHROPIC_ACCUM)
+    _ANTHROPIC_ACCUM = {"totalRequests": 0, "passthroughOk": 0, "passthroughError": 0}
+    from datetime import date as _date
+    if _ustore.upsert_anthropic_day(_date.today().isoformat(), accum):
+        return 1
+    return 0
+
+
+def _flush_aggregator_accum() -> int:
+    """把 _AGGREGATOR_ACCUM 增量 UPSERT 进 aggregator_daily；swap-then-write。"""
+    if not _AGGREGATOR_ACCUM:
+        return 0
+    from gateways import usage_store as _ustore
+    from datetime import date as _date
+    accum = dict(_AGGREGATOR_ACCUM)
+    _AGGREGATOR_ACCUM.clear()
+    today = _date.today().isoformat()
+    written = 0
+    for (vm_id, member), delta in accum.items():
+        if _ustore.upsert_aggregator_day(today, vm_id, member, delta):
+            written += 1
+    return written
+
+
 async def _usage_flush_loop():
     """每 60s 把 _TODAY_ACCUM 增量 UPSERT 进 SQLite；异常仅 warning 不中断循环。"""
     from gateways import usage_store as _ustore
@@ -569,6 +647,14 @@ async def _usage_flush_loop():
             _flush_usage_accum(_ustore)
         except Exception as e:
             logger.warning(f"usage flush loop error: {e}")
+        try:
+            _flush_anthropic_accum()
+        except Exception as e:
+            logger.warning(f"anthropic usage flush loop error: {e}")
+        try:
+            _flush_aggregator_accum()
+        except Exception as e:
+            logger.warning(f"aggregator usage flush loop error: {e}")
 
 
 def _first_enabled_target_with_handler(handler: str) -> Optional[dict]:
@@ -639,15 +725,18 @@ def _bump_model_stats(label: str, model: str, outcome: str):
     if outcome in s:
         s[outcome] += 1
     # 同步累加进持久化累加器（进程重启会清零的 _MODEL_STATS 之外的落盘副本）
-    try:
-        a = _TODAY_ACCUM["models"].setdefault(
-            (label, model), {"requests": 0, "ok": 0, "err": 0, "translated429": 0}
-        )
-        a["requests"] += 1
-        if outcome in a:
-            a[outcome] += 1
-    except Exception:
-        pass
+    # 8081（label="anthropic"）跳过：它是翻译入口，有独立 anthropic_daily 存储，
+    # 混入 usage_daily 会与下游端口转发重复计数（设计：独立存储不混写）。
+    if label != "anthropic":
+        try:
+            a = _TODAY_ACCUM["models"].setdefault(
+                (label, model), {"requests": 0, "ok": 0, "err": 0, "translated429": 0}
+            )
+            a["requests"] += 1
+            if outcome in a:
+                a[outcome] += 1
+        except Exception:
+            pass
 
 
 # ─── HTTP 代理共享工具函数（所有端口统一用，不要各写各的） ───
@@ -1192,7 +1281,10 @@ async def _handle_target_request(reader, writer, target):  # pyright: ignore[rep
             writer.close(); return
 
         stats["totalRequests"] += 1
-        _bump_usage_target(label, "totalRequests")
+        # 8080 聚合网关的端口级统计走独立的 _AGGREGATOR_ACCUM → aggregator_daily，
+        # 不进 usage_daily（否则与它转发到的下游真实端口重复计数）。
+        if target.get("handler") != "aggregator":
+            _bump_usage_target(label, "totalRequests")
 
         # ── qclaw /v1/models：上游（mmgrcalltoken.3g.qq.com）不提供 /models 接口，
         #    转发会得到 404，导致 opencode 等客户端拉不到模型列表。这里直接返回
@@ -1435,7 +1527,8 @@ async def _handle_target_request(reader, writer, target):  # pyright: ignore[rep
             if mapped is not None:
                 target_status, err_type = mapped
                 stats["translated429"] += 1
-                _bump_usage_target(label, "translated429")
+                if target.get("handler") != "aggregator":
+                    _bump_usage_target(label, "translated429")
                 if _req_model:
                     _bump_model_stats(label, _req_model, "translated429")
                 logger.info(f"[{label}] translated HTTP {status} → {target_status} ({err_type})")
@@ -1695,12 +1788,14 @@ async def log_requests(request: Request, call_next):
         except Exception:
             pass
         _ANTHROPIC_STATS["totalRequests"] += 1
+        _bump_anthropic_usage("totalRequests")
 
     response = await call_next(request)
 
     if path == "/v1/messages" and method == "POST":
         outcome = "ok" if response.status_code < 400 else "err"
         _ANTHROPIC_STATS["passthroughOk" if outcome == "ok" else "passthroughError"] += 1
+        _bump_anthropic_usage("passthroughOk" if outcome == "ok" else "passthroughError")
         _bump_model_stats("anthropic", req_model, outcome)
 
     if response.status_code >= 400:

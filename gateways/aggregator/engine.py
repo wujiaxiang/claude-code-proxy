@@ -375,7 +375,7 @@ class AggregatorEngine:
             except Exception as e:  # noqa: BLE001 - 成员失败即重试，非本引擎逻辑错误
                 last_error = e
                 tried_ports.add(member.port)
-                self.note_request(member, "err", (self._clock() - start) * 1000)
+                self.note_request(member, "err", (self._clock() - start) * 1000, vm_id=virtual_model_id)
                 continue
 
             latency_ms = (self._clock() - start) * 1000
@@ -391,7 +391,7 @@ class AggregatorEngine:
             # D. 成功（2xx / 无状态码）—— 唯一成功路径
             if classification == "success":
                 tried_ports.add(member.port)
-                self.note_request(member, "ok", latency_ms)
+                self.note_request(member, "ok", latency_ms, vm_id=virtual_model_id)
                 # 首次建立粘性，或粘性成员失败后换到了新成员 → 重新生根到当前成功成员
                 if not was_sticky or member != original_sticky_member:
                     self._set_sticky(virtual_model_id, session_id, member)
@@ -406,7 +406,7 @@ class AggregatorEngine:
                 )
                 tried_ports.add(member.port)
                 self.trip(member.port, reason)
-                self.note_request(member, "err", latency_ms, error_type=reason)
+                self.note_request(member, "err", latency_ms, error_type=reason, vm_id=virtual_model_id)
                 last_error = RuntimeError(f"{reason} on port {member.port}")
                 continue
 
@@ -415,7 +415,7 @@ class AggregatorEngine:
                 #     （限流会自行恢复，trip 300s 会误伤共享该端口的其他虚拟模型/会话）
                 if status_code == 429:
                     tried_ports.add(member.port)
-                    self.note_request(member, "err", latency_ms, error_type="429_rate_limit")
+                    self.note_request(member, "err", latency_ms, error_type="429_rate_limit", vm_id=virtual_model_id)
                     last_error = RuntimeError(f"429_rate_limit on port {member.port}")
                     continue
 
@@ -427,10 +427,10 @@ class AggregatorEngine:
                     # 重新选中同一端口，真实实现"同端点重试 1 次"语义
                     tried_ports.discard(member.port)
                     candidates_order.insert(0, member)
-                    self.note_request(member, "err", latency_ms, error_type=f"{status_code}_transient")
+                    self.note_request(member, "err", latency_ms, error_type=f"{status_code}_transient", vm_id=virtual_model_id)
                     continue
                 tried_ports.add(member.port)
-                self.note_request(member, "err", latency_ms, error_type="5xx_persistent")
+                self.note_request(member, "err", latency_ms, error_type="5xx_persistent", vm_id=virtual_model_id)
                 last_error = RuntimeError(f"5xx_persistent on port {member.port}")
                 continue
 
@@ -444,7 +444,7 @@ class AggregatorEngine:
                     f"body_prefix={body_text[:200]!r}"
                 )
             tried_ports.add(member.port)
-            self.note_request(member, "err", latency_ms, error_type=classification)
+            self.note_request(member, "err", latency_ms, error_type=classification, vm_id=virtual_model_id)
             return member, result
 
         # 降级池：与默认池使用完全一致的 classify_failure 五分类语义
@@ -476,7 +476,7 @@ class AggregatorEngine:
                 except Exception as e:  # noqa: BLE001
                     last_error = e
                     fb_tried.add(member.port)
-                    self.note_request(member, "err", (self._clock() - start) * 1000)
+                    self.note_request(member, "err", (self._clock() - start) * 1000, vm_id=virtual_model_id)
                     continue
 
                 latency_ms = (self._clock() - start) * 1000
@@ -492,7 +492,7 @@ class AggregatorEngine:
                 # D. 成功（2xx / 无状态码）—— 降级池成功记 degraded，且不更新会话粘性
                 if classification == "success":
                     fb_tried.add(member.port)
-                    self.note_request(member, "degraded", latency_ms)
+                    self.note_request(member, "degraded", latency_ms, vm_id=virtual_model_id)
                     return member, result
 
                 # A. 凭据/配额类失败：熔断该端口 + 换端点
@@ -504,7 +504,7 @@ class AggregatorEngine:
                     )
                     fb_tried.add(member.port)
                     self.trip(member.port, reason)
-                    self.note_request(member, "err", latency_ms, error_type=reason)
+                    self.note_request(member, "err", latency_ms, error_type=reason, vm_id=virtual_model_id)
                     last_error = RuntimeError(f"{reason} on port {member.port}")
                     continue
 
@@ -512,7 +512,7 @@ class AggregatorEngine:
                     # B1. 429 账号级限流：立刻换端点，但绝不熔断
                     if status_code == 429:
                         fb_tried.add(member.port)
-                        self.note_request(member, "err", latency_ms, error_type="429_rate_limit")
+                        self.note_request(member, "err", latency_ms, error_type="429_rate_limit", vm_id=virtual_model_id)
                         last_error = RuntimeError(f"429_rate_limit on port {member.port}")
                         continue
 
@@ -522,10 +522,10 @@ class AggregatorEngine:
                     if count == 1:
                         fb_tried.discard(member.port)
                         fb_candidates_order.insert(0, member)
-                        self.note_request(member, "err", latency_ms, error_type=f"{status_code}_transient")
+                        self.note_request(member, "err", latency_ms, error_type=f"{status_code}_transient", vm_id=virtual_model_id)
                         continue
                     fb_tried.add(member.port)
-                    self.note_request(member, "err", latency_ms, error_type="5xx_persistent")
+                    self.note_request(member, "err", latency_ms, error_type="5xx_persistent", vm_id=virtual_model_id)
                     last_error = RuntimeError(f"5xx_persistent on port {member.port}")
                     continue
 
@@ -539,7 +539,7 @@ class AggregatorEngine:
                         f"body_prefix={body_text[:200]!r}"
                     )
                 fb_tried.add(member.port)
-                self.note_request(member, "err", latency_ms, error_type=classification)
+                self.note_request(member, "err", latency_ms, error_type=classification, vm_id=virtual_model_id)
                 return member, result
 
         raise AllPoolsExhausted(
@@ -578,7 +578,13 @@ class AggregatorEngine:
             return ""
 
     def note_request(
-        self, member: PoolMember, outcome: str, latency_ms: float, error_type: str | None = None
+        self,
+        member: PoolMember,
+        outcome: str,
+        latency_ms: float,
+        error_type: str | None = None,
+        *,
+        vm_id: str | None = None,
     ) -> None:
         stats = self._stats.setdefault(member.key, MemberStats())
         stats.requests += 1
@@ -592,6 +598,13 @@ class AggregatorEngine:
                 stats.error_types[error_type] = stats.error_types.get(error_type, 0) + 1
         stats.latency_sum_ms += latency_ms
         stats.latency_count += 1
+
+        # 旁路：同步累加进 server._AGGREGATOR_ACCUM（异常绝不影响主链路；与 server._bump_model_stats 同风格）
+        try:
+            import server as _srv
+            _srv._bump_aggregator_usage(vm_id, member.port, member.model, outcome, error_type)
+        except Exception:
+            pass
 
     def session_stats(self) -> dict:
         hit_rate = self._session_hits / self._session_lookups if self._session_lookups else 0.0

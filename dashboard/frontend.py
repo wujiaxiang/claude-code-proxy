@@ -990,9 +990,14 @@ async def dashboard():
         from gateways import usage_store as _usage_store
         _trend_7 = _usage_store.get_trend(7) or {}
         _trend_30 = _usage_store.get_trend(30) or {}
+        # 8081 翻译入口 / 8080 聚合网关的独立趋势
+        _anth_trend = _usage_store.get_anthropic_trend(7) or {}
+        _agg_trend = _usage_store.get_aggregator_trend(7) or {}
     except Exception:
         _trend_7 = {}
         _trend_30 = {}
+        _anth_trend = {}
+        _agg_trend = {}
 
     def _build_trend_html(trend_data, days_label):
         """把 get_trend(days) 返回的 {date:{requests,ok,err,...}} 渲染为趋势卡 HTML。"""
@@ -1051,6 +1056,142 @@ async def dashboard():
 
     _trend_7_html = _build_trend_html(_trend_7, 7)
     _trend_30_html = _build_trend_html(_trend_30, 30)
+
+    # ── 8081 翻译入口 / 8080 聚合网关独立趋势卡（复用 .trend-card 样式）──
+    def _build_anth_trend_html(trend_data):
+        if not trend_data:
+            return (
+                '<div class="trend-card">'
+                '  <div class="trend-head">'
+                '    <span class="trend-title">8081 翻译入口（近 7 天）</span>'
+                '  </div>'
+                '  <div class="trend-empty">暂无数据</div>'
+                '</div>'
+            )
+        items = sorted(trend_data.items())
+        total_req = sum(int(v.get('total_requests', 0)) for _, v in items)
+        total_ok = sum(int(v.get('passthrough_ok', 0)) for _, v in items)
+        total_err = sum(int(v.get('passthrough_error', 0)) for _, v in items)
+        max_req = max((int(v.get('total_requests', 0)) for _, v in items), default=0)
+        max_req = max(max_req, 1)
+        total_html = (
+            '<div class="trend-summary">'
+            '  <div class="ts-item"><span class="ts-label">总请求</span><span class="ts-value grad">' + str(total_req) + '</span><span class="ts-sub">total_requests</span></div>'
+            '  <div class="ts-item"><span class="ts-label">成功</span><span class="ts-value">' + str(total_ok) + '</span><span class="ts-sub">passthrough_ok</span></div>'
+            '  <div class="ts-item"><span class="ts-label">失败</span><span class="ts-value">' + str(total_err) + '</span><span class="ts-sub">passthrough_error</span></div>'
+            '  <div class="ts-item"><span class="ts-label">覆盖天数</span><span class="ts-value">' + str(len(items)) + '</span><span class="ts-sub">有记录的日期</span></div>'
+            '</div>'
+        )
+        bars_html = '<div class="trend-bars">'
+        for date_str, info in items:
+            req = int(info.get('total_requests', 0))
+            height_pct = round(req / max_req * 100) if max_req > 0 else 0
+            short_date = date_str[5:] if len(date_str) >= 5 else date_str
+            bar_cls = 'tb-bar zero' if req == 0 else 'tb-bar'
+            bars_html += (
+                '<div class="trend-bar-col" title="' + str(date_str) + ': ' + str(req) + ' 请求">'
+                '  <span class="tb-count">' + str(req) + '</span>'
+                '  <div class="tb-bar-wrap">'
+                '    <div class="' + bar_cls + '" style="height:' + str(height_pct) + '%"></div>'
+                '  </div>'
+                '  <span class="tb-label">' + short_date + '</span>'
+                '</div>'
+            )
+        bars_html += '</div>'
+        return (
+            '<div class="trend-card">'
+            '  <div class="trend-head">'
+            '    <span class="trend-title">8081 翻译入口（近 7 天）</span>'
+            '  </div>'
+            + total_html
+            + '<div class="trend-period"><div class="tp-title">按日趋势</div>'
+            + bars_html
+            + '</div>'
+            '</div>'
+        )
+
+    def _build_agg_trend_html(trend_data):
+        if not trend_data:
+            return (
+                '<div class="trend-card">'
+                '  <div class="trend-head">'
+                '    <span class="trend-title">8080 聚合网关（近 7 天）</span>'
+                '  </div>'
+                '  <div class="trend-empty">暂无数据</div>'
+                '</div>'
+            )
+        items = sorted(trend_data.items())
+        total_req = sum(int(v.get('requests', 0)) for _, v in items)
+        total_ok = sum(int(v.get('ok', 0)) for _, v in items)
+        total_err = sum(int(v.get('err', 0)) for _, v in items)
+        total_degraded = sum(int(v.get('degraded', 0)) for _, v in items)
+        max_req = max((int(v.get('requests', 0)) for _, v in items), default=0)
+        max_req = max(max_req, 1)
+        # 合并 error_types 分布
+        _err_dist = {}
+        for _, v in items:
+            et = v.get('error_types') or {}
+            if isinstance(et, dict):
+                for ek, ev in et.items():
+                    try:
+                        _err_dist[ek] = _err_dist.get(ek, 0) + int(ev)
+                    except Exception:
+                        pass
+        total_html = (
+            '<div class="trend-summary">'
+            '  <div class="ts-item"><span class="ts-label">总请求</span><span class="ts-value grad">' + str(total_req) + '</span><span class="ts-sub">requests</span></div>'
+            '  <div class="ts-item"><span class="ts-label">成功</span><span class="ts-value">' + str(total_ok) + '</span><span class="ts-sub">ok</span></div>'
+            '  <div class="ts-item"><span class="ts-label">降级</span><span class="ts-value">' + str(total_degraded) + '</span><span class="ts-sub">degraded</span></div>'
+            '  <div class="ts-item"><span class="ts-label">失败</span><span class="ts-value">' + str(total_err) + '</span><span class="ts-sub">err</span></div>'
+            '</div>'
+        )
+        # 错误类型分布块（纯文本列表，复用 trend-period 区域）
+        if _err_dist:
+            _err_lines = ''.join(
+                '<span style="margin-right:14px;">' + _html_escape(str(k)) + ': ' + str(int(v)) + '</span>'
+                for k, v in sorted(_err_dist.items(), key=lambda x: -x[1])
+            )
+            _err_block = (
+                '<div class="trend-period" style="border-top:1px dashed rgba(148,163,184,0.15); margin-top:10px; padding-top:10px;">'
+                '<div class="tp-title">错误类型分布</div>'
+                '<div style="font-size:12px; color:var(--text-secondary); font-family:var(--font-mono); word-break:break-all;">'
+                + _err_lines
+                + '</div>'
+                '</div>'
+            )
+        else:
+            _err_block = ''
+        bars_html = '<div class="trend-bars">'
+        for date_str, info in items:
+            req = int(info.get('requests', 0))
+            height_pct = round(req / max_req * 100) if max_req > 0 else 0
+            short_date = date_str[5:] if len(date_str) >= 5 else date_str
+            bar_cls = 'tb-bar zero' if req == 0 else 'tb-bar'
+            bars_html += (
+                '<div class="trend-bar-col" title="' + str(date_str) + ': ' + str(req) + ' 请求">'
+                '  <span class="tb-count">' + str(req) + '</span>'
+                '  <div class="tb-bar-wrap">'
+                '    <div class="' + bar_cls + '" style="height:' + str(height_pct) + '%"></div>'
+                '  </div>'
+                '  <span class="tb-label">' + short_date + '</span>'
+                '</div>'
+            )
+        bars_html += '</div>'
+        return (
+            '<div class="trend-card">'
+            '  <div class="trend-head">'
+            '    <span class="trend-title">8080 聚合网关（近 7 天）</span>'
+            '  </div>'
+            + total_html
+            + '<div class="trend-period"><div class="tp-title">按日趋势</div>'
+            + bars_html
+            + '</div>'
+            + _err_block
+            + '</div>'
+         )
+
+    _anth_trend_html = _build_anth_trend_html(_anth_trend)
+    _agg_trend_html = _build_agg_trend_html(_agg_trend)
 
     # ── 局域网 IP（可粘贴 base_url 用）──
     _lan_ip = _get_lan_ip()
@@ -1365,6 +1506,8 @@ async def dashboard():
   <div class="dangling-bar" id="dangling-bar" role="status" aria-live="polite"></div>
   {_trend_7_html}
   {_trend_30_html}
+  {_anth_trend_html}
+  {_agg_trend_html}
   {cards_html}
 
   <!-- 模型编辑 modal -->

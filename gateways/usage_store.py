@@ -11,6 +11,7 @@
 #
 # 跨模块约定（AGENTS.md §7）：对 server 的共享依赖用函数内延迟导入；此处再包一层
 # try/except fallback，保证无 server 运行时（纯单测）也能独立 `import gateways.usage_store`。
+import json
 import logging
 import os
 import sqlite3
@@ -47,6 +48,39 @@ CREATE TABLE IF NOT EXISTS usage_daily (
 )
 """
 
+_CREATE_TABLE_ANTHROPIC_SQL = """
+CREATE TABLE IF NOT EXISTS anthropic_daily (
+  date TEXT NOT NULL,
+  total_requests INTEGER NOT NULL DEFAULT 0,
+  passthrough_ok INTEGER NOT NULL DEFAULT 0,
+  passthrough_error INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (date)
+)
+"""
+
+_CREATE_TABLE_AGGREGATOR_SQL = """
+CREATE TABLE IF NOT EXISTS aggregator_daily (
+  date TEXT NOT NULL,
+  vm_id TEXT NOT NULL,
+  member TEXT NOT NULL,
+  requests INTEGER NOT NULL DEFAULT 0,
+  ok INTEGER NOT NULL DEFAULT 0,
+  degraded INTEGER NOT NULL DEFAULT 0,
+  err INTEGER NOT NULL DEFAULT 0,
+  error_types TEXT NOT NULL DEFAULT '{}',
+  latency_sum_ms INTEGER NOT NULL DEFAULT 0,
+  latency_count INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (date, vm_id, member)
+)
+"""
+
+# 三条建表语句集合（init_db 一次性建齐）
+_ALL_CREATE_TABLE_SQL = (
+    _CREATE_TABLE_SQL,
+    _CREATE_TABLE_ANTHROPIC_SQL,
+    _CREATE_TABLE_AGGREGATOR_SQL,
+)
+
 
 def _log():
     """取 server 的 logger；无 server 运行时（单测）回落到本地 logger。
@@ -76,13 +110,14 @@ def _connect() -> Optional[sqlite3.Connection]:
 
 
 def init_db() -> bool:
-    """确保 .cache 目录与 usage_daily 表存在。幂等；失败降级返回 False。"""
+    """确保 .cache 目录与全部三张表（usage_daily / anthropic_daily / aggregator_daily）存在。幂等；失败降级返回 False。"""
     conn = None
     try:
         conn = _connect()
         assert conn is not None
         with conn:
-            conn.execute(_CREATE_TABLE_SQL)
+            for sql in _ALL_CREATE_TABLE_SQL:
+                conn.execute(sql)
         return True
     except Exception as e:
         _log().warning(f"usage_store: init_db failed ({USAGE_DB_PATH}): {e}")
@@ -166,6 +201,221 @@ def get_trend(days: int) -> Dict[str, Dict[str, int]]:
         return out
     except Exception as e:
         _log().warning(f"usage_store: get_trend failed (days={days}): {e}")
+        return {}
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+
+# ───────────────────────────── anthropic_daily ─────────────────────────────
+# 8081 翻译入口按天一行的统计：total_requests / passthrough_ok / passthrough_error。
+# delta 键：totalRequests / passthroughOk / passthroughError（驼峰，与 server 侧命名一致）。
+
+def upsert_anthropic_day(date: str, delta: Dict[str, Any]) -> bool:
+    """按主键 (date) UPSERT 累加 8081 入口统计。
+
+    delta 键：totalRequests / passthroughOk / passthroughError。缺失按 0。
+    失败降级返回 False。
+    """
+    delta = delta or {}
+    total = _int(delta.get("totalRequests"))
+    ok = _int(delta.get("passthroughOk"))
+    err = _int(delta.get("passthroughError"))
+    sql = (
+        "INSERT INTO anthropic_daily (date, total_requests, passthrough_ok, passthrough_error)"
+        " VALUES (?, ?, ?, ?)"
+        " ON CONFLICT(date) DO UPDATE SET"
+        " total_requests = anthropic_daily.total_requests + excluded.total_requests,"
+        " passthrough_ok = anthropic_daily.passthrough_ok + excluded.passthrough_ok,"
+        " passthrough_error = anthropic_daily.passthrough_error + excluded.passthrough_error"
+    )
+    conn = None
+    try:
+        conn = _connect()
+        assert conn is not None
+        with conn:
+            conn.execute(_CREATE_TABLE_ANTHROPIC_SQL)
+            conn.execute(sql, [date, total, ok, err])
+        return True
+    except Exception as e:
+        _log().warning(f"usage_store: upsert_anthropic_day failed (date={date}): {e}")
+        return False
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+
+def get_anthropic_trend(days: int) -> Dict[str, Dict[str, int]]:
+    """读 8081 入口最近 N 天（含今天不含未来）按日统计。
+
+    返回 {date: {total_requests, passthrough_ok, passthrough_error}} 升序。
+    无数据或异常返回 {}。
+    """
+    try:
+        n = max(1, int(days))
+    except (TypeError, ValueError):
+        n = 1
+    sql = (
+        "SELECT date, total_requests, passthrough_ok, passthrough_error FROM anthropic_daily"
+        " WHERE date >= date('now', 'localtime', ?) AND date <= date('now', 'localtime')"
+        " ORDER BY date ASC"
+    )
+    _FIELDS = ("total_requests", "passthrough_ok", "passthrough_error")
+    conn = None
+    try:
+        conn = _connect()
+        assert conn is not None
+        with conn:
+            conn.execute(_CREATE_TABLE_ANTHROPIC_SQL)
+            rows = conn.execute(sql, (f"-{n - 1} day",)).fetchall()
+        out: Dict[str, Dict[str, int]] = {}
+        for row in rows:
+            out[row[0]] = {f: _int(row[i + 1]) for i, f in enumerate(_FIELDS)}
+        return out
+    except Exception as e:
+        _log().warning(f"usage_store: get_anthropic_trend failed (days={days}): {e}")
+        return {}
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+
+# ──────────────────────────── aggregator_daily ─────────────────────────────
+# 8080 聚合网关按 (date, vm_id, member) 一行的统计。
+# delta 键：requests / ok / degraded / err / error_types(dict) / latency_sum_ms / latency_count。
+
+def _merge_error_types(existing_json: str, delta: Dict[str, Any]) -> str:
+    """把现有 error_types JSON 与 delta 的 dict 逐 key 累加，返回合并后的 JSON 字符串。"""
+    merged: Dict[str, int] = {}
+    try:
+        existing = json.loads(existing_json) if existing_json else {}
+        if isinstance(existing, dict):
+            for k, v in existing.items():
+                merged[str(k)] = _int(v)
+    except Exception:
+        merged = {}
+    for k, v in (delta or {}).items():
+        merged[str(k)] = merged.get(str(k), 0) + _int(v)
+    return json.dumps(merged, ensure_ascii=False)
+
+
+def upsert_aggregator_day(date: str, vm_id: str, member: str, delta: Dict[str, Any]) -> bool:
+    """按主键 (date, vm_id, member) UPSERT 累加 8080 聚合网关统计。
+
+    delta 键：requests / ok / degraded / err / error_types(dict) / latency_sum_ms / latency_count。
+    error_types 为 dict，DB 中以 JSON 存；累加时读取原值逐 key 合并后整体替换。
+    失败降级返回 False。
+    """
+    delta = delta or {}
+    requests = _int(delta.get("requests"))
+    ok = _int(delta.get("ok"))
+    degraded = _int(delta.get("degraded"))
+    err = _int(delta.get("err"))
+    latency_sum = _int(delta.get("latency_sum_ms"))
+    latency_count = _int(delta.get("latency_count"))
+    delta_err_types = delta.get("error_types") if isinstance(delta.get("error_types"), dict) else {}
+
+    conn = None
+    try:
+        conn = _connect()
+        assert conn is not None
+        with conn:
+            conn.execute(_CREATE_TABLE_AGGREGATOR_SQL)
+            # 读取原 error_types 以合并累加
+            cur = conn.execute(
+                "SELECT error_types FROM aggregator_daily WHERE date=? AND vm_id=? AND member=?",
+                (date, vm_id, member),
+            ).fetchone()
+            existing_json = cur[0] if cur else "{}"
+            merged_err_types = _merge_error_types(existing_json, delta_err_types or {})
+            conn.execute(
+                "INSERT INTO aggregator_daily"
+                " (date, vm_id, member, requests, ok, degraded, err, error_types, latency_sum_ms, latency_count)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+                " ON CONFLICT(date, vm_id, member) DO UPDATE SET"
+                " requests = aggregator_daily.requests + excluded.requests,"
+                " ok = aggregator_daily.ok + excluded.ok,"
+                " degraded = aggregator_daily.degraded + excluded.degraded,"
+                " err = aggregator_daily.err + excluded.err,"
+                " error_types = excluded.error_types,"
+                " latency_sum_ms = aggregator_daily.latency_sum_ms + excluded.latency_sum_ms,"
+                " latency_count = aggregator_daily.latency_count + excluded.latency_count",
+                [date, vm_id, member, requests, ok, degraded, err, merged_err_types,
+                 latency_sum, latency_count],
+            )
+        return True
+    except Exception as e:
+        _log().warning(
+            f"usage_store: upsert_aggregator_day failed (date={date} vm={vm_id} member={member}): {e}"
+        )
+        return False
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+
+def get_aggregator_trend(days: int) -> Dict[str, Dict[str, Any]]:
+    """读 8080 聚合网关最近 N 天（含今天不含未来）按日聚合（跨 vm/member 行合并）。
+
+    返回 {date: {requests, ok, degraded, err, error_types(合并 dict), latency_sum_ms, latency_count}}
+    升序；error_types 各行的 JSON 解析后逐 key 合并。无数据或异常返回 {}。
+    """
+    try:
+        n = max(1, int(days))
+    except (TypeError, ValueError):
+        n = 1
+    sql = (
+        "SELECT date, requests, ok, degraded, err, error_types, latency_sum_ms, latency_count"
+        " FROM aggregator_daily"
+        " WHERE date >= date('now', 'localtime', ?) AND date <= date('now', 'localtime')"
+        " ORDER BY date ASC"
+    )
+    conn = None
+    try:
+        conn = _connect()
+        assert conn is not None
+        with conn:
+            conn.execute(_CREATE_TABLE_AGGREGATOR_SQL)
+            rows = conn.execute(sql, (f"-{n - 1} day",)).fetchall()
+        out: Dict[str, Dict[str, Any]] = {}
+        for row in rows:
+            d = row[0]
+            if d not in out:
+                out[d] = {
+                    "requests": 0, "ok": 0, "degraded": 0, "err": 0,
+                    "error_types": {}, "latency_sum_ms": 0, "latency_count": 0,
+                }
+            agg = out[d]
+            agg["requests"] += _int(row[1])
+            agg["ok"] += _int(row[2])
+            agg["degraded"] += _int(row[3])
+            agg["err"] += _int(row[4])
+            agg["latency_sum_ms"] += _int(row[6])
+            agg["latency_count"] += _int(row[7])
+            # error_types JSON 逐 key 合并
+            try:
+                et = json.loads(row[5]) if row[5] else {}
+                if isinstance(et, dict):
+                    for k, v in et.items():
+                        k = str(k)
+                        agg["error_types"][k] = agg["error_types"].get(k, 0) + _int(v)
+            except Exception:
+                pass
+        return out
+    except Exception as e:
+        _log().warning(f"usage_store: get_aggregator_trend failed (days={days}): {e}")
         return {}
     finally:
         if conn is not None:

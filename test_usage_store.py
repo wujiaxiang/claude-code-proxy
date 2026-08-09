@@ -61,6 +61,17 @@ def _table_columns(db_path):
     return [r[1] for r in rows]
 
 
+def _all_tables(db_path):
+    conn = sqlite3.connect(db_path)
+    try:
+        rows = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'"
+        ).fetchall()
+    finally:
+        conn.close()
+    return {r[0] for r in rows}
+
+
 def _day_offset(n):
     """今天往前 n 天的 YYYY-MM-DD。"""
     return (datetime.date.today() - datetime.timedelta(days=n)).isoformat()
@@ -194,6 +205,129 @@ def test_e_standalone_import_and_path_contract():
             usage_store.init_db()
         assert not os.path.exists(real_db), \
             f"测试不得创建真实库文件: {real_db}"
+
+
+# ─── (f) init_db 建全部三张表 ───
+def test_f_init_db_creates_all_three_tables():
+    with _TempDb() as t:
+        assert usage_store.init_db() is True, "init_db 应返回 True"
+        tables = _all_tables(t.db_path)
+        for required in ("usage_daily", "anthropic_daily", "aggregator_daily"):
+            assert required in tables, f"缺表 {required}，实际: {sorted(tables)}"
+        # 幂等：重复 init_db 不报错、不丢数据
+        usage_store.upsert_anthropic_day("2026-05-01", {"totalRequests": 1})
+        usage_store.upsert_aggregator_day("2026-05-01", "agg:sonnet", "copilot", {"requests": 1})
+        assert usage_store.init_db() is True, "重复 init_db 应仍返回 True"
+        at = usage_store.get_anthropic_trend(3650)
+        assert at.get("2026-05-01", {}).get("total_requests") == 1, f"anthropic 数据不应丢: {at}"
+        agt = usage_store.get_aggregator_trend(3650)
+        assert agt.get("2026-05-01", {}).get("requests") == 1, f"aggregator 数据不应丢: {agt}"
+
+
+# ─── (g) upsert_anthropic_day 同 key 累加 ───
+def test_g_upsert_anthropic_day_accumulates():
+    with _TempDb():
+        usage_store.init_db()
+        day = "2026-06-06"
+        assert usage_store.upsert_anthropic_day(
+            day, {"totalRequests": 1, "passthroughOk": 1, "passthroughError": 0}
+        ) is True, "首次 upsert_anthropic_day 应返回 True"
+        usage_store.upsert_anthropic_day(
+            day, {"totalRequests": 1, "passthroughOk": 0, "passthroughError": 1}
+        )
+        row = usage_store.get_anthropic_trend(3650)[day]
+        assert row["total_requests"] == 2, f"total_requests 应 2，实际 {row['total_requests']}"
+        assert row["passthrough_ok"] == 1, f"passthrough_ok 应 1，实际 {row['passthrough_ok']}"
+        assert row["passthrough_error"] == 1, f"passthrough_error 应 1，实际 {row['passthrough_error']}"
+        # 缺省字段按 0
+        usage_store.upsert_anthropic_day(day, {"totalRequests": 5})
+        row2 = usage_store.get_anthropic_trend(3650)[day]
+        assert row2["total_requests"] == 7, f"total_requests 应 7，实际 {row2['total_requests']}"
+        assert row2["passthrough_ok"] == 1, f"未提供的 passthrough_ok 不应变，实际 {row2['passthrough_ok']}"
+
+
+# ─── (h) upsert_aggregator_day 累加 + error_types 合并 ───
+def test_h_upsert_aggregator_day_accumulates_and_merges_error_types():
+    with _TempDb():
+        usage_store.init_db()
+        day, vm, mem = "2026-07-07", "agg:opus", "qclaw"
+        assert usage_store.upsert_aggregator_day(
+            day, vm, mem,
+            {"requests": 1, "ok": 1, "degraded": 0, "err": 0,
+             "error_types": {"429": 1}, "latency_sum_ms": 200, "latency_count": 1},
+        ) is True, "首次 upsert_aggregator_day 应返回 True"
+        usage_store.upsert_aggregator_day(
+            day, vm, mem,
+            {"requests": 1, "ok": 0, "degraded": 1, "err": 1,
+             "error_types": {"429": 2, "timeout": 1}, "latency_sum_ms": 300, "latency_count": 1},
+        )
+        row = usage_store.get_aggregator_trend(3650)[day]
+        assert row["requests"] == 2, f"requests 应 2，实际 {row['requests']}"
+        assert row["ok"] == 1, f"ok 应 1，实际 {row['ok']}"
+        assert row["degraded"] == 1, f"degraded 应 1，实际 {row['degraded']}"
+        assert row["err"] == 1, f"err 应 1，实际 {row['err']}"
+        assert row["latency_sum_ms"] == 500, f"latency_sum_ms 应 500，实际 {row['latency_sum_ms']}"
+        assert row["latency_count"] == 2, f"latency_count 应 2，实际 {row['latency_count']}"
+        assert row["error_types"] == {"429": 3, "timeout": 1}, \
+            f"error_types 应合并为 {{'429':3,'timeout':1}}，实际 {row['error_types']}"
+        # 不同 vm/member 同 date 在汇总时相加（error_types 也逐 key 合并）
+        usage_store.upsert_aggregator_day(
+            day, "agg:opus", "copilot",
+            {"requests": 3, "ok": 3, "error_types": {"429": 1}},
+        )
+        row2 = usage_store.get_aggregator_trend(3650)[day]
+        assert row2["requests"] == 5, f"跨 member 应聚合为 5，实际 {row2['requests']}"
+        assert row2["error_types"] == {"429": 4, "timeout": 1}, \
+            f"error_types 跨 member 应合并，实际 {row2['error_types']}"
+
+
+# ─── (i) get_anthropic_trend / get_aggregator_trend 窗口与升序 ───
+def test_i_trends_window_and_ordering():
+    with _TempDb():
+        usage_store.init_db()
+        ad0, ad1, ad3 = _day_offset(0), _day_offset(1), _day_offset(3)
+        # anthropic 两张不同日期
+        usage_store.upsert_anthropic_day(ad3, {"totalRequests": 3})
+        usage_store.upsert_anthropic_day(ad1, {"totalRequests": 2})
+        usage_store.upsert_anthropic_day(ad0, {"totalRequests": 1})
+        at = usage_store.get_anthropic_trend(2)
+        assert set(at) == {ad0, ad1}, f"anthropic 2 天窗口应含 {ad0},{ad1}，实际 {list(at)}"
+        assert list(at.keys()) == sorted(at.keys()), f"anthropic 应升序，实际 {list(at.keys())}"
+        # aggregator
+        usage_store.upsert_aggregator_day(ad3, "vm", "m", {"requests": 30})
+        usage_store.upsert_aggregator_day(ad1, "vm", "m", {"requests": 20})
+        usage_store.upsert_aggregator_day(ad0, "vm", "m", {"requests": 10})
+        agt = usage_store.get_aggregator_trend(2)
+        assert set(agt) == {ad0, ad1}, f"aggregator 2 天窗口应含 {ad0},{ad1}，实际 {list(agt)}"
+        assert agt[ad0]["requests"] == 10
+        assert agt[ad1]["requests"] == 20
+        # 更大窗口能取到更早数据
+        assert ad3 in usage_store.get_aggregator_trend(10), "10 天窗口应含 3 天前数据"
+        assert ad3 in usage_store.get_anthropic_trend(10), "10 天窗口应含 3 天前 anthropic 数据"
+
+
+def test_i2_new_trends_empty_and_degraded():
+    with _TempDb():
+        usage_store.init_db()
+        assert usage_store.get_anthropic_trend(7) == {}, "无数据 anthropic 应返回 {}"
+        assert usage_store.get_aggregator_trend(7) == {}, "无数据 aggregator 应返回 {}"
+    # 不可用路径降级
+    tmpdir = tempfile.mkdtemp(prefix="usage_store_test_bad2_")
+    orig = usage_store.USAGE_DB_PATH
+    try:
+        blocker = os.path.join(tmpdir, "blocker")
+        with open(blocker, "w") as f:
+            f.write("x")
+        usage_store.USAGE_DB_PATH = os.path.join(blocker, "sub", "usage.db")
+        assert usage_store.upsert_anthropic_day("2026-01-01", {"totalRequests": 1}) is False, \
+            "不可用路径 upsert_anthropic_day 应降级 False"
+        assert usage_store.upsert_aggregator_day("2026-01-01", "vm", "m", {"requests": 1}) is False, \
+            "不可用路径 upsert_aggregator_day 应降级 False"
+        assert usage_store.get_anthropic_trend(7) == {}, "不可用路径 get_anthropic_trend 应 {}"
+        assert usage_store.get_aggregator_trend(7) == {}, "不可用路径 get_aggregator_trend 应 {}"
+    finally:
+        usage_store.USAGE_DB_PATH = orig
+        shutil.rmtree(tmpdir, ignore_errors=True)
 
 
 def main():

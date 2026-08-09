@@ -377,7 +377,16 @@ dashboard「聚合网关」分组的 8080 卡片由前端 `loadAggregateStatus()
 除各端口 handler 对应的网关注册（`server.py` 的 `_HANDLER_PATH_MAP` / `_HANDLE_TARGET_REQUEST`）外，代理还包含若干**旁路/支撑模块**，放在 `gateways/` 下，遵循 AGENTS.md §7 的跨模块约定（函数内延迟导入 + `import server as _srv` 访问热重载全局，旁路模块用 `sys.modules.get("server")` 探测复用 logger，绝不首次拉起 server）：
 
 - **gateways/rtk.py** — RTK token-saver（9Router `open-sse/rtk` 的 Python 移植，MIT，纯标准库）。在 Anthropic→OpenAI 翻译**前**确定性压缩超长 `tool_result`（头 120 行 + 尾 60 行，中段替换为 `... +N lines truncated` 标记），降 prompt token 消耗。只碰 `tool_result`，`text`/`thinking`/`tool_use` 一律零改动；常量 `RAW_CAP=10MiB` / `MIN_COMPRESS_SIZE=500` / `SMART_TRUNCATE_HEAD=120` / `TAIL=60` / `MIN_LINES=250`。**安全护栏**：`is_error=True` 的 tool_result 不压缩；过小（字节 < 500 或行数 < 250）/ 过大（> 10MiB）/ 压缩失败 / 压完变空或没变短 → 原样透传；所有异常静默 `pass`，绝不崩请求。开关为 8081 anthropic target 的 `tokenSaver: {enabled, minSize, maxSize}`（**默认关闭**，`enabled` 布尔、`minSize`/`maxSize` 字节阈值备用）；入口在 `anthropic_convert.convert_anthropic_request_to_openai` 翻译前注入，日志 `[RTK] saved XB / YB (Z%) via [smart-truncate] hits=N`。
-- **gateways/usage_store.py** — 用量统计 SQLite 持久化（纯标准库 `sqlite3`，WAL，无第三方依赖）。把内存统计异步落盘，进程重启不丢。落盘路径 `.cache/usage.db`（表 `usage_daily`，主键 `(date, label, model)`，含 `requests/ok/err/translated429/prompt_tokens/completion_tokens`，无 cost 列、无 key/token/请求体）。公开函数 `init_db()` / `upsert_day()` / `get_trend(days)`：每个函数开头自愈建表，调用方漏调 `init_db()` 也不炸。flush 机制由 `server.py` 承担：内存 `_TODAY_ACCUM` 累加 → 60s 周期 `_usage_flush_loop` UPSERT（swap-then-write 防丢增量）+ 退出前 `_flush_usage_accum` 兜底。dashboard 新增「近 7 天 / 近 30 天请求量」趋势卡片（`get_trend(7)` / `get_trend(30)` 读取，渲染在 `dashboard/frontend.py` 的 `_build_trend_html`）。**降级**：DB 故障仅 `logger.warning`，返回 `False`/`{}`，不影响主请求链路。
+- **gateways/usage_store.py** — 用量统计 SQLite 持久化（纯标准库 `sqlite3`，WAL，无第三方依赖）。内存统计异步落盘，进程重启不丢。落盘路径 `.cache/usage.db`，`init_db()` 一次性建**三张表**（每个函数也自愈建表，漏调 `init_db()` 不炸）。**三表独立存储，刻意分离**（8081 会把请求转发到下游端口，若与 usage_daily 混写会双计；8080 聚合请求同理会落到多个成员端口，混写同样双计）：
+  - `usage_daily`（既有）：主键 `(date, label, model)`，列 `requests/ok/err/translated429/prompt_tokens/completion_tokens`。底层端口（8082-8095）直连请求落这里。
+  - `anthropic_daily`（新）：主键 `(date)`，列 `total_requests/passthrough_ok/passthrough_error`。**8081 翻译入口独立统计**，与 usage_daily 隔离。
+  - `aggregator_daily`（新）：主键 `(date, vm_id, member)`，列 `requests/ok/degraded/err/error_types(latency_sum_ms/latency_count)`，`error_types` 为 JSON（`upsert_aggregator_day` 做 JSON 合并）。**8080 聚合网关独立统计**，与 usage_daily 隔离；`member` 是落库前由 PoolMember 的 `(port, model)` 元组转成的 `"port:model"` 字符串（对齐 `get_stats` 格式）。
+  - 公开函数：`init_db()` / `upsert_day()` / `get_trend(days)`（usage_daily）+ `upsert_anthropic_day()` / `get_anthropic_trend(days)`（anthropic_daily）+ `upsert_aggregator_day()` / `get_aggregator_trend(days)`（aggregator_daily）。无 cost 列、无 key/token/请求体。
+  - **写入链路**：
+    - 8081：`server.py` `_ANTHROPIC_ACCUM` 累加 → `_flush_anthropic_accum()`（60s `_usage_flush_loop` + 退出前 lifespan 兜底）→ `upsert_anthropic_day`。
+    - 8080：`engine.py` `note_request` 旁路（14 处调用点传 `vm_id=virtual_model_id`，末尾调 `_srv._bump_aggregator_usage`）→ `server.py` `_AGGREGATOR_ACCUM` → `_flush_aggregator_accum()`（同周期 + 兜底）→ `upsert_aggregator_day`。
+  - dashboard 趋势卡：`usage_daily` → 「近 7/30 天请求量」（`_build_trend_html`）；`anthropic_daily` → 「8081 翻译入口」（`_build_anth_trend_html`，`get_anthropic_trend(7)`）；`aggregator_daily` → 「8080 聚合网关」（`_build_agg_trend_html`，`get_aggregator_trend(7)`）。
+  - **降级**：DB 故障仅 `logger.warning`，返回 `False`/`{}`，不影响主请求链路。
 
 ## handler 分发
 
