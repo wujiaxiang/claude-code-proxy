@@ -485,8 +485,10 @@ _TARGETS: list = []
 _MODEL_REGISTRY = None  # P2: ModelRegistry 内存索引，热重载时重建（dashboard 渲染消费的单一事实源）
 _SECRETS: dict = {}
 _TARGET_STATS: Dict[str, dict] = {}
-# 模型级统计：{ label: { model_name: {"requests": N, "ok": N, "err": N, "translated429": N} } }
-_MODEL_STATS: Dict[str, Dict[str, Dict[str, int]]] = {}
+# 模型级统计：{ label: { model_name: {"requests": N, "ok": N, "err": N, "translated429": N,
+#                                     "error_types": {分类标签: N}} } }
+# 值类型是 int | dict：计数字段为 int，error_types 是嵌套直方图（由 _bump_model_error 维护）。
+_MODEL_STATS: Dict[str, Dict[str, Dict[str, Any]]] = {}
 # 模型别名/转发目标配置（targets.json 顶层 models[] + modelDefaults）
 _MODELS_CFG: dict = {"models": [], "modelDefaults": {"defaultPort": 8082}}
 
@@ -514,11 +516,13 @@ def _load_token_saver_cfg(anthropic_target) -> None:
 #
 # 结构（两个维度，落库时都写进同一张 usage_daily 表）：
 #   _TODAY_ACCUM["targets"][label]         = {"totalRequests": N, "translated429": N}
-#   _TODAY_ACCUM["models"][(label, model)] = {"requests": N, "ok": N, "err": N, "translated429": N}
+#   _TODAY_ACCUM["models"][(label, model)] = {"requests": N, "ok": N, "err": N, "translated429": N,
+#                                              "error_types": {分类标签: N}}
+# models 维度的值类型是 int | dict（error_types 为嵌套直方图，由 _bump_model_error 维护）。
 # targets 维度落为 model="__target__" 的伪行（刻意不给表加列——总请求数在 get_trend
 # 里就是该 label 下所有行 requests 之和，含 __target__ 行）。
 _USAGE_TARGET_PSEUDO_MODEL = "__target__"
-_TODAY_ACCUM: Dict[str, Dict[Any, Dict[str, int]]] = {"targets": {}, "models": {}}
+_TODAY_ACCUM: Dict[str, Dict[Any, Dict[str, Any]]] = {"targets": {}, "models": {}}
 
 # 8081 翻译入口独立统计累加器（落 anthropic_daily 表，与底层 usage_daily 隔离）
 # 为什么单独一张表：8081 是翻译入口，它的一次请求会在下游 target 端口再记一次；
@@ -737,6 +741,50 @@ def _bump_model_stats(label: str, model: str, outcome: str):
                 a[outcome] += 1
         except Exception:
             pass
+
+
+def _classify_http_error(status_code: int) -> str:
+    """状态码 → 错误分类标签（对齐聚合网关 error_types 命名风格）。"""
+    if status_code == 401:
+        return "401_auth"
+    if status_code == 402:
+        return "402_billing"
+    if status_code == 403:
+        return "403_forbidden"
+    if status_code == 429:
+        return "429_rate_limit"
+    if 400 <= status_code < 500:
+        return f"{status_code}_client"
+    if 500 <= status_code < 600:
+        return f"{status_code}_server"
+    return f"http_{status_code}"
+
+
+def _bump_model_error(label: str, model, error_type: str) -> None:
+    """记录模型级错误分类。旁路观测，异常绝不回抛。
+
+    与 _bump_model_stats 并列调用（不改后者签名）：后者管 requests/ok/err/translated429
+    计数，本函数只往 error_types 直方图里加一笔。model 可能为 None（错误发生在解析
+    请求体之前）→ 统一归到 "_unknown"，调用点无需判空。
+    """
+    try:
+        if not error_type:
+            return
+        mid = model or "_unknown"
+        ms = _MODEL_STATS.setdefault(label, {}).setdefault(
+            mid, {"requests": 0, "ok": 0, "err": 0, "translated429": 0, "error_types": {}}
+        )
+        ms.setdefault("error_types", {})
+        ms["error_types"][error_type] = ms["error_types"].get(error_type, 0) + 1
+        # 持久化累加器（label="anthropic" 跳过——8081 有独立 anthropic_daily，不混写）
+        if label != "anthropic":
+            a = _TODAY_ACCUM["models"].setdefault(
+                (label, mid), {"requests": 0, "ok": 0, "err": 0, "translated429": 0, "error_types": {}}
+            )
+            a.setdefault("error_types", {})
+            a["error_types"][error_type] = a["error_types"].get(error_type, 0) + 1
+    except Exception:
+        pass
 
 
 # ─── HTTP 代理共享工具函数（所有端口统一用，不要各写各的） ───
@@ -1202,6 +1250,10 @@ async def _handle_target_request(reader, writer, target):  # pyright: ignore[rep
         "passthroughOk": 0, "passthroughError": 0,
         "startedAt": datetime.now().isoformat(),
     })
+    # 在 try 之前绑定：下方各 except 分支的 _bump_model_error 都会读它，而请求体解析
+    # （真正赋值处）在 try 内部靠后位置——若异常发生在赋值之前，except 里读未绑定局部变量
+    # 会抛 UnboundLocalError，把错误处理路径本身打断（连 502/503 都写不出去）。
+    _req_model = None
     try:
         # 可变状态对象：跟踪响应 headers 是否已写入下游（用于流式中途异常时避免二次写状态行）
         write_state = {"headers_sent": False}
@@ -1531,6 +1583,7 @@ async def _handle_target_request(reader, writer, target):  # pyright: ignore[rep
                     _bump_usage_target(label, "translated429")
                 if _req_model:
                     _bump_model_stats(label, _req_model, "translated429")
+                _bump_model_error(label, _req_model, "429_rate_limit")
                 logger.info(f"[{label}] translated HTTP {status} → {target_status} ({err_type})")
                 err_payload = json.dumps({
                     "error": {
@@ -1551,9 +1604,12 @@ async def _handle_target_request(reader, writer, target):  # pyright: ignore[rep
             else:
                 if _req_model:
                     _bump_model_stats(label, _req_model, "ok" if resp.status_code < 400 else "err")
+                if resp.status_code >= 400:
+                    _bump_model_error(label, _req_model, _classify_http_error(resp.status_code))
                 await _write_response(writer, resp, stats=stats, write_state=write_state)
     except (httpx.ConnectError, httpx.ConnectTimeout, httpx.ReadError) as exc:
         stats["passthroughError"] += 1
+        _bump_model_error(label, _req_model, "connect_fail")
         logger.exception(f"[{label}] upstream connect failed")
         if write_state.get("headers_sent"):
             logger.warning(f"[{label}] stream aborted mid-transfer after headers sent, closing connection: {exc}")
@@ -1568,6 +1624,7 @@ async def _handle_target_request(reader, writer, target):  # pyright: ignore[rep
                 pass
     except httpx.ReadTimeout as exc:
         stats["passthroughError"] += 1
+        _bump_model_error(label, _req_model, "read_timeout")
         logger.exception(f"[{label}] upstream read timeout")
         if write_state.get("headers_sent"):
             logger.warning(f"[{label}] stream aborted mid-transfer after headers sent, closing connection: {exc}")
@@ -1582,6 +1639,7 @@ async def _handle_target_request(reader, writer, target):  # pyright: ignore[rep
                 pass
     except httpx.RemoteProtocolError as exc:
         stats["passthroughError"] += 1
+        _bump_model_error(label, _req_model, "protocol_error")
         logger.exception(f"[{label}] upstream protocol error")
         if write_state.get("headers_sent"):
             logger.warning(f"[{label}] stream aborted mid-transfer after headers sent, closing connection: {exc}")
@@ -1604,6 +1662,7 @@ async def _handle_target_request(reader, writer, target):  # pyright: ignore[rep
             pass
     except Exception:
         stats["passthroughError"] += 1
+        _bump_model_error(label, _req_model, "internal_error")
         logger.exception(f"[{label}] target proxy exception")
         if write_state.get("headers_sent"):
             logger.warning(f"[{label}] stream aborted mid-transfer after headers sent, closing connection")

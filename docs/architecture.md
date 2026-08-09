@@ -378,7 +378,20 @@ dashboard「聚合网关」分组的 8080 卡片由前端 `loadAggregateStatus()
 
 - **gateways/rtk.py** — RTK token-saver（9Router `open-sse/rtk` 的 Python 移植，MIT，纯标准库）。在 Anthropic→OpenAI 翻译**前**确定性压缩超长 `tool_result`（头 120 行 + 尾 60 行，中段替换为 `... +N lines truncated` 标记），降 prompt token 消耗。只碰 `tool_result`，`text`/`thinking`/`tool_use` 一律零改动；常量 `RAW_CAP=10MiB` / `MIN_COMPRESS_SIZE=500` / `SMART_TRUNCATE_HEAD=120` / `TAIL=60` / `MIN_LINES=250`。**安全护栏**：`is_error=True` 的 tool_result 不压缩；过小（字节 < 500 或行数 < 250）/ 过大（> 10MiB）/ 压缩失败 / 压完变空或没变短 → 原样透传；所有异常静默 `pass`，绝不崩请求。开关为 8081 anthropic target 的 `tokenSaver: {enabled, minSize, maxSize}`（**默认关闭**，`enabled` 布尔、`minSize`/`maxSize` 字节阈值备用）；入口在 `anthropic_convert.convert_anthropic_request_to_openai` 翻译前注入，日志 `[RTK] saved XB / YB (Z%) via [smart-truncate] hits=N`。
 - **gateways/usage_store.py** — 用量统计 SQLite 持久化（纯标准库 `sqlite3`，WAL，无第三方依赖）。内存统计异步落盘，进程重启不丢。落盘路径 `.cache/usage.db`，`init_db()` 一次性建**三张表**（每个函数也自愈建表，漏调 `init_db()` 不炸）。**三表独立存储，刻意分离**（8081 会把请求转发到下游端口，若与 usage_daily 混写会双计；8080 聚合请求同理会落到多个成员端口，混写同样双计）：
-  - `usage_daily`（既有）：主键 `(date, label, model)`，列 `requests/ok/err/translated429/prompt_tokens/completion_tokens`。底层端口（8082-8095）直连请求落这里。
+  - `usage_daily`（既有）：主键 `(date, label, model)`，列 `requests/ok/err/translated429/prompt_tokens/completion_tokens/error_types`。底层端口（8082-8095）直连请求落这里。
+  - **错误分类采集（error_types）**：底层网关错误从"只有 err 总数"升级为**分类直方图**。
+    - `server.py` `_classify_http_error(status_code)`：把 HTTP 状态码映射为分类标签，`401_auth` / `402_billing` / `403_forbidden` / `429_rate_limit` / `{code}_client`（4xx 其它）/ `{code}_server`（5xx）/ `http_{code}`（非标准码）。
+    - `server.py` `_bump_model_error(label, model, error_type)`：往内存 `_MODEL_STATS` 与持久化 `_TODAY_ACCUM` 的 `error_types` 直方图各加一笔（label="anthropic" 跳过，沿用 8081 独立存储不混写的约定）。`model` 为 `None` 时归到 `_unknown`，调用点无需判空。旁路观测，异常绝不回抛。
+    - **6 处采集点**（`_HANDLE_TARGET_REQUEST` 的转发/异常处理分支）：
+      1. `429_rate_limit`：上游限流被翻译为 429 时（L1586）
+      2. `_classify_http_error(resp.status_code)`：响应 4xx/5xx（L1608）
+      3. `connect_fail`：上游连接失败 `ConnectError/ConnectTimeout/ReadError`（L1612）
+      4. `read_timeout`：上游读取超时 `ReadTimeout`（L1627）
+      5. `protocol_error`：上游协议错误 `RemoteProtocolError`（L1642）
+      6. `internal_error`：其余未捕获异常（L1665）
+      > 客户端提前断开（`ConnectionResetError`/`RuntimeError`，headers 已提交）**不计**错误分类，仅关连接。
+    - **落库**：`usage_daily` 新增 `error_types TEXT NOT NULL` 列（含 `ALTER TABLE` 幂等迁移 + 自愈建表）；`upsert_day` 的 `error_types`（dict）走独立合并路径，读原值逐 key 累加后整体替换；`get_trend` 返回聚合后的 `error_types`（跨同日多行 `label/model` 逐 key 合并）。当前仅做**卡片级汇总**（dashboard 聚合并Card所有模型的 error_types），不提供模型级下钻分布。
+  - **展示**：dashboard 卡片详情新增「错误类型分布」块（见 frontend.py 卡片渲染，聚合该端口所有模型的 `error_types`，按计数降序排列；分布为空时不渲染该块）。
   - `anthropic_daily`（新）：主键 `(date)`，列 `total_requests/passthrough_ok/passthrough_error`。**8081 翻译入口独立统计**，与 usage_daily 隔离。
   - `aggregator_daily`（新）：主键 `(date, vm_id, member)`，列 `requests/ok/degraded/err/error_types(latency_sum_ms/latency_count)`，`error_types` 为 JSON（`upsert_aggregator_day` 做 JSON 合并）。**8080 聚合网关独立统计**，与 usage_daily 隔离；`member` 是落库前由 PoolMember 的 `(port, model)` 元组转成的 `"port:model"` 字符串（对齐 `get_stats` 格式）。
   - 公开函数：`init_db()` / `upsert_day()` / `get_trend(days)`（usage_daily）+ `upsert_anthropic_day()` / `get_anthropic_trend(days)`（anthropic_daily）+ `upsert_aggregator_day()` / `get_aggregator_trend(days)`（aggregator_daily）。无 cost 列、无 key/token/请求体。

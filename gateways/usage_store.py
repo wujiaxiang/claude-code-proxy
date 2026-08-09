@@ -44,6 +44,7 @@ CREATE TABLE IF NOT EXISTS usage_daily (
   translated429 INTEGER NOT NULL DEFAULT 0,
   prompt_tokens INTEGER NOT NULL DEFAULT 0,
   completion_tokens INTEGER NOT NULL DEFAULT 0,
+  error_types TEXT NOT NULL DEFAULT '{}',
   PRIMARY KEY (date, label, model)
 )
 """
@@ -118,6 +119,11 @@ def init_db() -> bool:
         with conn:
             for sql in _ALL_CREATE_TABLE_SQL:
                 conn.execute(sql)
+            # 既有库迁移：usage_daily 补 error_types 列（列已存在时 sqlite 抛 duplicate column，吞掉）
+            try:
+                conn.execute("ALTER TABLE usage_daily ADD COLUMN error_types TEXT NOT NULL DEFAULT '{}'")
+            except Exception:
+                pass
         return True
     except Exception as e:
         _log().warning(f"usage_store: init_db failed ({USAGE_DB_PATH}): {e}")
@@ -137,28 +143,57 @@ def _int(value: Any) -> int:
         return 0
 
 
+def _ensure_usage_error_types_column(conn: sqlite3.Connection) -> None:
+    """对既有 usage_daily 表补 error_types 列（列已存在时 sqlite 抛 duplicate column，吞掉）。
+
+    upsert_day 内联的 `CREATE TABLE IF NOT EXISTS` 不会给已存在的旧表补列，
+    故这里额外做一次 ALTER（幂等），保证运行时首次 upsert 也能写 error_types。
+    """
+    try:
+        conn.execute("ALTER TABLE usage_daily ADD COLUMN error_types TEXT NOT NULL DEFAULT '{}'")
+    except Exception:
+        pass
+
+
 def upsert_day(date: str, label: str, model: str, delta: Dict[str, Any]) -> bool:
     """按主键 (date, label, model) UPSERT 累加各计数。
 
-    delta 缺失的字段按 0 处理（不改动已有值）。失败降级返回 False。
+    delta 缺失的字段按 0 处理（不改动已有值）。
+    delta["error_types"]（dict）走独立路径：读原值逐 key 合并后整体替换（同
+    upsert_aggregator_day）；未提供或为空时不碰该列（保持现值 / 建表默认 '{}'）。
+    失败降级返回 False。
     """
     delta = delta or {}
     values = [_int(delta.get(f)) for f in _COUNTER_FIELDS]
-    sql = (
-        "INSERT INTO usage_daily (date, label, model, "
-        + ", ".join(_COUNTER_FIELDS)
-        + ") VALUES (?, ?, ?, "
-        + ", ".join("?" for _ in _COUNTER_FIELDS)
-        + ") ON CONFLICT(date, label, model) DO UPDATE SET "
-        + ", ".join(f"{f} = usage_daily.{f} + excluded.{f}" for f in _COUNTER_FIELDS)
-    )
+    delta_err_types = delta.get("error_types") if isinstance(delta.get("error_types"), dict) else {}
     conn = None
     try:
         conn = _connect()
         assert conn is not None
         with conn:
             conn.execute(_CREATE_TABLE_SQL)
-            conn.execute(sql, [date, label, model] + values)
+            _ensure_usage_error_types_column(conn)
+            cols: list = list(_COUNTER_FIELDS)
+            row_values: list = list(values)
+            updates = [f"{f} = usage_daily.{f} + excluded.{f}" for f in _COUNTER_FIELDS]
+            if delta_err_types:
+                cur = conn.execute(
+                    "SELECT error_types FROM usage_daily WHERE date=? AND label=? AND model=?",
+                    (date, label, model),
+                ).fetchone()
+                existing_json = cur[0] if cur else "{}"
+                cols.append("error_types")
+                row_values.append(_merge_error_types(existing_json, delta_err_types))
+                updates.append("error_types = excluded.error_types")
+            sql = (
+                "INSERT INTO usage_daily (date, label, model, "
+                + ", ".join(cols)
+                + ") VALUES (?, ?, ?, "
+                + ", ".join("?" for _ in cols)
+                + ") ON CONFLICT(date, label, model) DO UPDATE SET "
+                + ", ".join(updates)
+            )
+            conn.execute(sql, [date, label, model] + row_values)
         return True
     except Exception as e:
         _log().warning(f"usage_store: upsert_day failed (date={date} label={label} model={model}): {e}")
@@ -171,11 +206,15 @@ def upsert_day(date: str, label: str, model: str, delta: Dict[str, Any]) -> bool
                 pass
 
 
-def get_trend(days: int) -> Dict[str, Dict[str, int]]:
+def get_trend(days: int) -> Dict[str, Dict[str, Any]]:
     """读最近 N 天（含今天，不含未来）按日聚合的用量。
 
-    返回 {date: {requests, ok, err, translated429, prompt_tokens, completion_tokens}}，
-    按 date 升序。无数据或 DB 异常返回空 dict。
+    返回 {date: {requests, ok, err, translated429, prompt_tokens, completion_tokens,
+    error_types(合并 dict)}}，按 date 升序。无数据或 DB 异常返回空 dict。
+
+    error_types 不是数值列，不能 SUM——按 date 分组的多行 (label, model) 各自的
+    JSON 逐 key 合并（同 get_aggregator_trend），故这里不做 SQL GROUP BY，
+    改为按行读出后在 Python 侧聚合。
     """
     try:
         n = max(1, int(days))
@@ -183,10 +222,10 @@ def get_trend(days: int) -> Dict[str, Dict[str, int]]:
         n = 1
     sql = (
         "SELECT date, "
-        + ", ".join(f"SUM({f})" for f in _COUNTER_FIELDS)
-        + " FROM usage_daily"
+        + ", ".join(_COUNTER_FIELDS)
+        + ", error_types FROM usage_daily"
         " WHERE date >= date('now', 'localtime', ?) AND date <= date('now', 'localtime')"
-        " GROUP BY date ORDER BY date ASC"
+        " ORDER BY date ASC"
     )
     conn = None
     try:
@@ -194,10 +233,28 @@ def get_trend(days: int) -> Dict[str, Dict[str, int]]:
         assert conn is not None
         with conn:
             conn.execute(_CREATE_TABLE_SQL)
+            _ensure_usage_error_types_column(conn)
             rows = conn.execute(sql, (f"-{n - 1} day",)).fetchall()
-        out: Dict[str, Dict[str, int]] = {}
+        out: Dict[str, Dict[str, Any]] = {}
         for row in rows:
-            out[row[0]] = {f: _int(row[i + 1]) for i, f in enumerate(_COUNTER_FIELDS)}
+            d = row[0]
+            if d not in out:
+                agg: Dict[str, Any] = {f: 0 for f in _COUNTER_FIELDS}
+                agg["error_types"] = {}
+                out[d] = agg
+            agg = out[d]
+            for i, f in enumerate(_COUNTER_FIELDS):
+                agg[f] += _int(row[i + 1])
+            # error_types JSON 逐 key 合并（跨同日多行 label/model）
+            try:
+                raw = row[len(_COUNTER_FIELDS) + 1]
+                et = json.loads(raw) if raw else {}
+                if isinstance(et, dict):
+                    for k, v in et.items():
+                        k = str(k)
+                        agg["error_types"][k] = agg["error_types"].get(k, 0) + _int(v)
+            except Exception:
+                pass
         return out
     except Exception as e:
         _log().warning(f"usage_store: get_trend failed (days={days}): {e}")

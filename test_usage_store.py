@@ -330,6 +330,87 @@ def test_i2_new_trends_empty_and_degraded():
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 
+# ─── (j) upsert_day error_types 合并累加 ───
+def test_j_upsert_day_merges_error_types():
+    with _TempDb():
+        usage_store.init_db()
+        day, label, model = "2026-08-08", "copilot", "gpt-4o"
+        assert usage_store.upsert_day(
+            day, label, model,
+            {"requests": 1, "ok": 1, "error_types": {"5xx": 1}},
+        ) is True, "首次 upsert_day 应返回 True"
+        usage_store.upsert_day(
+            day, label, model,
+            {"requests": 1, "ok": 0, "error_types": {"5xx": 2, "timeout": 1}},
+        )
+        row = usage_store.get_trend(3650)[day]
+        assert row["requests"] == 2, f"requests 应 2，实际 {row['requests']}"
+        assert row["ok"] == 1, f"ok 应 1，实际 {row['ok']}"
+        assert row["error_types"] == {"5xx": 3, "timeout": 1}, \
+            f"error_types 应合并为 {{'5xx':3,'timeout':1}}，实际 {row['error_types']}"
+        # 同日跨 (label,model) 行在 get_trend 汇总时逐 key 合并
+        usage_store.upsert_day(
+            day, label, "glm-4",
+            {"requests": 2, "error_types": {"5xx": 4, "auth": 1}},
+        )
+        row2 = usage_store.get_trend(3650)[day]
+        assert row2["requests"] == 4, f"跨 model 应聚合为 4，实际 {row2['requests']}"
+        assert row2["error_types"] == {"5xx": 7, "timeout": 1, "auth": 1}, \
+            f"error_types 跨 model 应合并，实际 {row2['error_types']}"
+
+
+# ─── (k) upsert_day 无 error_types 的 delta 不覆盖已有值 ───
+def test_k_upsert_day_no_error_types_preserves_existing():
+    with _TempDb():
+        usage_store.init_db()
+        day, label, model = "2026-08-09", "qclaw", "kimi"
+        usage_store.upsert_day(
+            day, label, model,
+            {"requests": 1, "error_types": {"5xx": 5}},
+        )
+        # 纯计数 delta（无 error_types）不应把已写的值覆盖成 {}
+        usage_store.upsert_day(
+            day, label, model,
+            {"requests": 1, "ok": 1},
+        )
+        row = usage_store.get_trend(3650)[day]
+        assert row["requests"] == 2, f"requests 应 2，实际 {row['requests']}"
+        assert row["error_types"] == {"5xx": 5}, \
+            f"无 error_types 的 delta 不应覆盖已有值，实际 {row['error_types']}"
+
+
+# ─── (l) get_trend 返回 error_types（含合并）+ 旧数据兼容 ───
+def test_l_get_trend_returns_and_merges_error_types():
+    with _TempDb() as t:
+        usage_store.init_db()
+        d0, d1 = _day_offset(0), _day_offset(1)
+        usage_store.upsert_day(d0, "copilot", "m1", {"requests": 1, "error_types": {"429": 2}})
+        usage_store.upsert_day(d0, "copilot", "m2", {"requests": 3, "error_types": {"429": 1, "timeout": 4}})
+        trend = usage_store.get_trend(7)
+        assert d0 in trend, f"当日数据应出现，实际 keys: {list(trend)}"
+        assert trend[d0]["error_types"] == {"429": 3, "timeout": 4}, \
+            f"error_types 应跨行合并，实际 {trend[d0]['error_types']}"
+        assert trend[d0]["requests"] == 4, f"requests 应 4，实际 {trend[d0]['requests']}"
+
+        # 旧库（无 error_types 列）兼容：直接写一条没有该列的旧表结构数据
+        conn = sqlite3.connect(t.db_path)
+        try:
+            # 走原生 insert 不带 error_types（依赖建表默认值 '{}'），验证 get_trend 返回 {}
+            conn.execute(
+                "INSERT INTO usage_daily (date, label, model, requests, ok, err,"
+                " translated429, prompt_tokens, completion_tokens)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (d1, "old", "m", 1, 1, 0, 0, 0, 0),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        trend_old = usage_store.get_trend(7)
+        assert d1 in trend_old, "旧数据应出现"
+        assert trend_old[d1]["error_types"] == {}, \
+            f"无 error_types 的旧数据应返回 {{}}，实际 {trend_old[d1]['error_types']}"
+
+
 def main():
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for t in tests:

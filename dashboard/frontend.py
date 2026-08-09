@@ -782,8 +782,34 @@ def _model_details_html(models, model_stats=None, label=None, edit_mode=False, c
         f'</table>'
     )
 
+    # ── 卡片级错误类型分布（聚合所有模型的 error_types，空则不出块；仅有 stats 时显示）──
+    _err_block = ''
+    if has_stats and model_stats:
+        _err_dist = {}
+        for _m in (model_stats or {}).values():
+            _et = _m.get('error_types') or {} if isinstance(_m, dict) else {}
+            if isinstance(_et, dict):
+                for _k, _v in _et.items():
+                    try:
+                        _err_dist[str(_k)] = _err_dist.get(str(_k), 0) + int(_v)
+                    except Exception:
+                        pass
+        if _err_dist:
+            _err_lines = ''.join(
+                '<span style="margin-right:14px;">' + _html_escape(str(k)) + ': ' + str(int(v)) + '</span>'
+                for k, v in sorted(_err_dist.items(), key=lambda x: -x[1])
+            )
+            _err_block = (
+                '<div class="trend-period" style="border-top:1px dashed rgba(148,163,184,0.15); margin-top:10px; padding-top:10px;">'
+                '<div class="tp-title">错误类型分布</div>'
+                '<div style="font-size:12px; color:var(--text-secondary); font-family:var(--font-mono); word-break:break-all;">'
+                + _err_lines
+                + '</div>'
+                '</div>'
+            )
+
     if not editable:
-        return table_html
+        return table_html + _err_block
 
     # 可编辑：正常态表格 + 编辑入口 + 消息区
     edit_toggle = (
@@ -798,11 +824,12 @@ def _model_details_html(models, model_stats=None, label=None, edit_mode=False, c
         )
     return (
         f'{table_html}'
-        f'<div class="model-ops">'
-        f'  {edit_toggle}'
-        f'  {prune_toggle}'
-        f'</div>'
-        f'<div class="model-msg" data-label="{esc_label}"></div>'
+        + _err_block
+        + f'<div class="model-ops">'
+        + f'  {edit_toggle}'
+        + f'  {prune_toggle}'
+        + f'</div>'
+        + f'<div class="model-msg" data-label="{esc_label}"></div>'
     )
 
 
