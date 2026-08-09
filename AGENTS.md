@@ -198,6 +198,8 @@ tail -f codebuddy.log                 # 查
 - **gateways/copilot.py**：Copilot Responses API 转换 + GHE 配置
 - **gateways/aggregator/engine.py**：聚合网关纯引擎逻辑（`AggregatorEngine`，路由 / 会话粘性 / 熔断 / 降级）
 - **gateways/aggregator/http_adapter.py**：聚合网关 HTTP 适配（`_handle_aggregate_request`/`_aggregator_prober`）
+- **gateways/rtk.py**：RTK token-saver（9Router 移植，纯标准库）：在 Anthropic→OpenAI 翻译前确定性压缩超长 `tool_result`（头 120 行 + 尾 60 行，中段省略），降 prompt token 消耗；`is_error` 不压、过小/过大/失败/变空变长原样透传、异常静默；开关 `tokenSaver:{enabled,minSize,maxSize}`（默认关闭），入口 `anthropic_convert.convert_anthropic_request_to_openai` 翻译前注入，日志 `[RTK] saved XB / YB (Z%)`
+- **gateways/usage_store.py**：用量统计 SQLite 持久化（纯 `sqlite3`）：内存统计异步落盘（`.cache/usage.db`，表 `usage_daily`，主键 `(date,label,model)`）；`init_db()`/`upsert_day()`/`get_trend(days)`；server.py `_TODAY_ACCUM` + 60s `_usage_flush_loop` UPSERT + 退出前 flush；dashboard「近 7/30 天请求量」趋势卡读取；DB 故障仅 warning 不影响主链路
   - ⚠️ `_AGGREGATOR_ENGINE` 全局通过 `import server as _srv` + `_srv._AGGREGATOR_ENGINE` 模块属性共享
  - **dashboard/routes.py**（~74 行）：管理面板**装配入口**（定义 `dashboard_router` + import dashboard/ 子模块触发路由注册 + re-export）；dashboard 挂在独立的 8079 app（`server.dashboardPort`），server.py 仍 `from dashboard.routes import dashboard_router` 挂载到该 app，调用点零改动
 - **dashboard/frontend.py**（~2750 行）：前端渲染层（`DASHBOARD_STYLE` + `_html_escape`/`_get_lan_ip`/`_format_uptime`/`_model_details_html`/`_build_card_html` + `dashboard()` 页面路由）

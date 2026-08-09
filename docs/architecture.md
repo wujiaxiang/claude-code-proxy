@@ -372,6 +372,13 @@ dashboard「聚合网关」分组的 8080 卡片由前端 `loadAggregateStatus()
 - **stripV1 剥离**：`stripV1: true` 时把客户端 `/v1/xxx` → `/xxx`（上游 OpenAI 兼容但根路径直接挂端点，无 `/v1` 前缀，如 DeepSeek `api.deepseek.com/chat/completions`）。配合 `handler=passthrough` 使用，是「删除 /v1」的通用表达（routePrefix 是替换语义，无法删除）
 - **原样**：其余路径直接透传
 
+## 网关模块清单（gateways/）
+
+除各端口 handler 对应的网关注册（`server.py` 的 `_HANDLER_PATH_MAP` / `_HANDLE_TARGET_REQUEST`）外，代理还包含若干**旁路/支撑模块**，放在 `gateways/` 下，遵循 AGENTS.md §7 的跨模块约定（函数内延迟导入 + `import server as _srv` 访问热重载全局，旁路模块用 `sys.modules.get("server")` 探测复用 logger，绝不首次拉起 server）：
+
+- **gateways/rtk.py** — RTK token-saver（9Router `open-sse/rtk` 的 Python 移植，MIT，纯标准库）。在 Anthropic→OpenAI 翻译**前**确定性压缩超长 `tool_result`（头 120 行 + 尾 60 行，中段替换为 `... +N lines truncated` 标记），降 prompt token 消耗。只碰 `tool_result`，`text`/`thinking`/`tool_use` 一律零改动；常量 `RAW_CAP=10MiB` / `MIN_COMPRESS_SIZE=500` / `SMART_TRUNCATE_HEAD=120` / `TAIL=60` / `MIN_LINES=250`。**安全护栏**：`is_error=True` 的 tool_result 不压缩；过小（字节 < 500 或行数 < 250）/ 过大（> 10MiB）/ 压缩失败 / 压完变空或没变短 → 原样透传；所有异常静默 `pass`，绝不崩请求。开关为 8081 anthropic target 的 `tokenSaver: {enabled, minSize, maxSize}`（**默认关闭**，`enabled` 布尔、`minSize`/`maxSize` 字节阈值备用）；入口在 `anthropic_convert.convert_anthropic_request_to_openai` 翻译前注入，日志 `[RTK] saved XB / YB (Z%) via [smart-truncate] hits=N`。
+- **gateways/usage_store.py** — 用量统计 SQLite 持久化（纯标准库 `sqlite3`，WAL，无第三方依赖）。把内存统计异步落盘，进程重启不丢。落盘路径 `.cache/usage.db`（表 `usage_daily`，主键 `(date, label, model)`，含 `requests/ok/err/translated429/prompt_tokens/completion_tokens`，无 cost 列、无 key/token/请求体）。公开函数 `init_db()` / `upsert_day()` / `get_trend(days)`：每个函数开头自愈建表，调用方漏调 `init_db()` 也不炸。flush 机制由 `server.py` 承担：内存 `_TODAY_ACCUM` 累加 → 60s 周期 `_usage_flush_loop` UPSERT（swap-then-write 防丢增量）+ 退出前 `_flush_usage_accum` 兜底。dashboard 新增「近 7 天 / 近 30 天请求量」趋势卡片（`get_trend(7)` / `get_trend(30)` 读取，渲染在 `dashboard/frontend.py` 的 `_build_trend_html`）。**降级**：DB 故障仅 `logger.warning`，返回 `False`/`{}`，不影响主请求链路。
+
 ## handler 分发
 
 | handler | 行为 |

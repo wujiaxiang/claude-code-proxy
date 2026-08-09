@@ -33,6 +33,21 @@ def convert_anthropic_request_to_openai(anthropic_body: dict) -> dict:
     多条 OpenAI 消息（tool_result 独立成 role:"tool"），flush 顺序
     tool 消息在前、user 消息在后。assistant 的 tool_use → 顶层 tool_calls。
     """
+    # ── token-saver：翻译前压缩超长 tool_result（默认关闭；旁路优化，异常不影响主链路）──
+    # compress_tool_results 就地修改 messages，只缩短 tool_result 文本、不改结构，
+    # 因此下面的翻译逻辑直接读压缩后的内容即可（刻意不 deepcopy body）。
+    try:
+        import server as _srv  # 模块属性访问：_TOKEN_SAVER_CFG 是热重载可变全局
+        if _srv._TOKEN_SAVER_CFG.get("enabled"):
+            from gateways.rtk import compress_tool_results, format_rtk_log
+            _rtk = compress_tool_results(anthropic_body.get("messages"))
+            if _rtk.get("compressed"):
+                _log = format_rtk_log(_rtk.get("stats") or {})
+                if _log:
+                    _srv.logger.info(_log)
+    except Exception:
+        pass  # token-saver 是旁路优化：任何异常都静默跳过，绝不破坏请求
+
     messages = []
     system_out = ""
 

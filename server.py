@@ -375,6 +375,14 @@ async def lifespan(app):
     from gateways.aggregator.http_adapter import _aggregator_prober
     aggregator_prober_task = asyncio.create_task(_aggregator_prober())
 
+    # ── usage 持久化：建表 + 启动 60s flush 循环（旁路观测，失败不影响启动）──
+    try:
+        from gateways import usage_store as _ustore
+        _ustore.init_db()
+    except Exception as _ue:
+        logger.warning(f"usage_store: init skipped: {_ue}")
+    usage_flush_task = asyncio.create_task(_usage_flush_loop())
+
     yield
 
     # 停止配置 watcher
@@ -390,6 +398,17 @@ async def lifespan(app):
         await aggregator_prober_task
     except asyncio.CancelledError:
         pass
+
+    # 停止 usage flush 循环，并同步 flush 最后一轮增量（否则丢最后 ≤60s 的计数）
+    usage_flush_task.cancel()
+    try:
+        await usage_flush_task
+    except asyncio.CancelledError:
+        pass
+    try:
+        _flush_usage_accum()
+    except Exception as _fe:
+        logger.warning(f"usage final flush failed: {_fe}")
 
     # 停掉透明反代服务器
     for srv in _target_servers.values():
@@ -463,6 +482,94 @@ _MODEL_STATS: Dict[str, Dict[str, Dict[str, int]]] = {}
 # 模型别名/转发目标配置（targets.json 顶层 models[] + modelDefaults）
 _MODELS_CFG: dict = {"models": [], "modelDefaults": {"defaultPort": 8082}}
 
+# ─── token-saver 开关（targets.json 的 8081 anthropic target 内 tokenSaver 字段）───
+# 与 _MODELS_CFG 同源（都从 handler=="anthropic" 的 target 读），由 _load_token_saver_cfg()
+# 在启动与热重载两处刷新。跨模块（anthropic_convert.py）访问必须走 `import server as _srv`
+# + `_srv._TOKEN_SAVER_CFG` 模块属性，禁止 `from server import` 值拷贝（热重载后会读到旧快照）。
+_TOKEN_SAVER_DEFAULTS: dict = {"enabled": False, "minSize": 1024, "maxSize": 200000}
+_TOKEN_SAVER_CFG: dict = dict(_TOKEN_SAVER_DEFAULTS)
+
+
+def _load_token_saver_cfg(anthropic_target) -> None:
+    """从 anthropic target 刷新 _TOKEN_SAVER_CFG（缺失字段回落默认，就地替换全局）。"""
+    global _TOKEN_SAVER_CFG
+    raw = (anthropic_target or {}).get("tokenSaver") or {}
+    if not isinstance(raw, dict):
+        raw = {}
+    _TOKEN_SAVER_CFG = {**_TOKEN_SAVER_DEFAULTS, **raw}
+
+
+# ─── usage 持久化累加器（内存累加 → 60s 异步 flush 到 SQLite）───
+# 为什么不在热转发路径直接写库：SQLite 写是同步阻塞 IO，落在每个请求上会拖慢转发。
+# 这里只做纯内存自增（O(1)、无锁——单事件循环内全部同步代码，无 await 穿插，天然原子），
+# 由 _usage_flush_loop() 周期性搬运；进程退出前 lifespan 关闭段再 flush 一次兜底。
+#
+# 结构（两个维度，落库时都写进同一张 usage_daily 表）：
+#   _TODAY_ACCUM["targets"][label]         = {"totalRequests": N, "translated429": N}
+#   _TODAY_ACCUM["models"][(label, model)] = {"requests": N, "ok": N, "err": N, "translated429": N}
+# targets 维度落为 model="__target__" 的伪行（刻意不给表加列——总请求数在 get_trend
+# 里就是该 label 下所有行 requests 之和，含 __target__ 行）。
+_USAGE_TARGET_PSEUDO_MODEL = "__target__"
+_TODAY_ACCUM: Dict[str, Dict[Any, Dict[str, int]]] = {"targets": {}, "models": {}}
+
+
+def _bump_usage_target(label: str, field: str, n: int = 1):
+    """累加 target 维度用量（label 级汇总）。旁路观测，绝不因异常影响主链路。"""
+    try:
+        d = _TODAY_ACCUM["targets"].setdefault(label, {"totalRequests": 0, "translated429": 0})
+        d[field] = d.get(field, 0) + n
+    except Exception:
+        pass
+
+
+def _flush_usage_accum(ustore=None) -> int:
+    """把 _TODAY_ACCUM 的增量 UPSERT 进 SQLite，返回成功落盘的行数。
+
+    先整体摘走累加器再写库（swap-then-write）：写库期间到达的新请求会累进新的空 dict，
+    不会被后续 clear() 抹掉。任一行写失败只 warning 跳过——用量是旁路观测，
+    丢几条计数远好于把异常抛回调用方（flush loop / lifespan 关闭段）。
+    """
+    if ustore is None:
+        from gateways import usage_store as ustore  # 延迟导入（AGENTS.md §7 跨模块约定）
+    targets = _TODAY_ACCUM["targets"]
+    models = _TODAY_ACCUM["models"]
+    if not targets and not models:
+        return 0
+    # swap：拿走旧桶，换上空桶（此后的自增都进新桶）
+    _TODAY_ACCUM["targets"] = {}
+    _TODAY_ACCUM["models"] = {}
+
+    from datetime import date as _date
+    today = _date.today().isoformat()
+    written = 0
+    for label, d in targets.items():
+        delta = {"requests": d.get("totalRequests", 0), "translated429": d.get("translated429", 0)}
+        if not any(delta.values()):
+            continue
+        if ustore.upsert_day(today, label, _USAGE_TARGET_PSEUDO_MODEL, delta):
+            written += 1
+    for key, d in models.items():
+        try:
+            label, model = key
+        except Exception:
+            continue
+        if not any(d.values()):
+            continue
+        if ustore.upsert_day(today, label, model, dict(d)):
+            written += 1
+    return written
+
+
+async def _usage_flush_loop():
+    """每 60s 把 _TODAY_ACCUM 增量 UPSERT 进 SQLite；异常仅 warning 不中断循环。"""
+    from gateways import usage_store as _ustore
+    while True:
+        await asyncio.sleep(60)
+        try:
+            _flush_usage_accum(_ustore)
+        except Exception as e:
+            logger.warning(f"usage flush loop error: {e}")
+
 
 def _first_enabled_target_with_handler(handler: str) -> Optional[dict]:
     """返回第一个 enabled 且 handler 匹配的 target，无则 None。每次调用实时扫 _TARGETS。"""
@@ -531,6 +638,16 @@ def _bump_model_stats(label: str, model: str, outcome: str):
     s["requests"] += 1
     if outcome in s:
         s[outcome] += 1
+    # 同步累加进持久化累加器（进程重启会清零的 _MODEL_STATS 之外的落盘副本）
+    try:
+        a = _TODAY_ACCUM["models"].setdefault(
+            (label, model), {"requests": 0, "ok": 0, "err": 0, "translated429": 0}
+        )
+        a["requests"] += 1
+        if outcome in a:
+            a[outcome] += 1
+    except Exception:
+        pass
 
 
 # ─── HTTP 代理共享工具函数（所有端口统一用，不要各写各的） ───
@@ -722,6 +839,7 @@ def _load_vendor_targets():
     else:
         _MODELS_CFG["models"] = []
         _MODELS_CFG["modelDefaults"] = {"defaultPort": 8082}
+    _load_token_saver_cfg(_anthropic_t)
     _SECRETS = _cfg.load_secrets()
     # 私密凭据统一收敛：COPILOT_GHE_TOKEN 与 targets.json copilot-enterprise 的
     # secretRef 同源（crack_copilot.py 提取的企业 GHE PAT 写 copilot_token），
@@ -779,6 +897,7 @@ async def _reload_targets() -> list:
     else:
         _MODELS_CFG["models"] = []
         _MODELS_CFG["modelDefaults"] = {"defaultPort": 8082}
+    _load_token_saver_cfg(_anthropic_t)
     # P2: 重建 ModelRegistry 单一事实源（dashboard 渲染改读它，targets.json 结构不变）
     _MODEL_REGISTRY = ModelRegistry({
         "targets": _TARGETS,
@@ -1073,6 +1192,7 @@ async def _handle_target_request(reader, writer, target):  # pyright: ignore[rep
             writer.close(); return
 
         stats["totalRequests"] += 1
+        _bump_usage_target(label, "totalRequests")
 
         # ── qclaw /v1/models：上游（mmgrcalltoken.3g.qq.com）不提供 /models 接口，
         #    转发会得到 404，导致 opencode 等客户端拉不到模型列表。这里直接返回
@@ -1315,6 +1435,7 @@ async def _handle_target_request(reader, writer, target):  # pyright: ignore[rep
             if mapped is not None:
                 target_status, err_type = mapped
                 stats["translated429"] += 1
+                _bump_usage_target(label, "translated429")
                 if _req_model:
                     _bump_model_stats(label, _req_model, "translated429")
                 logger.info(f"[{label}] translated HTTP {status} → {target_status} ({err_type})")

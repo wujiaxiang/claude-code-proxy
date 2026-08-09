@@ -510,6 +510,31 @@ DASHBOARD_STYLE = """
     .mm-row .agg-mem-port, .mm-row .agg-mem-model { width: 100%; }
     .mm-row .mm-del { justify-self: end; }
   }
+
+  /* ── 趋势卡片（请求量近 7/30 天趋势，纯 CSS 条形图，零依赖）── */
+  .trend-card { position: relative; background: linear-gradient(180deg, rgba(255,255,255,0.035) 0%, rgba(255,255,255,0.008) 40%, rgba(255,255,255,0) 100%), var(--bg-card); border: 1px solid var(--border); border-radius: var(--radius-lg); padding: 18px 22px; margin-bottom: 26px; box-shadow: inset 0 1px 0 rgba(255,255,255,0.05), 0 1px 4px rgba(0,0,0,0.3); overflow: hidden; }
+  .trend-card::before { content: ""; position: absolute; top: 0; left: 8%; right: 8%; height: 1px; background: linear-gradient(90deg, transparent, rgba(34,211,238,0.45), transparent); z-index: 1; pointer-events: none; }
+  .trend-head { display: flex; align-items: center; justify-content: space-between; gap: 14px; margin-bottom: 14px; }
+  .trend-head .trend-title { font-size: 15px; font-weight: 600; color: var(--text-primary); letter-spacing: -0.2px; }
+  .trend-head .trend-tabs { display: inline-flex; gap: 4px; }
+  .trend-head .trend-tab { font-size: 11px; font-weight: 600; letter-spacing: 0.8px; padding: 4px 12px; border-radius: 999px; border: 1px solid var(--border); color: var(--text-tertiary); background: rgba(148,163,184,0.08); cursor: default; }
+  .trend-head .trend-tab.active { background: var(--brand-grad); color: #fff; border-color: transparent; box-shadow: 0 3px 10px rgba(34,211,238,0.28); }
+  .trend-summary { display: flex; gap: 28px; flex-wrap: wrap; align-items: baseline; padding: 10px 0 14px; border-bottom: 1px dashed rgba(148,163,184,0.15); margin-bottom: 14px; }
+  .trend-summary .ts-item { display: flex; flex-direction: column; gap: 4px; }
+  .trend-summary .ts-label { font-size: 11px; color: var(--text-tertiary); text-transform: uppercase; letter-spacing: 1px; font-weight: 600; }
+  .trend-summary .ts-value { font-size: 28px; font-weight: 700; color: var(--text-primary); font-family: var(--font-mono); font-variant-numeric: tabular-nums; letter-spacing: -0.5px; line-height: 1.1; }
+  .trend-summary .ts-value.grad { background: var(--brand-grad); -webkit-background-clip: text; background-clip: text; -webkit-text-fill-color: transparent; }
+  .trend-summary .ts-sub { font-size: 11px; color: var(--text-tertiary); }
+  .trend-period { margin-bottom: 12px; }
+  .trend-period .tp-title { font-size: 12px; font-weight: 600; color: var(--text-secondary); margin-bottom: 8px; letter-spacing: 0.3px; }
+  .trend-bars { display: flex; align-items: flex-end; gap: 5px; height: 92px; padding: 0 2px; }
+  .trend-bar-col { flex: 1 1 auto; display: flex; flex-direction: column; align-items: center; justify-content: flex-end; min-width: 0; }
+  .trend-bar-col .tb-bar-wrap { width: 100%; max-width: 22px; height: 68px; display: flex; flex-direction: column; justify-content: flex-end; border-radius: 5px; background: rgba(148,163,184,0.06); border: 1px solid rgba(148,163,184,0.10); overflow: hidden; position: relative; }
+  .trend-bar-col .tb-bar { width: 100%; min-height: 1px; background: linear-gradient(180deg, rgba(34,211,238,0.95) 0%, rgba(59,130,246,0.75) 100%); border-radius: 5px; box-shadow: 0 0 8px rgba(34,211,238,0.28); transition: height 0.4s ease; }
+  .trend-bar-col .tb-bar.zero { background: linear-gradient(180deg, rgba(148,163,184,0.45) 0%, rgba(148,163,184,0.20) 100%); box-shadow: none; }
+  .trend-bar-col .tb-label { font-size: 10px; color: var(--text-tertiary); margin-top: 5px; font-family: var(--font-mono); font-variant-numeric: tabular-nums; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 100%; }
+  .trend-bar-col .tb-count { font-size: 10px; color: var(--text-secondary); margin-bottom: 2px; font-family: var(--font-mono); font-variant-numeric: tabular-nums; }
+  .trend-empty { font-size: 13px; color: var(--text-tertiary); font-style: italic; text-align: center; padding: 30px 0; }
 """
 
 
@@ -960,6 +985,73 @@ async def dashboard():
     alive_rate = round(alive_ports / len(results) * 100) if results else 0
     _alive_color = "#34d399" if alive_rate == 100 else ("#fbbf24" if alive_rate >= 50 else "#f87171")
 
+    # ── 趋势数据（近 7 天 / 近 30 天请求量，从 usage_store 读取，降级安全）──
+    try:
+        from gateways import usage_store as _usage_store
+        _trend_7 = _usage_store.get_trend(7) or {}
+        _trend_30 = _usage_store.get_trend(30) or {}
+    except Exception:
+        _trend_7 = {}
+        _trend_30 = {}
+
+    def _build_trend_html(trend_data, days_label):
+        """把 get_trend(days) 返回的 {date:{requests,ok,err,...}} 渲染为趋势卡 HTML。"""
+        if not trend_data:
+            return (
+                '<div class="trend-card">'
+                '  <div class="trend-head">'
+                '    <span class="trend-title">近 ' + str(days_label) + ' 天请求量</span>'
+                '  </div>'
+                '  <div class="trend-empty">暂无数据</div>'
+                '</div>'
+            )
+        items = sorted(trend_data.items())  # date 升序
+        total_req = sum(int(v.get('requests', 0)) for _, v in items)
+        total_ok = sum(int(v.get('ok', 0)) for _, v in items)
+        total_err = sum(int(v.get('err', 0)) for _, v in items)
+        max_req = max((int(v.get('requests', 0)) for _, v in items), default=0)
+        max_req = max(max_req, 1)  # 防除零
+        # KPI summary
+        total_html = (
+            '<div class="trend-summary">'
+            '  <div class="ts-item"><span class="ts-label">总请求</span><span class="ts-value grad">' + str(total_req) + '</span><span class="ts-sub">近 ' + str(days_label) + ' 天累计</span></div>'
+            '  <div class="ts-item"><span class="ts-label">成功</span><span class="ts-value">' + str(total_ok) + '</span><span class="ts-sub">OK</span></div>'
+            '  <div class="ts-item"><span class="ts-label">失败</span><span class="ts-value">' + str(total_err) + '</span><span class="ts-sub">ERR</span></div>'
+            '  <div class="ts-item"><span class="ts-label">覆盖天数</span><span class="ts-value">' + str(len(items)) + '</span><span class="ts-sub">有记录的日期</span></div>'
+            '</div>'
+        )
+        # 条形图：每个日期一根 bar
+        bars_html = '<div class="trend-bars">'
+        for date_str, info in items:
+            req = int(info.get('requests', 0))
+            height_pct = round(req / max_req * 100) if max_req > 0 else 0
+            short_date = date_str[5:] if len(date_str) >= 5 else date_str  # '08-09' 形式
+            bar_cls = 'tb-bar zero' if req == 0 else 'tb-bar'
+            bars_html += (
+                '<div class="trend-bar-col" title="' + str(date_str) + ': ' + str(req) + ' 请求">'
+                '  <span class="tb-count">' + str(req) + '</span>'
+                '  <div class="tb-bar-wrap">'
+                '    <div class="' + bar_cls + '" style="height:' + str(height_pct) + '%"></div>'
+                '  </div>'
+                '  <span class="tb-label">' + short_date + '</span>'
+                '</div>'
+            )
+        bars_html += '</div>'
+        return (
+            '<div class="trend-card">'
+            '  <div class="trend-head">'
+            '    <span class="trend-title">近 ' + str(days_label) + ' 天请求量</span>'
+            '  </div>'
+            + total_html
+            + '<div class="trend-period"><div class="tp-title">按日趋势</div>'
+            + bars_html
+            + '</div>'
+            '</div>'
+        )
+
+    _trend_7_html = _build_trend_html(_trend_7, 7)
+    _trend_30_html = _build_trend_html(_trend_30, 30)
+
     # ── 局域网 IP（可粘贴 base_url 用）──
     _lan_ip = _get_lan_ip()
 
@@ -1271,6 +1363,8 @@ async def dashboard():
     <span id="ov-msg" class="ov-msg" role="status"></span>
   </div>
   <div class="dangling-bar" id="dangling-bar" role="status" aria-live="polite"></div>
+  {_trend_7_html}
+  {_trend_30_html}
   {cards_html}
 
   <!-- 模型编辑 modal -->
