@@ -121,6 +121,7 @@ tail -f codebuddy.log                 # 查
 | **8092** | gemini | free | **gemini-native** | OpenAI↔Gemini | 原生 Gemini 协议转换（generateContent） |
 | **8093** | opencode-zen | free | passthrough | OpenAI | 免费代理 |
 | **8094** | open-go | paid | passthrough | OpenAI | 收费代理 |
+| **8096** | nous | crack | passthrough | OpenAI | Nous Portal（Hermes 免费模型，token 由 hermes 容器维护，代理定时同步） |
 
 - **base_url 规范**：crack 类与 gemini-native 统一 `/v1`（代理内部映射下游）；free/paid 透传用 `routePrefix`（如 `/api/v1`）
  - **客户端接入**：OpenAI 协议 `base_url = http://<局域网IP>:8082/v1` 等，`api_key = "dummy"`（crack 类不校验；free/paid 用真实 key）；Anthropic 协议 `base_url = http://<局域网IP>:8081`；dashboard 访问 `http://<局域网IP>:8079/dashboard`（或 8081 的 `/dashboard` 反向代理到 8079）
@@ -139,6 +140,8 @@ tail -f codebuddy.log                 # 查
 | `crack_codebuddy.py` + `crack_codebuddy_q.py` | token 提取（客户端目录探测）+ 额度 / 成长计划任务领取 | [codebuddy.md](docs/codebuddy.md) |
 | `crack_qclaw.py` + `crack_qclaw_q.py` | token 提取（Windows DPAPI 解密）+ 积分查询（jprx.m.qq.com 逆向） | [qclaw.md](docs/qclaw.md) |
 | `crack_traework.py` | tc 加密认证提取 + 签到 / 额度 / 刷新 CLI | [trae-work.md](docs/trae-work.md) |
+| `crack_nous.py` | Nous Portal 凭据同步（从 hermes 容器 auth.json 拷贝到 secrets.json，刷新由 hermes 负责） | [nous.md](docs/nous.md) |
+| `gateways/nous.py` | Nous 同步器：60s 周期只读 auth.json 同步 access_token 到 secrets.json；token 快过期/缺失/revoke 仅告警（**不 docker exec 触发刷新**——Nous refresh_token 单次使用，外部触发会 revoke session） | [nous.md](docs/nous.md) |
 
 ### 5.2 状态查询统一结构
 
@@ -314,6 +317,7 @@ $env:Path = "C:\Program Files\QClaw\v0.2.33.617\resources\git\cmd;C:\Windows\Sys
 - [docs/codebuddy.md](docs/codebuddy.md) — CodeBuddy：refreshToken 轮换 / 11101 聚合 / 成长任务 / 已知陷阱
 - [docs/trae-work.md](docs/trae-work.md) — Trae Work 逆向：tc 加密 / 接口规范 / 签到 / 额度 / 续期 / 传图
 - [docs/crack-tools.md](docs/crack-tools.md) — 破解公共层索引（模块 / secrets 字段 / 状态查询 / 每日任务）
+- [docs/nous.md](docs/nous.md) — Nous Portal（Hermes）：OAuth 凭据同步机制 / 免费模型 / 依赖 hermes 容器
 - [docs/windows-deployment.md](docs/windows-deployment.md) — Windows 部署指南（8 个坑）
 - [scripts/windows/README.md](scripts/windows/README.md) — Windows 启动脚本目录说明（开发约定）
 

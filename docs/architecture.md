@@ -21,6 +21,7 @@
 | **8093** | opencode-zen | free | passthrough | OpenAI | 免费透传 |
 | **8094** | open-go | paid | passthrough | OpenAI | 收费透传 |
 | **8095** | deepseek | free | passthrough | OpenAI | DeepSeek 直连透传（`stripV1:true`，上游 `api.deepseek.com` 无 `/v1` 前缀，客户端带 key） |
+| **8096** | nous | crack | passthrough | OpenAI | Nous Portal 直连（Hermes 免费 `:free` 模型，token 由 hermes 容器维护，代理定时同步，见 [nous.md](nous.md)） |
 
 - **分类**：`crack`（破解获取 token，注入 secrets.json）/ `free`（免费，透传客户端 key）/ `paid`（收费，透传客户端 key）/ `aggregate`（聚合网关，不持凭据）
 - **isFree**：管理界面维护，标记供应商 key 是否免费（重试策略预留字段）

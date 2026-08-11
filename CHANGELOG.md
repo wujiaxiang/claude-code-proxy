@@ -2,6 +2,13 @@
 
 ## [Unreleased]
 
+### Added
+- **Nous Portal 网关（8096，crack/passthrough，2026-08-11）**：直连 [Nous Portal](https://portal.nousresearch.com)（Hermes 模型订阅网关）免费 tier 的 `:free` 模型（实测 5 个：`poolside/laguna-s-2.1:free` / `poolside/laguna-xs-2.1:free` / `tencent/hy3:free` / `stepfun/step-3.7-flash:free` / `upstage/solar-pro4:free`），上游 `inference-api.nousresearch.com/v1`（OpenAI 兼容）。
+  - **凭据设计（区别于其他 crack 网关）**：OAuth token 生命周期完全由 **hermes 容器**（`nousresearch/hermes-agent`，auth.json 挂载于宿主机 `/data/docker/hermes/data/auth.json`）负责（登录/刷新/回写），**auth.json 的唯一写入者 = hermes 进程（hermes 用户）**——`gateways/nous.py` 只做**只读同步**（60s 周期只读 auth.json → access_token 有效且变化才写 secrets.json 的 `nous_access_token`/`nous_expires_at`；快过期/缺失/revoke 仅告警），**代理永不触发刷新**，请求时由 crack 类通用注入逻辑加 Bearer。
+  - **新文件**：`gateways/nous.py`（只读同步器 + 后台循环）、`crack_nous.py`（只读凭据提取 CLI）、`docs/nous.md`；server.py lifespan 注册 `nous_sync_loop` + 启动同步一次
+  - **2026-08-11 事故修复（重要，勿改回触发刷新）**：初版曾用 `docker exec hermes ... resolve_nous_runtime_credentials(force_refresh=True)` 触发刷新，导致 Nous Portal **refresh-token reuse 判定 revoke 整个 session**（auth.json `last_auth_error` 原文：Nous refresh tokens are single-use — only Hermes may call the refresh endpoint）。根因：Nous refresh_token **单次使用**，外部触发刷新未持久化旋转后的新 refresh_token，下次复用即被判 reuse revoke；且 docker exec 默认以容器 root 回写 auth.json，属主变 `root:root` 后 hermes 主进程（hermes 用户）失去写权限。修复：移除全部触发刷新逻辑（`HERMES_REFRESH_CMD`/`_trigger_hermes_refresh`/`crack_nous --refresh`），改为只读+告警；同步器检测无 token / `last_auth_error` 时告警提示重新登录（`hermes auth add nous --type oauth`，device-code 流程）。
+  - 文档：`docs/nous.md`（只读同步机制/踩坑记录/陷阱）、`AGENTS.md` 端口表与模块清单同步
+
 ### Removed
 - **legacy 单端口模式彻底下线（2026-08-08）**：8081 早期是「一个端口按 `PREFERRED_PROVIDER` 选后端 + LiteLLM 翻译」的单端口代理，多端口架构上线后这条路径已长期无人走，本次连同其全部依赖一次性删除。
   - **删除 legacy `/v1/chat/completions` 端点**：8081 不再提供 OpenAI 协议入口（各 target 端口自己的 `/v1/chat/completions` 不受影响）

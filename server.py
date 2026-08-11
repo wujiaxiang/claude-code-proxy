@@ -383,7 +383,26 @@ async def lifespan(app):
         logger.warning(f"usage_store: init skipped: {_ue}")
     usage_flush_task = asyncio.create_task(_usage_flush_loop())
 
+    # ── nous 凭据同步：定时从 hermes 容器 auth.json 拷贝 access_token 到 secrets.json
+    #    （hermes 负责 token 刷新，代理只同步，见 gateways/nous.py docstring）
+    nous_sync_task = None
+    try:
+        from gateways.nous import nous_sync_loop
+        nous_sync_task = asyncio.create_task(nous_sync_loop())
+        # 启动即同步一次（拿初值 + 提前触发过期 token 刷新）
+        await asyncio.to_thread(_nous_sync_once)
+    except Exception as _ne:
+        logger.warning(f"nous: 同步器启动失败（不影响主服务）: {_ne}")
+
     yield
+
+    # 停止 nous 凭据同步任务
+    if nous_sync_task is not None:
+        nous_sync_task.cancel()
+        try:
+            await nous_sync_task
+        except asyncio.CancelledError:
+            pass
 
     # 停止配置 watcher
     watcher_task.cancel()
@@ -640,6 +659,15 @@ def _flush_aggregator_accum() -> int:
         if _ustore.upsert_aggregator_day(today, vm_id, member, delta):
             written += 1
     return written
+
+
+def _nous_sync_once() -> None:
+    """启动时同步一次 nous 凭据（线程内执行，避免阻塞事件循环）。"""
+    try:
+        from gateways.nous import sync_nous_token
+        sync_nous_token()
+    except Exception as e:
+        logger.warning(f"nous: 启动同步失败: {e}")
 
 
 async def _usage_flush_loop():
