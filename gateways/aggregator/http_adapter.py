@@ -41,6 +41,25 @@ async def _handle_aggregate_request(reader, writer, target, method, path, raw_pa
             return
     engine = _srv._AGGREGATOR_ENGINE
 
+    # ── GET /v1/models（或 /models）：返回已配置的虚拟模型列表，供客户端自动发现 ──
+    #    （OpenAI 格式；虚拟模型 id 即 clients 可直接请求的 model 字段值）
+    if method == "GET" and (raw_path or path).split("?")[0].rstrip("/").endswith("/models"):
+        virtual_ids = engine.list_virtual_models()
+        payload = json.dumps({
+            "object": "list",
+            "data": [
+                {"id": mid, "object": "model", "created": 0, "owned_by": "aggregator"}
+                for mid in sorted(virtual_ids)
+            ],
+        }, ensure_ascii=False)
+        writer.write(
+            b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: %d\r\n\r\n%s"
+            % (len(payload.encode()), payload.encode())
+        )
+        await writer.drain()
+        writer.close()
+        return
+
     try:
         body_json = json.loads(body.decode("utf-8")) if body else {}
     except Exception:

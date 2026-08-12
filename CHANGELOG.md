@@ -8,6 +8,7 @@
   - **新文件**：`gateways/nous.py`（只读同步器 + 后台循环）、`crack_nous.py`（只读凭据提取 CLI）、`docs/nous.md`；server.py lifespan 注册 `nous_sync_loop` + 启动同步一次
   - **2026-08-11 事故修复（重要，勿改回触发刷新）**：初版曾用 `docker exec hermes ... resolve_nous_runtime_credentials(force_refresh=True)` 触发刷新，导致 Nous Portal **refresh-token reuse 判定 revoke 整个 session**（auth.json `last_auth_error` 原文：Nous refresh tokens are single-use — only Hermes may call the refresh endpoint）。根因：Nous refresh_token **单次使用**，外部触发刷新未持久化旋转后的新 refresh_token，下次复用即被判 reuse revoke；且 docker exec 默认以容器 root 回写 auth.json，属主变 `root:root` 后 hermes 主进程（hermes 用户）失去写权限。修复：移除全部触发刷新逻辑（`HERMES_REFRESH_CMD`/`_trigger_hermes_refresh`/`crack_nous --refresh`），改为只读+告警；同步器检测无 token / `last_auth_error` 时告警提示重新登录（`hermes auth add nous --type oauth`，device-code 流程）。
   - 文档：`docs/nous.md`（只读同步机制/踩坑记录/陷阱）、`AGENTS.md` 端口表与模块清单同步
+- **聚合网关 8080 支持 `GET /v1/models`（2026-08-12）**：返回全部已配置的虚拟模型 id（OpenAI 格式 `{"object":"list","data":[{"id":...}]}`），opencode 等 OpenAI 兼容客户端可自动发现模型列表而无需手写；POST chat 请求仍按 body `model` 字段路由，不受影响（`gateways/aggregator/http_adapter.py`）
 
 ### Removed
 - **legacy 单端口模式彻底下线（2026-08-08）**：8081 早期是「一个端口按 `PREFERRED_PROVIDER` 选后端 + LiteLLM 翻译」的单端口代理，多端口架构上线后这条路径已长期无人走，本次连同其全部依赖一次性删除。

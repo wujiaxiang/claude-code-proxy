@@ -168,6 +168,8 @@ dashboard：      http://192.168.2.128:8079/dashboard
 
 聚合网关是**多下游统一入口**：客户端只连一个端口（8080，OpenAI 协议），用**虚拟模型 id**（如 `agg:sonnet`）请求，代理按配置把请求路由到多个真实下游 target 端口（8082 copilot / 8084 codebuddy / 8090 openrouter 等），并在成员之间做加权选择、会话粘性、失败重试与配额熔断。路由目标永远是**本地其他 target 端口**，聚合层本身不直连任何上游。
 
+**模型自动发现**：`GET /v1/models`（或 `/models`）返回全部已配置的虚拟模型 id（OpenAI 格式 `{"object":"list","data":[{"id":"<虚拟模型id>","object":"model",...}]}`），opencode 等 OpenAI 兼容客户端可自动发现模型列表而无需手写配置；POST chat 请求仍按 body 的 `model` 字段路由，不受影响。
+
 ### targets.json 配置
 
 聚合网关是一个普通 target（`handler: "aggregator"`），额外字段：
