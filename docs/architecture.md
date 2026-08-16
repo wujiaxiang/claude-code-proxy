@@ -339,11 +339,10 @@ dashboard「聚合网关」分组的 8080 卡片由前端 `loadAggregateStatus()
 
 ### 模型定义（models）
 
-8081 与所有 OpenAI 协议直连端口统一用 `models[]` 做别名解析（`_resolve_model_alias`）。该 `models[]` 与 `modelDefaults` 现位于 `targets[]` 中 `handler="anthropic"` 的 8081 target 嵌套内（server.py 启动时读此 target 填充 `_MODELS_CFG`，顶层残留的 `models/modelDefaults` 不再生效）：
+`models[]` 别名解析（`_resolve_model_alias`）**仅 8081 Anthropic 翻译入口生效**（方案 A，2026-08-16）。该 `models[]` 与 `modelDefaults` 现位于 `targets[]` 中 `handler="anthropic"` 的 8081 target 嵌套内（server.py 启动时读此 target 填充 `_MODELS_CFG`，顶层残留的 `models/modelDefaults` 不再生效）：
 
-- **命中且 `target.port` 等于请求到达的端口** → 只改写模型名继续原上游转发
-- **命中且指向另一端口**（含聚合网关 `agg:xxx`）→ 整体改路由到该端口
-- **未命中** → 8081 直接返回 404（legacy 单端口模式下线后不再有兜底路径，模型必须先在 `models[]` 里配路由）；直连端口未命中则原样透传模型名给自己上游
+- **8081 `/v1/messages`**：命中且 `target.port` 等于 8081 → 改写模型名翻译转发；命中指向另一端口（含聚合网关 `agg:xxx`）→ 整体改路由到该端口；未命中 → 直接返回 404（legacy 单端口模式下线后不再有兜底路径，模型必须先在 `models[]` 里配路由）
+- **其他 target 端口**（copilot/passthrough/qclaw 等）：**不做全局别名解析**，模型名原样透传给本端口上游，各端口服务自己 `models[]` 白名单声明的模型。全局别名此前对所有端口生效，会把 8082 上 `claude-sonnet-5` / `claude-haiku-4.5` 劫持跨端口路由到 8080 聚合网关（映射 deepseek-v4-flash:agg / hy3:agg），永远到不了 8082 自己的 GHE 上游——而 GHE 原生支持 `/v1/messages` 与 `/chat/completions`（models 能力声明 + 实测 200）
 
 示例（嵌套在 anthropic target 内）：
 

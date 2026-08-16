@@ -555,33 +555,34 @@ def test_model_stats_structure():
     print(f"PASS test_model_stats_structure: model stats structure correct")
 
 
-def test_handler_prepare_body_cross_port():
-    """_handler_prepare_body 三元组返回：跨端口信号 / 同端口改写 / 未命中透传。"""
+def test_handler_prepare_body_alias_scoped_to_anthropic():
+    """方案 A：全局别名解析仅对 handler=="anthropic"（8081）生效；
+    其他端口模型名原样透传给本端口上游，cross_port_target 恒 None。"""
     import server as _srv
     _srv._MODELS_CFG["models"] = [
         {"name": "sonnet", "aliases": [], "target": {"port": 8080, "model": "agg:sonnet"}},
     ]
     _srv._MODELS_CFG["modelDefaults"] = {"defaultPort": 8082}
     try:
-        # 跨端口：请求 target 是 8082，命中 sonnet（target.port=8080）→ cross_port_target 非空，body model 不改
+        # 非 anthropic 端口（passthrough/copilot/qclaw）：全局别名不生效，模型名原样透传
+        for handler in ("passthrough", "copilot", "qclaw"):
+            b, j, cross = _srv._handler_prepare_body(
+                {"label": "x", "handler": handler, "listenPort": 8082},
+                b'{"model": "sonnet", "messages": []}')
+            assert j is not None and cross is None, (handler, j, cross)
+            assert j["model"] == "sonnet", f"{handler} 不应被全局别名改写 model: {j}"
+        # 未命中模型同样原样透传
         b, j, cross = _srv._handler_prepare_body(
             {"label": "x", "handler": "passthrough", "listenPort": 8082},
-            b'{"model": "sonnet", "messages": []}')
-        assert j is not None, (j, cross)
-        assert cross == {"port": 8080, "model": "agg:sonnet"}, (j, cross)
-        assert j["model"] == "sonnet", "跨端口命中不应改写 body model（由调用方处理）"
-        # 同端口：请求 target 是 8080 → 只改写 model 为 agg:sonnet，cross 为 None
-        b2, j2, cross2 = _srv._handler_prepare_body(
-            {"label": "agg", "handler": "passthrough", "listenPort": 8080},
-            b'{"model": "sonnet", "messages": []}')
-        assert j2 is not None, (j2, cross2)
-        assert cross2 is None and j2["model"] == "agg:sonnet", (j2, cross2)
-        # 未命中：model 原样，cross 为 None
-        b3, j3, cross3 = _srv._handler_prepare_body(
-            {"label": "x", "handler": "passthrough", "listenPort": 8082},
             b'{"model": "nope-xyz", "messages": []}')
-        assert j3 is not None, (j3, cross3)
-        assert cross3 is None and j3["model"] == "nope-xyz", (j3, cross3)
+        assert j is not None and cross is None and j["model"] == "nope-xyz", (j, cross)
+        # anthropic handler（8081）：全局别名解析仍生效（8081 由 FastAPI 承载，
+        # 此处为函数语义兜底——跨端口命中返回 cross 信号，body model 不改写）
+        b, j, cross = _srv._handler_prepare_body(
+            {"label": "anthropic", "handler": "anthropic", "listenPort": 8081},
+            b'{"model": "sonnet", "messages": []}')
+        assert j is not None and cross == {"port": 8080, "model": "agg:sonnet"}, (j, cross)
+        assert j["model"] == "sonnet", "跨端口命中不应改写 body model（由调用方处理）"
     finally:
         _srv._MODELS_CFG["models"] = []
         _srv._MODELS_CFG["modelDefaults"] = {"defaultPort": 8082}

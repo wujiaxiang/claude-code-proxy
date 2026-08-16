@@ -19,6 +19,7 @@
   - **validator 模型映射退化**：`MessagesRequest` 的模型 validator 不再做 provider 前缀改写/大中小模型映射，只保留 `original_model` 记录
 
 ### Changed
+- **全局模型别名解析收窄到 8081（方案 A，2026-08-16）**：`_handler_prepare_body` 中的 `_resolve_model_alias(_MODELS_CFG, ...)` 只对 `handler=="anthropic"`（8081）生效，其他 target 端口模型名**原样透传**给自己的上游。此前对所有端口生效，会把 8082 上 `claude-sonnet-5` / `claude-haiku-4.5` 劫持跨端口路由到 8080 聚合网关（映射 deepseek-v4-flash:agg / hy3:agg），永远到不了 8082 自己的 GHE 上游。实测 GHE（copilot-api.bmw.ghe.com）claude 模型 `supported_endpoints` 原生包含 `/v1/messages` 与 `/chat/completions`，直连 `/v1/messages` 返回 200；修复后 8082 两个协议均可直通 GHE。8081 `/v1/messages` 翻译路由（server.py 内 `_resolve_model_alias` 调用）不受影响，别名表（`claude-sonnet-5`→8080、`claude-haiku-4-5-20251001`→8080、`claude-opus-5`→8082）保持原样。
 - **`/v1/messages/count_tokens` 改纯 tiktoken 估算**：不再经 LiteLLM 转换，直接走 `_estimate_messages_tokens`（含 system 与 tools 的文本提取），无网络调用、无第三方翻译层
 - **`COPILOT_*` 配置函数化**：原 `server.copilot` 段的 GHE host / integration id / 大中小模型名改为每次调用实时推导，`gateways/copilot.py` 新增 `_copilot_api_base()` / `_copilot_integration_id()` / `_copilot_big_model()` 等，数据源是 copilot target（8082/8083）的 `targetHost` / `extraHeaders` / `modelRoles`。同理原 `server.qclaw.baseUrl` 由 qclaw target 的 `targetHost` 承载。配置从此单一事实源在 target 定义里，不再两处各写一份
 - **文档同步**：`AGENTS.md` / `README.md` / `README-zh.md` / `docs/architecture.md` 移除 LiteLLM 依赖、provider 策略机制、四个 server 段旧键的描述，8081 路由说明改为单一路径 + 404 语义

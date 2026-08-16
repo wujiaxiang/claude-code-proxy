@@ -869,7 +869,7 @@ def _resolve_auth(headers: dict, target: Optional[dict] = None, provider: Option
 
 
 def _handler_prepare_body(target: dict, body_bytes: bytes):
-    """按 handler 处理请求体：统一模型别名解析 + qclaw body 清理。
+    """按 handler 处理请求体：模型别名解析（仅 anthropic）+ qclaw body 清理。
     返回 (new_body_bytes, body_json_or_None, cross_port_target_or_None)。
     cross_port_target 非 None 时表示该请求应整体路由到另一端口（调用方处理）。
     """
@@ -878,10 +878,16 @@ def _handler_prepare_body(target: dict, body_bytes: bytes):
         body_json = json.loads(body_bytes.decode("utf-8")) if body_bytes else {}
     except Exception:
         return body_bytes, None, None
-    # ── 统一模型别名解析（所有 handler，含 passthrough）──
+    # ── 模型别名解析：仅 8081 Anthropic 翻译入口（handler=="anthropic"）──
+    # 方案 A（2026-08-16）：全局别名表（_MODELS_CFG = 8081 anthropic target 的
+    # models[] 路由表）只服务 8081 的 /v1/messages 翻译链路；其他端口各服务自己
+    # 的 models[] 白名单，模型名原样透传给本端口上游。此前对所有端口生效，会把
+    # 8082 上 claude-sonnet-5 / claude-haiku-4.5 劫持跨端口路由到 8080 聚合网关
+    # （deepseek-v4-flash:agg / hy3:agg），永远到不了 8082 自己的 GHE 上游——
+    # 而 GHE 原生支持 /v1/messages 与 /chat/completions（models 能力声明 + 实测 200）。
     req_model = body_json.get("model")
     mapped = None
-    if req_model and isinstance(req_model, str):
+    if handler == "anthropic" and req_model and isinstance(req_model, str):
         mapped = _cfg._resolve_model_alias(_MODELS_CFG, req_model)
     cross_port_target = None
     if mapped:
@@ -921,22 +927,25 @@ def _handler_prepare_headers(target: dict, fwd_headers: dict, body_json: dict) -
 
     token 策略：
     - crack 类：注入 secrets token（secrets.json > apikeyEnv），覆盖客户端传入（统一用破解 token）
-    - free/paid（passthrough）类：客户端传入的 Authorization 优先（覆盖自己维护的）；
-      客户端未传时才用 dashboard 维护的 secrets.json token 兜底
+    - free/paid（passthrough）类：
+      - 有 secretRef 的 target（如 opencode-zen）：用 secrets token 覆盖客户端传入
+      - 无 secretRef 的 target：客户端传入的 Authorization 优先，未传时才用 secrets 兜底
     """
     handler = target.get("handler", "passthrough")
     category = target.get("category", "free")
     # 认证
-    if category == "crack":
+    if category == "crack" or target.get("secretRef"):
+        # crack 类或有 secretRef 的 free/paid 类：注入 secrets token 覆盖客户端传入
         token = _cfg.resolve_secret(target, _SECRETS)
         if token:
             fwd_headers["authorization"] = f"Bearer {token}"
         # crack 类凭据唯一事实源是 secrets.json 注入的 authorization；
         # 客户端透传的 x-api-key 必须删除——否则上游（如 codebuddy copilot.tencent.com）
         # 优先用 x-api-key 校验（dummy 值 → 401 invalid_format），无视已注入的 authorization。
-        fwd_headers.pop("x-api-key", None)
+        if category == "crack":
+            fwd_headers.pop("x-api-key", None)
     elif "authorization" not in fwd_headers:
-        # free/paid：客户端未带 token → 用自己维护的 secrets.json / apikeyEnv 兜底
+        # free/paid 无 secretRef：客户端未带 token → 用自己维护的 secrets.json / apikeyEnv 兜底
         token = _cfg.resolve_secret(target, _SECRETS)
         if token:
             fwd_headers["authorization"] = f"Bearer {token}"
