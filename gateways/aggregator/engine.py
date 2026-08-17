@@ -35,7 +35,7 @@ class AllPoolsExhausted(Exception):
 # 聚合网关失败分类表（状态码严格优先于文本）。
 # 命中此表的状态码直接返回对应分类，绝不回退到文本判断。
 _HTTP_STATUS_CLASSIFICATION: dict[int, str] = {
-    400: "pass_through_to_client",
+    400: "retry_other_or_fallback",  # 400 often model-specific (e.g. reasoning_content), fallback may succeed
     401: "retry_other_or_fallback",
     402: "retry_other_or_fallback",
     403: "retry_other_or_fallback",
@@ -53,6 +53,7 @@ _HTTP_STATUS_CLASSIFICATION: dict[int, str] = {
 # retry_other_or_fallback 分类下的熔断原因（状态码 → reason）。
 # 不在表内（即由配额文本兜底命中）统一记为 "quota_text"。
 _RETRY_OTHER_REASONS: dict[int, str] = {
+    400: "400_client_error",
     401: "401_auth",
     402: "402_billing",
     403: "403_forbidden",

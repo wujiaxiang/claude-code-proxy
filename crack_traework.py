@@ -38,8 +38,8 @@ HASH_SIZE = 64
 
 # 请求头固定值（设备指纹）
 APP_ID = "6eefa01c-1036-4c7e-9ca5-d891f63bfcd8"
-IDE_VERSION = "0.1.43"
-IDE_VERSION_CODE = "20260730"
+IDE_VERSION = "0.1.51"
+IDE_VERSION_CODE = "20260814"
 
 
 def _xor_salts(a: bytes, b: bytes) -> bytes:

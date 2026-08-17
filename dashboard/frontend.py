@@ -480,10 +480,11 @@ DASHBOARD_STYLE = """
   .model-editor-list .mrow-id { color: var(--text-primary); }
   .model-editor-list .mrow-name { color: var(--text-secondary); }
   .model-editor-add { padding-top: 2px; }
-  .mm-row { display: grid; grid-template-columns: minmax(140px, 1fr) minmax(150px, 1fr) 180px minmax(200px, 1.35fr) auto; gap: 8px; align-items: center; padding: 10px; margin-bottom: 8px; background: linear-gradient(180deg, rgba(255,255,255,0.02), rgba(255,255,255,0.004)), var(--bg-inset); border: 1px solid var(--border); border-radius: var(--radius-sm); transition: border-color 0.2s, background 0.2s; }
+  .mm-row { display: grid; grid-template-columns: minmax(120px, 1fr) minmax(130px, 1fr) 150px minmax(160px, 1.1fr) 110px auto; gap: 8px; align-items: center; padding: 10px; margin-bottom: 8px; background: linear-gradient(180deg, rgba(255,255,255,0.02), rgba(255,255,255,0.004)), var(--bg-inset); border: 1px solid var(--border); border-radius: var(--radius-sm); transition: border-color 0.2s, background 0.2s; }
   .mm-row:hover { border-color: rgba(34,211,238,0.3); background: rgba(34,211,238,0.035); }
   .mm-row .agg-mem-port { width: 100%; }
   .mm-row .agg-mem-model { min-width: 0; }
+  .mm-row .md-protocol { width: 100%; min-width: 0; }
   .mm-hint { font-size: 11.5px; line-height: 1.55; color: var(--text-tertiary); margin: 0 0 14px; padding: 9px 12px; border-left: 2px solid var(--brand-cyan); background: rgba(34,211,238,0.045); border-radius: 0 var(--radius-sm) var(--radius-sm) 0; }
   .mm-del, .mm-add-btn { border-radius: var(--radius-sm); font-size: 12px; font-weight: 600; cursor: pointer; transition: background 0.2s, border-color 0.2s, transform 0.15s; }
   .mm-del { border: 1px solid transparent; background: transparent; color: var(--text-tertiary); padding: 6px 8px; }
@@ -507,7 +508,7 @@ DASHBOARD_STYLE = """
     .modal-overlay { padding: 12px; }
     .modal-wide { max-width: 100%; }
     .mm-row { grid-template-columns: 1fr; }
-    .mm-row .agg-mem-port, .mm-row .agg-mem-model { width: 100%; }
+    .mm-row .agg-mem-port, .mm-row .agg-mem-model, .mm-row .md-protocol { width: 100%; }
     .mm-row .mm-del { justify-self: end; }
   }
 
@@ -1578,7 +1579,7 @@ async def dashboard():
 
   <!-- 模型定义编辑 modal（全局 models[]：name/aliases/target port+model） -->
   <div class="modal-overlay" id="models-modal" role="dialog" aria-modal="true" aria-label="编辑模型定义">
-    <div class="modal">
+    <div class="modal modal-wide">
       <div class="modal-head">
         <h3 id="models-modal-title">模型定义</h3>
         <button class="modal-close" onclick="closeModelsEditor()" aria-label="关闭">×</button>
@@ -2042,28 +2043,33 @@ function buildModelsEditorHtml(r) {{
     '</div></div>';
   html += '<div class="agg-section"><div class="agg-section-title">模型定义列表</div>';
   if (models.length === 0) {{
-    html += modelsRowHtml('', '', '', '', 0);
+    html += modelsRowHtml('', '', '', '', 0, 'openai');
   }} else {{
     models.forEach(function(m, i) {{
       var aliases = (m.aliases || []).join(', ');
       var t = m.target || {{}};
-      html += modelsRowHtml(m.name, aliases, t.port, t.model, i);
+      html += modelsRowHtml(m.name, aliases, t.port, t.model, i, t.protocol);
     }});
   }}
   html += '<div class="agg-add-row"><button class="mm-add-btn" onclick="addModelsRow()">+ 添加模型</button></div></div>';
   return html;
 }}
 
-function modelsRowHtml(name, aliases, port, model, index) {{
+function modelsRowHtml(name, aliases, port, model, index, protocol) {{
   var n = (name === undefined || name === null) ? '' : escHtml(String(name));
   var a = (aliases === undefined || aliases === null) ? '' : escHtml(String(aliases));
   var p = (port === undefined || port === null) ? '' : escHtml(String(port));
   var m = (model === undefined || model === null) ? '' : escHtml(String(model));
+  var proto = (protocol === 'messages') ? 'messages' : 'openai';
   return '<div class="mm-row">' +
     '<input type="text" class="agg-input md-name" data-path="models[' + index + '].name" value="' + n + '" placeholder="模型名（如 sonnet）" aria-label="模型名">' +
     '<input type="text" class="agg-input md-aliases" data-path="models[' + index + '].aliases" value="' + a + '" placeholder="别名，逗号分隔" aria-label="别名">' +
     aggPortSelectHtml(p, 'models[' + index + '].target.port') +
     aggModelSelectHtml(p, m, 'models[' + index + '].target.model') +
+    '<select class="agg-input md-protocol" data-path="models[' + index + '].target.protocol" aria-label="下游协议" title="下游协议：openai=需翻译为 /v1/chat/completions；messages=下游已是 /v1/messages，直接透传">' +
+    '<option value="openai"' + (proto === 'openai' ? ' selected' : '') + '>openai</option>' +
+    '<option value="messages"' + (proto === 'messages' ? ' selected' : '') + '>messages</option>' +
+    '</select>' +
     '<button class="mm-del" onclick="removeModelsRow(this)" title="删除此行">×</button>' +
     '</div>';
 }}
@@ -2071,7 +2077,7 @@ function modelsRowHtml(name, aliases, port, model, index) {{
 function addModelsRow() {{
   var body = document.getElementById('models-modal-body');
   if (!body) return;
-  mmInsertRow(body, modelsRowHtml('', '', '', '', body.querySelectorAll('.mm-row').length), '.agg-add-row');
+  mmInsertRow(body, modelsRowHtml('', '', '', '', body.querySelectorAll('.mm-row').length, 'openai'), '.agg-add-row');
 }}
 
 function removeModelsRow(btn) {{
@@ -2086,10 +2092,12 @@ function syncModelsPaths(body) {{
     var aliases = row.querySelector('.md-aliases');
     var port = row.querySelector('.agg-mem-port');
     var model = row.querySelector('.agg-mem-model');
+    var protocol = row.querySelector('.md-protocol');
     if (name) name.dataset.path = prefix + '.name';
     if (aliases) aliases.dataset.path = prefix + '.aliases';
     if (port) port.dataset.path = prefix + '.target.port';
     if (model) model.dataset.path = prefix + '.target.model';
+    if (protocol) protocol.dataset.path = prefix + '.target.protocol';
   }});
 }}
 
@@ -2117,10 +2125,12 @@ async function saveModelsEditor(btn) {{
     var aEl = row.querySelector('.md-aliases');
     var pEl = row.querySelector('.agg-mem-port');
     var mEl = row.querySelector('.agg-mem-model');
+    var protoEl = row.querySelector('.md-protocol');
     var n = (nEl ? nEl.value : '').trim();
     var a = (aEl ? aEl.value : '').trim();
     var p = (pEl ? pEl.value : '').trim();
     var m = (mEl ? mEl.value : '').trim();
+    var proto = protoEl ? protoEl.value : 'openai';
     if (!n && !a && !p && !m) return;
     if (!n) {{ mmMsg(msg, 'err', '⚠️ 模型名不能为空'); bad = true; return; }}
     if (p === '' || isNaN(Number(p)) || Number(p) < 0 || Number(p) % 1 !== 0) {{
@@ -2128,7 +2138,9 @@ async function saveModelsEditor(btn) {{
     }}
     if (!m) {{ mmMsg(msg, 'err', '⚠️ 模型 ' + n + ' 的真实模型不能为空'); bad = true; return; }}
     var aliases = a ? a.split(',').map(function(x) {{ return x.trim(); }}).filter(function(x) {{ return x; }}) : [];
-    models.push({{name: n, aliases: aliases, target: {{port: Number(p), model: m}}}});
+    var target = {{port: Number(p), model: m}};
+    if (proto === 'messages') target.protocol = 'messages';
+    models.push({{name: n, aliases: aliases, target: target}});
   }});
   if (bad) return;
   var payload = {{models: models, modelDefaults: {{defaultPort: Number(defaultPort)}}}};

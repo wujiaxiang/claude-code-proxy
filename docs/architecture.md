@@ -89,6 +89,30 @@ dashboard：      http://192.168.2.128:8079/dashboard
 }
 ```
 
+**可选 `messagesProfile`（每端能力开关，缺省不报错、全向后兼容）**：
+
+passthrough 的 `/v1/messages` 请求体先经 `gateways/messages_contract.filter_messages_request()` 扁平白名单过滤（仅保留 Anthropic 标准字段），随后做**能力门控**——若某 target 声明了 `messagesProfile` 且其中某语义能力键显式为 `false`，则对应字段即便在白名单内也会被剥离后再转发；键缺失或 `true` 则照常透传（fail-open，绝不因「未声明」而静默丢弃）。
+
+该键完全可选：存量 target 不配置 `messagesProfile` 时，行为与旧版完全一致（零回归）。
+
+```jsonc
+{
+  "messagesProfile": {              // 可选：本 target 的 /v1/messages 语义能力声明
+    "supportsThinking": true,      // thinking 字段是否转发（false → 剥离；缺省/true → 透传）
+    "supportsTopK": true,          // top_k 字段是否转发（false → 剥离；缺省/true → 透传）
+    "supportsToolChoice": true     // tool_choice 字段是否转发（false → 剥离；缺省/true → 透传）
+  }
+}
+```
+
+> **三态 fail 策略**（贯穿字段过滤）：
+> | 字段类别 | 策略 |
+> |----------|------|
+> | 安全/凭据字段（`authorization` / `x-api-key` / `cookie`） | fail-closed：由 `_resolve_auth` 注入，客户端携带的被剥离，不泄露到上游 |
+> | 未知 OPTIONAL 字段 | fail-open：扁平白名单外字段仍按既往契约丢弃，能力门控绝不外溢到未知字段 |
+> | 语义能力字段（`thinking` / `top_k` / `tool_choice`） | capability-driven：profile 显式 `false` → 剥离；缺省/`true` → 透传 |
+
+
 **secrets 优先级**：`secrets.json` > `apikeyEnv` 环境变量 > 客户端透传（free/paid）。
 
 ### 顶层 `server` 段（主服务运行配置）

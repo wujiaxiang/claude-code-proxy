@@ -614,3 +614,233 @@ seed-code 等模型协议转换出问题（空响应/工具调用异常/格式�
 - 用例集合：`scripts/test-cases/trae-work/*.json`（14 个：glm-5.2 / Doubao-Seed-Code × 流式/非流式 × 简单/工具历史/content+tool_calls/多轮/长 system）
 - 历史关键回归点：`seed-tool-history`（曾 0 chunks 空响应）、`seed-nonstream-toolhistory`（曾 arguments 混入 reasoning）、`seed-*-tool*`（曾 [Tool Call:] 文本泄漏）
 - 排查时临时加流式 `chunk raw=` DEBUG 日志（已内置，`_handle_traework`），看上游原始事件与转换输出
+
+---
+
+## 11. 重大发现：真实客户端已迁移到 `workflow/start` 新协议（2026-08-17）
+
+### 11.1 现象
+
+8086 端口（`llm_utils_chat` HTTP+SSE 接口）自 2026-08-13 起持续返回 `code=4011`
+（`We're sorry, your requests have exceeded the rate limit.`），且**与请求频率无关**——
+单次、间隔数分钟的孤立请求同样必现。同期 177 上真实 Trae Work 客户端（VSCode 插件）
+对话功能完全正常。
+
+### 11.2 排查过程（按时间顺序，均已证伪，仅供参考勿重复）
+
+1. **IDE 版本号过旧**（`0.1.43`/`20260730` → 从 177 真实 `product.json` 取得 `appVersion=0.1.51`，
+   构建日期 `2026-08-14`）：更新 `gateways/trae_work.py`（实际生效路径）、`crack_common.py`、
+   `crack_traework.py` 三处常量后**问题依旧**，直连上游裸测（绕开代理层）`extra:null`，
+   无更多诊断信息。
+2. **账号/额度问题**：`--quota` 显示多档权益未耗尽（仅一档 2000/2000 用尽，其余充足）；
+   `--checkin` 正常；`trae_work_token` JWT 未过期（有效至 2026-08-28）。**排除**。
+3. **设备指纹伪造**：`x-device-id`/`x-machine-id` 硬编码值与 177 上
+   `telemetry.machineId` 实测**完全一致**（非伪造）。**排除**。
+4. **Header 缺失**：对照文档 §4 清单逐项核对，`_trae_build_headers` 字段齐全。**排除**。
+
+### 11.3 抓包定位真因（四层递进，前三层均失败）
+
+| 方法 | 结果 | 原因（事后判断） |
+|------|------|------|
+| CDP 渲染进程 Network 域（`--remote-debugging-port`） | 只抓到 `get_session_usage`（账户信息接口），从未见聊天请求 | 聊天流量不在这个渲染进程发起（或者不在这条 fetch/XHR 路径） |
+| CDP Node 主进程 hook（`--inspect` + `Runtime.evaluate` 劫持 `http`/`https`/`fetch`） | 抓到 `icube-api.bytedance.net/trae/ping` 心跳（证明 hook 本身有效），但从未见聊天流量 | 聊天流量也不在 Node 主进程的 `http`/`https`/`fetch` 层 |
+| Electron `--proxy-server=host:port` 系统级重定向 + mitmproxy | 63 个请求全是遥测域名（`mcs.zijieapi.com` 等），**无一条 `trae-api-cn.mchost.guru`** | `--proxy-server` 只影响 Chromium 网络栈，聊天请求绕过了它 |
+| **`mitmdump --mode "local:TRAE SOLO CN.exe"`（WinDivert 驱动，OS 层按进程名重定向，见 §12）** | **✅ 成功**：抓到完整真实流量，含 `POST https://api5-normal.mchost.guru/api/agent/v3/workflow/start` | 唯一能在 OS socket 层无差别拦截、不受应用自身路由逻辑影响的方法 |
+
+**结论（几经修正，以此为准）**：
+
+1. 真实客户端对话走的是全新接口 **`POST https://api5-normal.mchost.guru/api/agent/v3/workflow/start`**（host 也变了，不再是 `trae-api-cn.mchost.guru`），**完全不是**本文档 §3.1、`crack_traework.py`/`gateways/trae_work.py` 一直在用的 `api/agent/v3/llm_utils_chat`。
+2. 认证头也变了：真实请求用 **`x-ide-token: <JWT>`**（裸 token，无前缀），不是 `Authorization: Cloud-IDE-JWT <token>`。
+3. 新增大量头：`x-bridge-transport: aha`、`x-lgw-req-sdk-type: 3`、`package-type: stable_cn`、`x-ahanet-timeout: 86400`、`x-request-pin`、`x-requested-at`、`x-request-id`、`x-trae-request-id`、`x-lscbd-aid`、`x-lscbd-platform`、`x-ss-dp`、`x-tt-trace-id`、以及三个疑似加密/签名材料头 **`x-helios`/`x-medusa`/`x-neptune`**。
+4. **`workflow/start` 的请求体和响应体本身是密文**（不是 gzip，是随机字节流），必须先搞清楚 `x-helios`/`x-medusa`/`x-neptune` 这套加密方案才能构造合法请求——这不是"改几个 header"能解决的，而是要逆向一套专有加密协议。
+5. 抓包过程中一度误判"聊天走 `wss://.../ws/v2` 持久 WebSocket"——后来用 Trae **IDE**（非 Trae Work）做对照实验证伪：IDE 在**完全不聊天**、仅空跑的情况下同样会建立这个 `ws/v2` 连接（`aid=711126` 与遥测 SDK 共用的 aid 一致）。**结论修正为**：`ws/v2` 是字节通用的长连接推送通道（类似 Frontier 基建，用于通知/在线状态），**不是**专属聊天传输层——这是本次排查唯一一个先下结论、后被推翻的判断，记录下来避免下次重复踩坑。
+6. 尝试寻找"本地明文网关"（怀疑聊天内容先发到本地 sidecar 明文，再由 sidecar 加密转发）：确认 Trae Work 主进程确实监听了额外本地端口 `127.0.0.1:17788`（HTTP，CORS 头 `Access-Control-Allow-Headers: x-jwt-token`），但**用渲染进程 Network 域和 Node 主进程 hook 两条路径都没能捕获到对 17788 的实际调用**——要么调用来自尚未定位的第三个进程，要么 17788 根本跟对话链路无关（更像是扩展宿主/本地 IPC 用途）。此方向未能证实或证伪，如后续要继续深挖，起点是先确认 17788 到底被谁调用（可用 `Sysinternals Handle`/`Process Monitor` 这类工具查看 socket 归属，本次未安装此类工具）。
+
+### 11.4 8086 网关现状与建议
+
+- 现有实现（`llm_utils_chat` + `Authorization: Cloud-IDE-JWT`）**仍然"活着"**：能连通、能鉴权、返回 200，只是被一个持续性的 `code=4011` 限流卡死——大概率是因为它已不是主路径，后端对这条旧路径做了限流处理。
+- 改 header/版本号**不会修复**这个问题（已实测：`x-ide-version`/`x-ide-version-code` 改成真实值后 4011 依旧）。
+- 若要让 8086 真正可用，需要重写整个上游对接层去适配 `workflow/start`，前提是先破解 `x-helios`/`x-medusa`/`x-neptune` 这套加密方案——工作量远大于当前实现，建议作为独立任务立项，而非在现有代码上小修小补。
+
+> 通用抓包方法论（`mitmproxy local` 模式的具体用法、CDP 自动打字、常见坑）已整理到
+> 独立的 §12，本节聚焦本次排查的具体结论。
+
+---
+
+## 12. 通用抓包方法论（适用于 Trae Work / Trae IDE / VSCode Trae 插件等所有 Electron/VSCode 系客户端）
+
+> 本节与具体产品无关，是这次排查沉淀下来的通用步骤，下次抓任意 Electron/VSCode 系
+> 客户端的真实网络协议时直接照抄，不用重新摸索。
+
+### 12.1 环境前提
+
+- 目标客户端装在 Windows 机器上，本例是 `192.168.2.177`（`Administrator` 免密 SSH，见
+  §10.1），Python venv 用的是 `C:\Users\Administrator\AppData\Local\hermes\hermes-agent\venv`
+- 需要该 venv 装有 `mitmproxy`（`pip install mitmproxy`，自带 `mitmproxy-windows`/
+  `pydivert`/`mitmproxy_rs` 依赖，装一次即可，7 月 8 号就装过，确认存在再决定要不要重装）
+- SSH 是非交互会话（无桌面），**GUI 应用不能直接 `start`/`cmd /c` 启动**——非交互 session
+  里启动的 GUI 进程要么静默失败要么无法渲染，见 12.2
+
+### 12.2 关键坑：非交互 SSH 会话启动 GUI 应用
+
+`ssh user@host "cmd /c start ..."` 或 `Start-Process` 在纯 SSH 会话里启动 GUI 应用
+**大概率静默失败**（无报错、进程不存在），因为 SSH 会话默认落在 session 0（services），
+GUI 应用需要真实的交互式桌面 session。
+
+**解法**：用 `schtasks` 创建一次性任务，加 `/it`（interactive token）参数，让任务
+以当前登录用户的交互式 token 运行，这样启动的进程会出现在真实桌面 session
+（`query session` 能看到的 `rdp-tcp#N` 这一行）：
+
+```
+schtasks /create /tn <任务名> /tr "<完整命令行，含参数>" /sc once /st 23:59 /ru <用户名> /it /f
+schtasks /run /tn <任务名>
+:: 等几秒确认进程起来后
+schtasks /delete /tn <任务名> /f
+```
+
+- `/tr` 里的可执行文件路径含空格时，整个 `/tr` 值要用**外层双引号**包住，路径本身
+  再套一层转义引号（`\"...\"`）；嵌套引号超过 2-3 层容易解析出错，**优先把命令写成
+  一个 `.bat` 文件用 `Write` 工具在本地写好、`scp` 传过去，再 `schtasks /tr` 直接指向
+  这个 `.bat` 文件**，比在命令行里堆转义可靠得多（本次踩过 `cmd /c "..."` 嵌套转义
+  失败的坑，改用 `.bat` 文件后一次成功）
+- 每次改动完记得清理任务（`schtasks /delete`）避免残留
+
+### 12.3 三种抓包手段的优先级（按成功率排序）
+
+| 优先级 | 方法 | 命令 | 覆盖范围 | 何时用 |
+|---|---|---|---|---|
+| 1（首选） | **mitmproxy `local` 模式**（WinDivert，按进程名重定向） | `mitmdump --mode "local:进程名.exe" -w out.flow` | OS socket 层，**不管请求从 Node/Rust/Chromium 哪一层发出都能截获**，唯一在本次排查里成功抓到真实聊天请求的方法 | 默认首选，不需要额外装 Npcap/Wireshark/Proxifier（这三个都尝试过，均因需要交互式会话/内核驱动装不上或卡住） |
+| 2 | CDP 渲染进程 Network 域 | `--remote-debugging-port=9222` + `chrome://inspect` 或直接连 `ws://127.0.0.1:9222/devtools/page/<id>` 用 `Network.enable` | 只能看到**这个渲染进程**自己发起的 fetch/XHR，看不到其他进程、看不到 Node 主进程、看不到 Rust 核心 | 快速验证某个 UI 交互对应的接口调用时够用，但**看不到就不代表没有**——只能证明"这层没发"，不能证明"整个应用没发" |
+| 3 | CDP Node 主进程 hook | `--inspect=9223` + `Runtime.evaluate` 注入代码劫持 `http`/`https`/`fetch` | 只能看到 **Node 主进程**（Electron browser process）里经这三个 API 发出的请求 | 同上，局限明显，且本次两次尝试聊天请求都没抓到（抓到了心跳/ping，证明 hook 有效，但主链路不在这层） |
+
+**核心教训**：方法 2、3 都是"在某一层挂钩子"，只能证明"这一层有没有"，**证伪能力弱**——
+只要应用有多进程/多语言运行时（Electron 主进程 + 渲染进程 + Rust sidecar，是这类
+"AI IDE"的常见架构），关键流量完全可能绕过任意一层的钩子。方法 1（OS 层按进程名
+拦截）没有这个盲区，才是应该优先尝试的手段，能省下大量在方法 2/3 上反复摸索的时间。
+
+### 12.4 用 CDP 自动打字发消息（不用等真人手动点）
+
+如果需要在抓包窗口内主动触发一次对话（而不是等人工发消息、屡屡错过窗口），
+可以用 CDP 直接操作 UI：
+
+1. 先枚举候选输入框：
+   ```js
+   Array.from(document.querySelectorAll('textarea, [contenteditable="true"], input[type="text"]'))
+     .map(el => ({tag: el.tagName, cls: el.className, visible: !!(el.offsetWidth||el.offsetHeight)}))
+   ```
+2. **不要用 `document.execCommand('insertText', ...)`**——现代富文本编辑器（Lexical/Slate
+   类框架）不认这套，`insertText` 会静默失败（`innerText` 检查出来是空的），只是没报错
+   看起来像成功了，容易误判
+3. 改用 CDP **`Input.insertText`**（原生输入事件，走 Chromium 真实输入管线，兼容性好
+   得多）+ `Input.dispatchKeyEvent`（Enter 键）：
+   ```python
+   await send(ws, N, "Input.insertText", {"text": "要发的内容"})
+   await send(ws, N+1, "Input.dispatchKeyEvent", {"type": "keyDown", "key": "Enter", "code": "Enter", "windowsVirtualKeyCode": 13})
+   await send(ws, N+2, "Input.dispatchKeyEvent", {"type": "keyUp", "key": "Enter", "code": "Enter", "windowsVirtualKeyCode": 13})
+   ```
+4. 发送前先 `el.focus()`（Runtime.evaluate 里对目标元素调用），否则 `Input.insertText`
+   可能落到错误的（或没有）焦点元素上
+
+### 12.5 常见反复踩的坑（复查清单）
+
+1. `mitmdump --mode local:进程名` 的进程名传错（比如手滑传了 `help` 想看帮助），会
+   **静默"成功启动"并挂起等待匹配进程**，不报错、不打印用法——先用确认能匹配到的
+   真实进程名验证有输出，再排除"参数写错"这个可能
+2. `ssh -f -N -L` 端口转发命令本身会立刻返回（正常），但如果因为端口冲突或权限问题
+   没转发成功，本地 `curl` 会显示 connection refused——每次建隧道后**必须** `curl` 验证
+   一次再往下走，不要假设转发一定成功
+3. 同时启动两个重量级 Electron 应用（比如 Trae IDE + Trae Work）来做对照实验，
+   叠加抓包工具的资源/驱动占用，**可能导致其中一个意外崩溃退出**——如果要开第二个
+   应用做对比，做完立刻关掉，并检查原来那个还活着，不活着立刻拉起来，不要等用户
+   发现"应用消失了"才处理
+4. 一旦从渲染进程或 Node 主进程都没抓到目标流量，**不要无限重试同一层**——换成
+   方法 1（OS 层 `mitmdump local` 模式）大概率能解决，重试次数控制在 2-3 次内没
+   进展就换手段
+5. 抓到的响应体如果是"看起来像乱码但不是明显的 gzip/deflate 头"，大概率是**真正的
+   加密密文**，不是编码问题——不要浪费时间试各种字符集解码，直接确认协议已加密，
+   记录相关的自定义 header（本例是 `x-helios`/`x-medusa`/`x-neptune`），作为后续
+   加密方案逆向的输入
+
+### 12.6 多目标横向验证结果（2026-08-17，同一台机器装了 Trae IDE / Trae Work / VSCode+MarsCode 插件三个客户端）
+
+| 目标 | 结果 |
+|---|---|
+| **Trae Work**（TRAE SOLO CN.exe） | ✅ 成功抓到真实协议（见 §11.3）：`POST https://api5-normal.mchost.guru/api/agent/v3/workflow/start` |
+| **Trae IDE**（Trae CN.exe） | ✅ 成功抓到：**同样是** `POST https://60.5.20.200/api/agent/v3/workflow/start`（host 是负载均衡的另一个 IP，路径完全一致），配套 `create_agent_task`/`sync_history_state`/`query_history_state`/`chat_mode`/`batch_get_detail_param` |
+| **VSCode + MarsCode 插件**（Code.exe，扩展 ID `marscode.marscode-extension`，官方名 **TraeCode**） | ⚠️ 定位到真实域名 **`a0ai.marscode.cn`**，但**证书锁定（cert pinning）**——该域名在 TLS 握手阶段就拒绝 mitmproxy 的（已加入 Windows 信任库的）CA 证书，`http.proxy` 系统代理设置也绕不过，无法解密内容。三个客户端里唯一真正拦不到明文的 |
+
+**结论**：`workflow/start` 是**字节 Trae 全系产品线通用的新协议**（IDE 和 Work 共用同一套
+`v3/agent` API 族），不是 Trae Work 专属的变化——这进一步说明旧的 `llm_utils_chat`
+在整条产品线里都已经过时，8086 网关要跟上必须整体迁移到新协议（并解决 §11.3 提到的
+请求体加密问题），不存在"换个产品线接口就没这问题"的取巧空间。
+
+**VSCode 侧的关键突破与瓶颈（2026-08-17，第二轮补充排查）**：
+
+1. **突破**：VSCode/Electron 有独立于系统代理的 `http.proxy`/`http.proxyStrictSSL`/
+   `http.proxySupport` 设置（`%APPDATA%\Code\User\settings.json`），专门用于让扩展宿主
+   进程（Extension Host，独立 Node.js 进程）的网络请求走指定代理——这比 `mitmdump local`
+   模式更精确命中扩展这一层，且**不需要驱动**。设置示例：
+   ```json
+   {
+     "http.proxy": "http://127.0.0.1:8888",
+     "http.proxyStrictSSL": false,
+     "http.proxySupport": "override"
+   }
+   ```
+   改完必须**彻底 `taskkill /F /IM Code.exe /T` 后重新启动**（不是重载窗口）才生效，
+   同时要保证 `mitmdump -p 8888`（**普通正向代理模式，不是 `local` 模式**）在整个
+   VSCode 重启过程中不中断——本次踩过的坑：中途 `mitmdump` 掉线过几次导致 VSCode
+   内部判定"代理不可用"进而退化直连，即使之后代理恢复也不会重连，必须让代理先
+   稳定运行、再重启 VSCode，顺序不能反
+2. **瓶颈**：即使拿到明文代理链路，`a0ai.marscode.cn`（高度疑似 MarsCode 真正的 AI
+   接口域名）在 TLS 握手阶段就报 `Client TLS handshake failed ... does not trust
+   the proxy's certificate`——说明这个域名的请求走的是**证书锁定的独立 TLS 客户端**
+   （不受 VS Code 全局 `http.proxyStrictSSL: false` 影响，这个设置只对标准 Node.js
+   `https` 模块生效，证书锁定客户端绕过了这层配置），比 Trae Work/IDE 的防护更强
+
+**Trae IDE 抓包补充方法**：VSCode 系客户端的 AI 聊天面板是**双层 iframe 的 webview**
+（`document.querySelectorAll('iframe.webview')`能找到外层 iframe，但内层内容因跨域
+无法用 `Runtime.evaluate` 直接读取/操作）。本次没有解出精确坐标去自动点击输入框，
+改为请人工在窗口内手动发送——这个针对 VSCode webview 的自动化输入问题本次**未解决**，
+如果下次需要在 VSCode 系客户端里自动触发聊天，需要用 CDP `Page.createIsolatedWorld`
+或类似手段拿到 webview 内层 frame 的 `executionContextId`，直接在那个 context 里
+跑 `Runtime.evaluate`，而不是在最外层 workbench 页面的 context 里执行。
+
+### 12.6.1 排查中验证过的开源项目（均非可用捷径，记录以免重复调研）
+
+| 项目 | 描述 | 验证结论 |
+|---|---|---|
+| `Ttungx/trae-solo-local-api`（ZedeX 分支，7 星，2026-08-11 更新） | 专门声称适配 TRAE SOLO/Work 的本地 OpenAI 兼容网关 | ❌ 实测 `src/trae-client.js` 第 474 行调用的仍是**旧接口** `api/agent/v3/llm_utils_chat`，跟我们现有 8086 网关用的是同一个已被限流的接口，**不解决问题**。`src/crypto.js` 也只是它自己本地存储用的通用 AES-GCM 工具（随机自生成 key），与 `x-helios`/`x-medusa`/`x-neptune` 这套线上协议加密**完全无关**，容易被名字误导 |
+| `DASungta/trae-proxy`（Go 项目，49 星，2026-07-31 更新） | "爆锤 Trae 不支持自定义模型接入" | ❌ 方向完全相反——这是让 Trae **反过来调用你自己的模型后端**（自定义模型接入 Trae 内部使用），不是把 Trae 自己的对话能力代理给外部消费，跟我们的目标南辕北辙 |
+
+**教训**：网络上（含 AI 生成的建议）推荐的"现成开源方案"必须先验证再采信——
+方法是直接读目标仓库 `src/` 下实际发请求的那个文件（本例是 `trae-client.js`），
+grep 真实调用的端点路径，而不是只看 README 的功能描述和更新时间。
+
+### 12.6.2 下一步方向（未实施，仅记录，供后续继续时参考）
+
+鉴于新协议（`workflow/start` + `x-helios`/`x-medusa`/`x-neptune` 签名/加密）没有
+现成开源实现，且证书锁定（VSCode 侧的 `a0ai.marscode.cn`）挡住了纯抓包路线，
+**更可行的方向是"寄生注入"而非"逆向加密算法"**：
+
+- 已验证可行的基础能力：`--inspect=<port>` + CDP `Runtime.evaluate` 可以在**真实
+  登录态的 Trae 主进程内**执行任意 JS（本次用它 hook 过 `http`/`https`/`fetch`，
+  也验证过能捕获到真实的 `icube-api.bytedance.net/trae/ping` 心跳请求）
+- 思路：不逆向加密算法，而是在运行时找到 `app.asar` 解包后源码里**真正构建
+  `workflow/start` 请求体（含签名）的那个函数**，直接在已认证的进程上下文里调用它、
+  传入自己的消息内容——因为签名/加密是该函数自己算的，我们不需要知道算法细节
+- 关键前置步骤（未做）：`app.asar` 解包（`npx asar extract app.asar out/` 之类），
+  在解包出的 JS 里搜索 `workflow/start`、`x-helios` 等关键字符串定位目标函数，
+  再决定怎么在运行时调用它（可能需要拿到闭包内的 auth/session 对象作为参数）
+- 工作量评估：比"改 header/版本号"大得多，但比"逆向签名算法从零实现"小得多，
+  是相对最优的性价比路径，只是本次会话未执行，留待下次专项处理
+
+### 12.7 收尾清理（每次抓包后必做）
+
+- `taskkill /F /IM mitmdump.exe`（停止抓包，flush 输出文件）
+- 目标客户端如果被临时加过 `--remote-debugging-port`/`--inspect`/`--proxy-server`
+  等调试参数重启过，**验证完立刻按无参数重新拉起**，恢复原状
+- 删除临时下载的安装包/日志/`.flow` 抓包文件/`.bat` 脚本（`del /Q ...`）
+- 删除所有临时 `schtasks` 任务（`schtasks /delete /tn ... /f`）——一次性任务如果中途
+  被打断可能忘删，每次收尾前 `schtasks /query` 过一遍确认
+- 关闭本地建立的 SSH 端口转发进程（`pkill -f "L <本地端口>:127.0.0.1:<远程端口>"`）

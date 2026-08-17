@@ -25,8 +25,8 @@ traework_logger = logging.getLogger("gateway.trae-work")
 # Trae 的 llm_utils_chat（SSE，content 数组格式）。认证用 Cloud-IDE-JWT。
 _TRAE_API_HOST = "https://trae-api-cn.mchost.guru"
 _TRAE_APP_ID = "6eefa01c-1036-4c7e-9ca5-d891f63bfcd8"
-_TRAE_IDE_VERSION = "0.1.43"
-_TRAE_IDE_VERSION_CODE = "20260730"
+_TRAE_IDE_VERSION = "0.1.51"
+_TRAE_IDE_VERSION_CODE = "20260814"
 _TRAE_DEVICE_ID = "199444637423849"
 _TRAE_MACHINE_ID = "d2115a713ee587fea5d340ceb8ef1fda3ad808431c24e7fed3085693f52f4428"
 # trae 上游模型列表缓存（get_detail_param，TTL 5 分钟）

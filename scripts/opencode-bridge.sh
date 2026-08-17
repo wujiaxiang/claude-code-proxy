@@ -81,7 +81,7 @@ do_start() {
     echo -e "${YELLOW}正在后台启动 opencode...${NC}"
     # tmux 独立会话：SSH 断开（SIGHUP）不影响会话内进程
     tmux new-session -d -s "$SESSION_NAME" -x 220 -y 55 \
-        "export PATH=\"$HOME/.opencode/bin:\$PATH\"; exec ${OPENCODE_BIN} -c 2>>${LOG_DIR}/opencode.log"
+        "export PATH=\"$HOME/.opencode/bin:\$PATH\"; export OPENCODE_DISABLE_CLAUDE_CODE=1; exec ${OPENCODE_BIN} -c 2>>${LOG_DIR}/opencode.log"
     ensure_prefix
     sleep 2
     if is_running; then

@@ -206,6 +206,7 @@ def validate_targets(cfg: dict) -> list:
                 _err(errors, f"{base}.crackTool", f"crack {base} 缺少 crackTool")
             if t.get("handler") == "aggregator":
                 _validate_aggregator_target(t, label, base, errors)
+            _validate_messages_profile(t, base, errors)
         if label in labels:
             _err(errors, f"{base}.label", f"重复 label: '{label}'")
         labels[label] = True
@@ -369,6 +370,10 @@ def _validate_models(models: list, errors: list, path_prefix: str = "",
             model_name = target.get("model")
             if not isinstance(model_name, str) or not model_name:
                 _err(errors, f"{base}.target.model", f"{base}.target.model must be a non-empty string")
+            protocol = target.get("protocol", "openai")
+            if protocol not in ("openai", "messages"):
+                _err(errors, f"{base}.target.protocol",
+                     f"{base}.target.protocol must be 'openai' or 'messages'")
 
 
 def _get_anthropic_target(targets_or_cfg) -> Optional[dict]:
@@ -491,6 +496,28 @@ def _validate_aggregator_target(t: dict, label: str, base: str, errors: list) ->
     qep = t.get("quotaErrorPatterns")
     if qep is not None and not isinstance(qep, list):
         _err(errors, f"{base}.quotaErrorPatterns", f"aggregator target '{label}' 的 quotaErrorPatterns 必须为列表")
+
+
+def _validate_messages_profile(t: dict, base: str, errors: list) -> None:
+    """校验可选 messagesProfile：targets[] 每元素可声明 `messagesProfile` 字典，
+    其键（supportsThinking / supportsTopK / supportsToolChoice …）均为可选的能力开关，
+    取值须为布尔或字符串（"true"/"false" 亦可，便于 JSON 配置）。缺省、非 dict、或键缺失均合法，
+    不报任何错误——能力门控是 fail-open 的：未声明即视为支持，绝不误删字段。
+    """
+    mp = t.get("messagesProfile")
+    if mp is None:
+        return
+    if not isinstance(mp, dict):
+        _err(errors, f"{base}.messagesProfile",
+             f"{base}.messagesProfile 必须为对象（可选，缺省不报错）")
+        return
+    for key, val in mp.items():
+        if isinstance(val, bool):
+            continue
+        if isinstance(val, str) and val.strip().lower() in ("true", "false"):
+            continue
+        _err(errors, f"{base}.messagesProfile.{key}",
+             f"{base}.messagesProfile.{key} 必须为布尔或 'true'/'false' 字符串")
 
 
 def _validate_pool_member(label: str, vmid: str, pool_key: str, idx: int, m: object,
