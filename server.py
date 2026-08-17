@@ -299,7 +299,8 @@ async def get_http_client() -> httpx.AsyncClient:
                 max_connections=50,
                 max_keepalive_connections=10,
             ),
-)
+        )
+    return _http_client
 
 # #7 Anthropic 标准 error.type → HTTP 状态码映射（供 messages 流式路径的
 # embedded-200 SSE error 帧检测使用，与 gateways/errors.py 的 _ANTHROPIC_ERROR_MAPS
