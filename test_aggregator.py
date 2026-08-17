@@ -386,7 +386,7 @@ def test_classify_failure_status_codes():
     # 已知状态码直接返回映射分类
     assert eng.classify_failure(401, "", lambda t: False) == "retry_other_or_fallback"
     assert eng.classify_failure(500, "", lambda t: False) == "retry_same"
-    assert eng.classify_failure(400, "", lambda t: False) == "pass_through_to_client"
+    assert eng.classify_failure(400, "", lambda t: False) == "retry_other_or_fallback"
 
     # 关键回归：2xx 即使 body 命中配额文本也绝不判定为熔断/重试
     assert eng.classify_failure(200, "insufficient credit", lambda t: True) == "success"
@@ -516,8 +516,8 @@ async def test_route_request_5xx_retries_same_then_fails_over_without_tripping()
     assert error_types.get("5xx_persistent", 0) >= 1, f"应记录 5xx_persistent，实际 {error_types}"
 
 
-async def test_route_request_400_passthrough_no_retry():
-    """400 客户端错误 → 原样透传给客户端：不重试、不换端点、不熔断。"""
+async def test_route_request_400_fallback_to_other_endpoint():
+    """400 客户端错误 → 降级到其他端点：重试、换端点、熔断。"""
     eng = AggregatorEngine(two_member_target(), rng=random.Random(1))
     tripped = spy_trip(eng)
     calls = []
@@ -525,18 +525,25 @@ async def test_route_request_400_passthrough_no_retry():
 
     async def send_fn(member, info):
         calls.append(member.port)
-        return bad_request
+        if len(calls) == 1:
+            return bad_request
+        return fake_response(200, '{"ok":true}')
 
     member, result = await eng.route_request("agg:pair", session_id=None, send_fn=send_fn)
 
-    assert len(calls) == 1, f"400 不应重试，实际尝试 {calls}"
-    assert result is bad_request, "400 应原样返回上游响应对象"
-    assert len(tripped) == 0, f"400 不应熔断，却发生了 {tripped}"
-    assert eng.tripped_ports() == {}
+    first_port = calls[0]
+    assert len(calls) == 2, f"应换端点重试一次，实际尝试 {calls}"
+    assert member.port != first_port, f"应换到另一个端口，仍是 {member.port}"
+    assert getattr(result, "status_code", None) == 200
 
-    stats = eng.get_stats()["virtual_models"]["agg:pair"]
-    key = next(k for k in stats if k.startswith(f"{member.port}:"))
-    assert stats[key]["error_types"].get("pass_through_to_client", 0) >= 1
+    # 熔断确实发生，且 reason 正确
+    assert tripped == [(first_port, "400_client_error")], f"熔断记录不符: {tripped}"
+    breakers = eng.tripped_ports()
+    assert first_port in breakers, f"端口 {first_port} 应被熔断"
+    assert breakers[first_port].state == "tripped"
+    assert breakers[first_port].reason == "400_client_error"
+    # 未失败的端口不应被熔断
+    assert member.port not in breakers, "成功端口不应被熔断"
 
 
 async def test_route_request_unclassified_status_logs_warning():
