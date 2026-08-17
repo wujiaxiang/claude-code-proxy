@@ -3,6 +3,21 @@
 ## [Unreleased]
 
 ### Added
+- **Messages Protocol Passthrough 架构升级（2026-08-17，Hyperplan 设计+实施）**：基于对抗性多代理规划（5 成员 3 轮交叉攻击），完成 10 个任务的增量修复，覆盖 reasoning_content echo bug、auth injection、SSRF 防护、字段白名单、能力门控、错误标准化、流式守护、完整测试套件和安全审查。详见 `docs/architecture-messages-passthrough.md` §10。
+  - **核心决策**：保持 passthrough "薄"（字节流+header 策略+最小验证），三态 fail 策略（安全字段 fail-closed / 未知字段 fail-open / 语义字段 capability-driven），不合并 convert 模块
+  - **关键修复**：
+    - reasoning_content 多轮回传（`anthropic_convert.py`）
+    - auth injection + fail-closed 凭据剥离（`server.py` `_resolve_auth` 调用）
+    - SSRF egress guard（`_is_internal_host` + IPv6 映射处理）
+    - 字段白名单集中化 + `thinking` 字段（`gateways/messages_contract.py`）
+    - `messagesProfile` 能力门控（`targets.json` 可选配置）
+    - 错误枚举扩展（7 种 Anthropic error.type）
+    - 流式路径错误标准化 + Anthropic 帧守护
+  - **安全审查**：发现并修复 IPv6-mapped IPv4 SSRF 绕过漏洞
+  - **测试**：48 个新测试，110 个全量通过
+  - **文档**：`docs/architecture-messages-passthrough.md` 添加实施结果、踩坑记录、commit 策略
+
+### Added
 - **Nous Portal 网关（8096，crack/passthrough，2026-08-11）**：直连 [Nous Portal](https://portal.nousresearch.com)（Hermes 模型订阅网关）免费 tier 的 `:free` 模型（实测 5 个：`poolside/laguna-s-2.1:free` / `poolside/laguna-xs-2.1:free` / `tencent/hy3:free` / `stepfun/step-3.7-flash:free` / `upstage/solar-pro4:free`），上游 `inference-api.nousresearch.com/v1`（OpenAI 兼容）。
   - **凭据设计（区别于其他 crack 网关）**：OAuth token 生命周期完全由 **hermes 容器**（`nousresearch/hermes-agent`，auth.json 挂载于宿主机 `/data/docker/hermes/data/auth.json`）负责（登录/刷新/回写），**auth.json 的唯一写入者 = hermes 进程（hermes 用户）**——`gateways/nous.py` 只做**只读同步**（60s 周期只读 auth.json → access_token 有效且变化才写 secrets.json 的 `nous_access_token`/`nous_expires_at`；快过期/缺失/revoke 仅告警），**代理永不触发刷新**，请求时由 crack 类通用注入逻辑加 Bearer。
   - **新文件**：`gateways/nous.py`（只读同步器 + 后台循环）、`crack_nous.py`（只读凭据提取 CLI）、`docs/nous.md`；server.py lifespan 注册 `nous_sync_loop` + 启动同步一次

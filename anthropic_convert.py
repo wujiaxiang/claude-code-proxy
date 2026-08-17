@@ -71,8 +71,9 @@ def convert_anthropic_request_to_openai(anthropic_body: dict) -> dict:
         role = msg.get("role", "user")
         content = msg.get("content", "")
         if role == "assistant":
-            # assistant：text 块合并成纯字符串 + tool_use → 顶层 tool_calls
+            # assistant：text 块合并成纯字符串 + thinking → reasoning_content + tool_use → 顶层 tool_calls
             text_parts: list[str] = []
+            reasoning_parts: list[str] = []
             tool_calls: list[dict] = []
             if isinstance(content, str):
                 text_parts.append(content)
@@ -81,6 +82,9 @@ def convert_anthropic_request_to_openai(anthropic_body: dict) -> dict:
                     if isinstance(block, dict):
                         if block.get("type") == "text":
                             text_parts.append(str(block.get("text", "")))
+                        elif block.get("type") == "thinking":
+                            # Anthropic thinking → OpenAI reasoning_content（多轮回传，避免上游 thinking 模式 400）
+                            reasoning_parts.append(str(block.get("thinking", "")))
                         elif block.get("type") == "tool_use":
                             # Anthropic tool_use → OpenAI tool_calls（顶层字段）
                             tool_calls.append({
@@ -92,8 +96,9 @@ def convert_anthropic_request_to_openai(anthropic_body: dict) -> dict:
                                 },
                             })
             assistant_msg: dict[str, object] = {"role": "assistant"}
-            assistant_content: str = "".join(text_parts) if text_parts else ""
-            assistant_msg["content"] = assistant_content
+            assistant_msg["content"] = "".join(text_parts) if text_parts else ""
+            if reasoning_parts:
+                assistant_msg["reasoning_content"] = "\n".join(reasoning_parts)
             if tool_calls:
                 assistant_msg["tool_calls"] = tool_calls
             messages.append(assistant_msg)
@@ -207,8 +212,15 @@ def convert_openai_response_to_anthropic(openai_data: dict, original_model: str)
 
     # build Anthropic content blocks
     content_blocks = []
+    # reasoning_content（DeepSeek 思考链）→ thinking 块必须放在最前面，且逐字回填，
+    # 这样客户端回放历史时该 thinking 块能在下一轮经 convert_anthropic_request_to_openai
+    # 逐字还原成 reasoning_content 回传上游（thinking 模式要求原样回传，否则 400）。
+    reasoning_content = message.get("reasoning_content")
+    if reasoning_content:
+        content_blocks.append({"type": "thinking", "thinking": reasoning_content})
     if isinstance(content, str):
-        content_blocks.append({"type": "text", "text": content})
+        if content:
+            content_blocks.append({"type": "text", "text": content})
     elif isinstance(content, list):
         for item in content:
             if isinstance(item, dict):

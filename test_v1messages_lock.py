@@ -14,7 +14,11 @@ PREFERRED_PROVIDER 注入管道一并移除。分支 A 只由 _MODELS_CFG 注入
 不需要任何真实端口：全部通过 ASGI 直调 app + 替换 server.httpx.AsyncClient 完成。
 分支 C（LiteLLM）不在本次重构范围，未覆盖。
 
-用法: python _test_v1messages_lock.py
+ASGI 直调基础设施（FakeResponse / 假 AsyncClient / _asgi_post / run_case 等）
+已抽取到 `messages_test_helpers.py`（Task 9 consolidation），本文件直接复用，
+避免与 `test_messages_passthrough.py` 重复样板。
+
+用法: python test_v1messages_lock.py
 """
 import asyncio
 import json
@@ -25,6 +29,15 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).parent))
 
 import server as _srv  # noqa: E402
+from messages_test_helpers import (  # noqa: E402
+    FakeResponse,
+    make_fake_client_cls,
+    _asgi_post,
+    _asgi_post_events,
+    run_case,
+    run_case_events,
+    _req,
+)
 
 passed = 0
 failed = 0
@@ -42,241 +55,6 @@ _MODELS_CFG_FIXTURE = {
         }
     ],
 }
-
-
-# ============================================================
-# 假 httpx.AsyncClient —— 记录调用 + 按脚本回放响应
-# ============================================================
-
-class FakeResponse:
-    """最小 httpx.Response 替身，支持 aread / aiter_bytes / json / aclose。"""
-
-    def __init__(self, status_code, body=b"", chunks=None):
-        self.status_code = status_code
-        self._body = body
-        # chunks 为 None 时用整块 body；非 None 时按给定切分回放（模拟 TCP 分片）
-        self._chunks = chunks
-        self.closed = False
-
-    async def aread(self):
-        return self._body
-
-    async def aiter_bytes(self):
-        for c in (self._chunks if self._chunks is not None else [self._body]):
-            yield c
-
-    def json(self):
-        return json.loads(self._body.decode("utf-8"))
-
-    async def aclose(self):
-        self.closed = True
-
-
-def make_fake_client_cls(script, calls):
-    """
-    构造假 AsyncClient 类。
-
-    script: 列表，每项是 FakeResponse 或 Exception 实例（抛出以模拟连接错误）。
-            按调用顺序依次消费；耗尽后复用最后一项。
-    calls:  外部传入的 list，用于记录每次调用 (method, url, kwargs)。
-    """
-    state = {"i": 0}
-
-    def _next():
-        i = min(state["i"], len(script) - 1)
-        state["i"] += 1
-        item = script[i]
-        if isinstance(item, Exception):
-            raise item
-        return item
-
-    class FakeAsyncClient:
-        def __init__(self, *a, **kw):
-            self.closed = False
-
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, *exc):
-            self.closed = True
-            return False
-
-        async def aclose(self):
-            self.closed = True
-
-        # 分支 A 用 build_request + send
-        def build_request(self, method, url, **kw):
-            return {"method": method, "url": url, **kw}
-
-        async def send(self, req, stream=False):
-            calls.append(("send", req["url"], {"stream": stream}))
-            return _next()
-
-    return FakeAsyncClient
-
-
-# ============================================================
-# ASGI 直调 —— 不起端口，直接把 request 喂给 app
-# ============================================================
-
-async def _asgi_post(path, body_obj, headers=None):
-    """
-    通过 ASGI 协议直接调用 server.app，返回 (status, headers_dict, body_bytes)。
-    流式响应会把所有 http.response.body 事件拼接后返回。
-    """
-    payload = json.dumps(body_obj).encode("utf-8")
-    hdrs = [(b"content-type", b"application/json"), (b"host", b"127.0.0.1:8081")]
-    for k, v in (headers or {}).items():
-        hdrs.append((k.encode(), v.encode()))
-
-    scope = {
-        "type": "http",
-        "asgi": {"version": "3.0", "spec_version": "2.3"},
-        "http_version": "1.1",
-        "method": "POST",
-        "scheme": "http",
-        "path": path,
-        "raw_path": path.encode(),
-        "query_string": b"",
-        "root_path": "",
-        "headers": hdrs,
-        "client": ("127.0.0.1", 50000),
-        "server": ("127.0.0.1", 8081),
-    }
-
-    sent = {"consumed": False}
-
-    async def receive():
-        if not sent["consumed"]:
-            sent["consumed"] = True
-            return {"type": "http.request", "body": payload, "more_body": False}
-        # 不能返回 http.disconnect —— StreamingResponse 会监听它并提前中断流，
-        # 导致只收到第一个 chunk。真实服务端在请求体读完后不会立刻断连，
-        # 这里永久挂起以还原真实行为（响应发完后 app() 返回，任务被回收）。
-        await asyncio.Event().wait()
-        raise AssertionError("unreachable")
-
-    out = {"status": None, "headers": {}, "body": b""}
-
-    async def send(msg):
-        if msg["type"] == "http.response.start":
-            out["status"] = msg["status"]
-            out["headers"] = {k.decode().lower(): v.decode() for k, v in msg.get("headers", [])}
-        elif msg["type"] == "http.response.body":
-            out["body"] += msg.get("body", b"")
-
-    await _srv.app(scope, receive, send)
-    return out["status"], out["headers"], out["body"]
-
-
-async def _asgi_post_events(path, body_obj, headers=None):
-    """与 _asgi_post 相同，但保留 http.response.body 事件列表（不拼接），
-    用于断言流式输出的渐进分块粒度（_SseLineBuffer 重组后应按完整行逐块送达）。"""
-    payload = json.dumps(body_obj).encode("utf-8")
-    hdrs = [(b"content-type", b"application/json"), (b"host", b"127.0.0.1:8081")]
-    for k, v in (headers or {}).items():
-        hdrs.append((k.encode(), v.encode()))
-
-    scope = {
-        "type": "http",
-        "asgi": {"version": "3.0", "spec_version": "2.3"},
-        "http_version": "1.1",
-        "method": "POST",
-        "scheme": "http",
-        "path": path,
-        "raw_path": path.encode(),
-        "query_string": b"",
-        "root_path": "",
-        "headers": hdrs,
-        "client": ("127.0.0.1", 50000),
-        "server": ("127.0.0.1", 8081),
-    }
-
-    sent = {"consumed": False}
-
-    async def receive():
-        if not sent["consumed"]:
-            sent["consumed"] = True
-            return {"type": "http.request", "body": payload, "more_body": False}
-        await asyncio.Event().wait()
-        raise AssertionError("unreachable")
-
-    out = {"status": None, "headers": {}, "events": []}
-
-    async def send(msg):
-        if msg["type"] == "http.response.start":
-            out["status"] = msg["status"]
-            out["headers"] = {k.decode().lower(): v.decode() for k, v in msg.get("headers", [])}
-        elif msg["type"] == "http.response.body":
-            out["events"].append(msg.get("body", b""))
-
-    await _srv.app(scope, receive, send)
-    return out["status"], out["headers"], out["events"]
-
-
-def run_case(script, body_obj, models_cfg=None, headers=None):
-    """
-    在受控环境跑一次 /v1/messages：
-      - 替换 server.httpx.AsyncClient 为假客户端（按 script 回放）
-      - 注入 models[] 配置（分支 A 的唯一开关）
-      - asyncio.sleep 打桩为记录耗时（可断言 backoff）
-    返回 (status, headers, body_bytes, calls, sleeps)
-    """
-    calls = []
-    sleeps = []
-    fake_cls = make_fake_client_cls(script, calls)
-
-    real_sleep = asyncio.sleep
-
-    async def fake_sleep(sec, *a, **kw):
-        sleeps.append(sec)
-        return await real_sleep(0)
-
-    old_models = _srv._MODELS_CFG
-    try:
-        _srv._MODELS_CFG = models_cfg if models_cfg is not None else {"models": [], "modelDefaults": {}}
-        with patch.object(_srv.httpx, "AsyncClient", fake_cls), \
-             patch.object(_srv.asyncio, "sleep", fake_sleep):
-            status, hdrs, raw = asyncio.run(_asgi_post("/v1/messages", body_obj, headers))
-    finally:
-        _srv._MODELS_CFG = old_models
-    return status, hdrs, raw, calls, sleeps
-
-
-def run_case_events(script, body_obj, models_cfg=None, headers=None):
-    """与 run_case 相同，但返回 (status, headers, body_events, calls, sleeps)，
-    body_events 为 http.response.body 事件的原始列表（未拼接）。"""
-    calls = []
-    sleeps = []
-    fake_cls = make_fake_client_cls(script, calls)
-
-    real_sleep = asyncio.sleep
-
-    async def fake_sleep(sec, *a, **kw):
-        sleeps.append(sec)
-        return await real_sleep(0)
-
-    old_models = _srv._MODELS_CFG
-    try:
-        _srv._MODELS_CFG = models_cfg if models_cfg is not None else {"models": [], "modelDefaults": {}}
-        with patch.object(_srv.httpx, "AsyncClient", fake_cls), \
-             patch.object(_srv.asyncio, "sleep", fake_sleep):
-            status, hdrs, events = asyncio.run(_asgi_post_events("/v1/messages", body_obj, headers))
-    finally:
-        _srv._MODELS_CFG = old_models
-    return status, hdrs, events, calls, sleeps
-
-
-def _req(model, stream=False, **extra):
-    b = {
-        "model": model,
-        "max_tokens": 64,
-        "messages": [{"role": "user", "content": "hi"}],
-    }
-    if stream:
-        b["stream"] = True
-    b.update(extra)
-    return b
 
 
 # ============================================================
@@ -390,9 +168,9 @@ def test_branch_a_stream_split_frame_reassembled_progressive():
     代理必须等凑齐完整行后再下发 —— 客户端收到的是重组后的完整帧，且分块渐进送达。
 
     与 test_branch_a_stream_passthrough_split_frames 的关系：
-      那个用例锁定「整帧到达时字节逐字节不变」；本用例锁定「半截帧到达时先缓冲、
-      凑齐 \n 后才吐出」——两者合并字节都等于 上游帧 + [DONE]，但本用例进一步断言
-      下发粒度是「完整行」而非「原始 TCP chunk」。
+       那个用例锁定「整帧到达时字节逐字节不变」；本用例锁定「半截帧到达时先缓冲、
+       凑齐 \n 后才吐出」——两者合并字节都等于 上游帧 + [DONE]，但本用例进一步断言
+       下发粒度是「完整行」而非「原始 TCP chunk」。
     """
     frame1 = b'data: {"choices":[{"delta":{"content":"hello world"}}]}\n'
     frame2 = b'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n'

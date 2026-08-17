@@ -106,6 +106,53 @@ def test_validate_clean_config_passes():
     assert errors == [], f"合法配置不应有错误，实际: {errors}"
 
 
+# ─── messagesProfile 可选能力开关校验（Task 5）───
+
+
+def _clean_target_with(**extra):
+    t = {"label": "openrouter", "listenPort": 8090, "category": "free", "handler": "passthrough",
+         "isFree": True, "targetHost": "openrouter.ai", "targetPort": 443,
+         "targetProtocol": "https", "routePrefix": "/api/v1", "models": []}
+    t.update(extra)
+    return t
+
+
+def test_validate_messages_profile_absent_ok():
+    """messagesProfile 缺失（存量 target）→ 不报任何错误，完全向后兼容。"""
+    cfg = {"anthropicForwardPort": 8082, "targets": [_clean_target_with()]}
+    errors = config_store.validate_targets(cfg)
+    assert errors == [], f"无 messagesProfile 不应报错，实际: {errors}"
+
+
+def test_validate_messages_profile_valid_passes():
+    """合法 messagesProfile（布尔 / 'true'/'false' 字符串）→ 校验通过。"""
+    cfg = {"anthropicForwardPort": 8082, "targets": [_clean_target_with(messagesProfile={
+        "supportsThinking": False,
+        "supportsTopK": True,
+        "supportsToolChoice": "false",
+    })]}
+    errors = config_store.validate_targets(cfg)
+    assert errors == [], f"合法 messagesProfile 不应报错，实际: {errors}"
+
+
+def test_validate_messages_profile_invalid_value_errors():
+    """messagesProfile 子键为非布尔/非字符串值（如数字）→ 报错且路径精确。"""
+    cfg = {"anthropicForwardPort": 8082, "targets": [_clean_target_with(
+        messagesProfile={"supportsThinking": 1})]}
+    errors = config_store.validate_targets(cfg)
+    assert any(e["path"] == "targets[0].messagesProfile.supportsThinking" for e in errors), \
+        f"应报 messagesProfile.supportsThinking 非法值，实际: {errors}"
+
+
+def test_validate_messages_profile_non_dict_errors():
+    """messagesProfile 非对象（如字符串）→ 报错。"""
+    cfg = {"anthropicForwardPort": 8082, "targets": [_clean_target_with(
+        messagesProfile="supportsThinking")]}
+    errors = config_store.validate_targets(cfg)
+    assert any(e["path"] == "targets[0].messagesProfile" for e in errors), \
+        f"应报 messagesProfile 必须为对象，实际: {errors}"
+
+
 # ─── 聚合网关（aggregator）校验 ───
 def test_validate_aggregator_target():
     """合法聚合 target：无 targetHost + 有效 virtualModels → 校验通过。"""

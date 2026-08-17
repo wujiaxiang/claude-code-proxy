@@ -4,11 +4,12 @@ import logging
 from logging.handlers import TimedRotatingFileHandler
 import json
 from pydantic import BaseModel, Field, field_validator, model_validator
-from typing import AsyncIterator, Callable, List, Dict, Any, Optional, Union, Literal
+from typing import AsyncIterator, Callable, List, Dict, Any, Optional, Tuple, Union, Literal
 import httpx
 import os
 import asyncio
 from urllib.parse import urlparse
+import ipaddress
 from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.responses import HTMLResponse
 import uuid
@@ -81,6 +82,7 @@ from gateways.models import (
     _target_model_source,
 )
 import gateways.models as _gmodels  # 模型缓存状态（_DOWNSTREAM_MODELS_CACHE）归 gateways.models 模块所有，需模块属性实时读取
+from gateways.messages_contract import filter_messages_request  # passthrough /v1/messages 请求体字段白名单过滤
 
 # 翻译层符号（从 server.py 拆出至 gateways/translate.py；内部对 server 模块为延迟导入，
 # 现仅保留 token 估算族——LiteLLM 翻译链与 provider 策略已随分支 C 删除）
@@ -297,8 +299,101 @@ async def get_http_client() -> httpx.AsyncClient:
                 max_connections=50,
                 max_keepalive_connections=10,
             ),
-        )
-    return _http_client
+)
+
+# #7 Anthropic 标准 error.type → HTTP 状态码映射（供 messages 流式路径的
+# embedded-200 SSE error 帧检测使用，与 gateways/errors.py 的 _ANTHROPIC_ERROR_MAPS
+# 目标状态码保持一致）。
+_ANTHROPIC_ERR_TYPE_TO_STATUS = {
+    "authentication_error": 401,
+    "invalid_request_error": 400,
+    "permission_error": 403,
+    "not_found_error": 404,
+    "rate_limit_error": 429,
+    "overloaded_error": 503,
+    "timeout_error": 504,
+    "api_error": 500,
+}
+
+# #8 config-gated Anthropic-frame `event: error` 流内哨兵开关（默认关闭，未验证前
+# 不改变既有行为）。与 #7 的 embedded-200 检测互补：#7 只在整流读完后做一次性扫描
+# （已在 create_message 的 passthrough messages 分支内联实现），本开关服务于未来
+# 逐帧扫描场景的守护函数 _guard_anthropic_sse_error_frame（见下）。
+# 显式区别于 normalizeSse（server_http._write_response 的 OpenAI 帧规范化）——
+# 那是改写 OpenAI SSE 帧结构，对 Anthropic 帧结构不适用，不可复用。
+ANTHROPIC_SSE_ERROR_GUARD_ENABLED = os.environ.get(
+    "ANTHROPIC_SSE_ERROR_GUARD_ENABLED", "false"
+).lower() == "true"
+
+
+def _guard_anthropic_sse_error_frame(frame_text: str) -> Optional[Tuple[int, str, str]]:
+    """识别单个 Anthropic 格式 SSE 帧是否为 `event: error` 错误帧，命中则翻译。
+
+    与 `normalizeSse`（server_http._write_response 的 OpenAI SSE 帧改写）
+    是两回事，绝不可混用：normalizeSse 面向 OpenAI chat.completions SSE 帧
+    结构（`choices[].delta` 等），Anthropic 帧结构完全不同
+    （`event: message_start/content_block_delta/...`），套用 normalizeSse
+    会把 Anthropic 帧错误地当成 OpenAI 帧解析/改写。本函数只做“识别 error
+    帧 → 翻译”，不改写任何非 error 帧的字节。
+
+    参数 ``frame_text`` 是一个完整 SSE 帧（不含帧间分隔空行，形如
+    ``event: error\\ndata: {...}``）。
+
+    返回 ``(http_status, err_type, err_message)``；不是可识别的 error 信封
+    （非 error 帧 / data 缺失 / JSON 解析失败 / 结构不符）一律返回
+    ``None`` —— fail-open，调用方对 None 必须原样透传该帧，不中断流。
+    """
+    if "event: error" not in frame_text and "event:error" not in frame_text:
+        return None
+    data_line = None
+    for line in frame_text.splitlines():
+        if line.startswith("data:"):
+            data_line = line[len("data:"):].strip()
+            break
+    if not data_line:
+        return None
+    try:
+        err_obj = json.loads(data_line)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(err_obj, dict):
+        return None
+    err_detail = err_obj.get("error")
+    if not isinstance(err_detail, dict):
+        return None
+    err_type = err_detail.get("type", "api_error")
+    err_msg = err_detail.get("message", "SSE error frame")
+    err_status = _ANTHROPIC_ERR_TYPE_TO_STATUS.get(err_type, 500)
+    return (err_status, err_type, err_msg)
+
+
+def _guard_anthropic_sse_stream(raw_bytes: bytes) -> Optional[Tuple[int, str, str]]:
+    """对整段 Anthropic SSE 响应字节做 `event: error` / 畸形终止帧扫描（config-gated 调用方）。
+
+    两级检测，均 fail-open（识别不了就返回 None，调用方须原样透传，不中断流）：
+    1. 逐帧（以空行分隔）调用 `_guard_anthropic_sse_error_frame`——严格匹配
+       `event: error` + 合法 JSON error 信封的帧，命中即返回其翻译结果。
+    2. 若未命中任何结构化 error 帧，回退用 (T6 broadened) `_map_upstream_error`
+       对整段文本做子串匹配——覆盖“畸形终止帧”场景：上游未按标准 SSE error
+       信封格式收尾，而是吐出裸文本/非 JSON 错误片段（如限流/过载文案），
+       命中映射表关键字仍可翻译；未命中任何已知特征则返回 None。
+
+    本函数只读不改：不修改 `raw_bytes`，不改写任何非 error 帧。仅用于
+    “是否需要拦截整个响应”的判定，真正的透传字节流由调用方另行处理。
+    """
+    try:
+        text = raw_bytes.decode("utf-8")
+    except Exception:
+        return None
+    for frame in text.split("\n\n"):
+        result = _guard_anthropic_sse_error_frame(frame)
+        if result is not None:
+            return result
+    fallback = _map_upstream_error(text)
+    if fallback is not None:
+        status, err_type = fallback
+        return (status, err_type, "malformed terminal SSE frame recognized via vendor error map")
+    return None
 
 
 @asynccontextmanager
@@ -835,6 +930,49 @@ from server_http import (
     _get_status_reason,
     _write_response_with_status_override,
 )
+
+
+# ─── egress SSRF 防护（Task 3）───
+#
+# 威胁模型：targets.json 不是攻击者可写的输入（由运维配置，见 AGENTS.md），
+# 本守卫是运维误配置场景下的纵深防御——一次笔误/复制粘贴错误让 targetHost
+# 指向云元数据服务或内网地址时，T2 之后的凭据注入会让代理带着真实凭据把
+# 请求打进内网。不是"攻击者直接控制 targetHost"的场景。
+_INTERNAL_NETWORKS = tuple(
+    ipaddress.ip_network(cidr)
+    for cidr in (
+        "169.254.169.254/32",  # 云元数据服务（AWS/GCP/Azure IMDS）
+        "10.0.0.0/8",
+        "192.168.0.0/16",
+        "172.16.0.0/12",
+        "fe80::/10",  # IPv6 link-local（对应 IPv4 169.254.0.0/16 段）
+        "fc00::/7",  # IPv6 unique local address（ULA，对应 IPv4 私有段）
+    )
+)
+# 注意：故意不封锁 127.0.0.0/8 / ::1 —— 本代理的既有架构里多个 target
+# 合法地把 targetHost 配成 127.0.0.1（转发到同机其它端口的本地服务，如
+# crack 网关/聚合网关内部路由），封锁回环会误伤这条已验证的正常路径。
+
+
+def _is_internal_host(host: str) -> bool:
+    """判定 host 是否落在内网/链路本地/云元数据地址范围内，或是 *.internal 域名。
+
+    仅按字面量判定（IP 字面量 + 域名后缀），不做 DNS 解析——targetHost 来自
+    运维静态配置，不需要防"域名解析后才是内网 IP"的 DNS rebinding 场景。
+    """
+    host = host.strip().lower()
+    if host.endswith(".internal") or host == "internal":
+        return True
+    try:
+        addr = ipaddress.ip_address(host)
+    except ValueError:
+        return False
+    # IPv4-mapped IPv6 字面量（::ffff:a.b.c.d）需展开为其内嵌 IPv4 地址再比对，
+    # 否则 IPv6Address 与 tuple 中的 IPv4Network 做 `in` 判断恒为 False（跨地址族
+    # 静默不匹配，不抛异常），会让 ::ffff:169.254.169.254 之类字面量绕过内网判定。
+    if isinstance(addr, ipaddress.IPv6Address) and addr.ipv4_mapped is not None:
+        addr = addr.ipv4_mapped
+    return any(addr in net for net in _INTERNAL_NETWORKS)
 
 
 def _resolve_auth(headers: dict, target: Optional[dict] = None, provider: Optional[str] = None) -> dict:
@@ -1498,6 +1636,13 @@ async def _handle_target_request(reader, writer, target):  # pyright: ignore[rep
             )
             if _use_responses:
                 upstream_path = "/responses"
+            # egress SSRF 防护（Task 3）：转发前拒绝内网/元数据 targetHost，fail-closed。
+            if _is_internal_host(target["targetHost"]):
+                logger.warning(f"[{label}] blocked egress to internal host: {target['targetHost']}")
+                await _write_error_response(
+                    writer, 502, f"targetHost {target['targetHost']!r} is blocked (internal/link-local range)"
+                )
+                return
             upstream_url = f"{transport}://{target['targetHost']}:{target.get('targetPort', 443)}{upstream_path}"
             fwd_headers = _resolve_auth(headers, target=target)
             fwd_headers["host"] = target["targetHost"]
@@ -2038,8 +2183,198 @@ async def create_message(request: MessagesRequest, raw_request: Request):
         # 未命中则不再有兜底路径（legacy 单端口模式已下线），落到函数尾直接返回 404。
         mapped = _cfg._resolve_model_alias(_MODELS_CFG, original_model)
         if mapped:
-            from anthropic_convert import convert_anthropic_request_to_openai, convert_openai_response_to_anthropic
             _fwd_port = int(mapped["port"])
+            _downstream_protocol = mapped.get("protocol", "openai")
+            _is_stream = bool(body_json.get("stream", False))
+
+            if _downstream_protocol == "messages":
+                # 下游已是 Anthropic /v1/messages 协议，跳过翻译，原样透传。
+                # 注意：下游目标端口必须确实是 Anthropic /v1/messages 兼容端点，
+                # 否则请求会被原样发到 /v1/messages 得到 404（协议不匹配需自查配置）。
+                logger.info(f"🔀 [8081] route (passthrough messages): {original_model} → 127.0.0.1:{_fwd_port}/v1/messages model={mapped['model']}")
+                # 过滤请求体：只保留 Anthropic /v1/messages 标准字段，丢弃额外字段（如 context_management）
+                # 白名单集中维护于 gateways/messages_contract（含 thinking），避免内联散落 + 漏放思考链。
+                # 能力门控：取目标 target 的 messagesProfile（按下游端口查），显式声明不支持的语义字段
+                # （thinking/top_k/tool_choice）在转发前剥离；profile 缺失则完全沿用既往行为（零回归）。
+                _profile_target = next(
+                    (t for t in _TARGETS if t.get("listenPort") == _fwd_port), None
+                )
+                _messages_profile = (
+                    _profile_target.get("messagesProfile") if _profile_target else None
+                )
+                _passthrough_body = filter_messages_request(body_json, profile=_messages_profile)
+                _passthrough_body["model"] = mapped["model"]
+                _passthrough_payload = json.dumps(_passthrough_body).encode("utf-8")
+                # #2 鉴权注入：复用与 OpenAI 分支一致的 _resolve_auth —— target 配置了
+                # apikey/apikeyEnv 时注入目标凭据（覆盖客户端传入），使 passthrough messages
+                # 分支也能对接真实外部 Anthropic 兼容端点，而非仅限本地回环 + dummy key。
+                _fwd_headers = {
+                    "content-type": "application/json",
+                    "host": f"127.0.0.1:{_fwd_port}",
+                }
+                _fwd_headers.update(_resolve_auth(raw_request.headers, target=mapped))
+                _fwd_headers["host"] = f"127.0.0.1:{_fwd_port}"  # 保持指向下游本地端口
+                # 失败闭合 + 大小写归一：target 解析出凭据时，剔除客户端携带的安全字段
+                # （authorization 任意大小写 / x-api-key / cookie），仅保留 _resolve_auth 注入的
+                # 目标 authorization，防止伪造凭据泄露到上游；无凭据则原样透传，保持旧行为。
+                _resolved_cred = bool(mapped) and bool(
+                    mapped.get("apikey")
+                    or (mapped.get("apikeyEnv") and os.environ.get(mapped["apikeyEnv"], ""))
+                )
+                if _resolved_cred:
+                    for _sec in ("authorization", "x-api-key", "cookie"):
+                        for _k in [k for k in _fwd_headers if k.lower() == _sec and k != "authorization"]:
+                            del _fwd_headers[_k]
+                async with httpx.AsyncClient(timeout=httpx.Timeout(300.0, connect=10.0), trust_env=False) as client:
+                    _req = client.build_request("POST", f"http://127.0.0.1:{_fwd_port}/v1/messages", headers=_fwd_headers, content=_passthrough_payload)
+                    _resp = await client.send(_req, stream=_is_stream)
+                    _anth_t = _cfg._get_anthropic_target(_MODELS_CFG)
+                    _label = _anth_t.get("label") if _anth_t else "8081"
+                    if _is_stream:
+                        # #4 流式错误兜底：若上游非 2xx，转成 Anthropic 错误 JSON 而非透传原始错误体，避免客户端解析失败。
+                        if _resp.status_code >= 400:
+                            _err_body = b""
+                            try:
+                                async for _c in _resp.aiter_bytes():
+                                    _err_body += _c
+                            finally:
+                                await _resp.aclose()
+                            _err_text = _err_body.decode("utf-8", "replace")
+                            # #7 复用 _map_upstream_error：与非流式路径同等质量的错误标准化
+                            # （429/限流/认证/权限/过载等 → 标准 Anthropic error.type + 目标状态码）。
+                            _mapped_err = _map_upstream_error(_err_text)
+                            if _mapped_err is not None:
+                                _tgt_status, _err_type = _mapped_err
+                                _bump_model_stats(_label, mapped["model"], "translated429")
+                                return JSONResponse(
+                                    content={
+                                        "type": "error",
+                                        "error": {
+                                            "type": _err_type,
+                                            "message": "Upstream temporarily over capacity.",
+                                            "original_status": _resp.status_code,
+                                        },
+                                    },
+                                    status_code=_tgt_status,
+                                    headers={"Retry-After": str(_VENDOR_RETRY_AFTER)},
+                                )
+                            # 未命中映射表：保留原状态码，尽量透传上游原始错误信封
+                            try:
+                                _upstream_err = json.loads(_err_text)
+                                _err_type = _upstream_err.get("type", "api_error")
+                                _err_msg = _upstream_err.get("error", {}).get("message", str(_upstream_err))
+                            except Exception:
+                                _err_type = "api_error"
+                                _err_msg = f"upstream messages error (status {_resp.status_code})"
+                            _bump_model_stats(_label, mapped["model"], "err")
+                            return JSONResponse(
+                                content={"type": "error", "error": {"type": _err_type, "message": _err_msg}},
+                                status_code=_resp.status_code,
+                            )
+                        # #1 流式正常路径：先在 async with 内读完所有字节再 yield（避免 client 关闭后迭代报 ReadError）
+                        _raw_chunks: list[bytes] = []
+                        try:
+                            async for chunk in _resp.aiter_bytes():
+                                _raw_chunks.append(chunk)
+                        finally:
+                            await _resp.aclose()
+                        # #7 检测"上游 200 但 SSE 内嵌 event: error 帧"的伪装成功响应。
+                        # 逐帧扫描（SSE 帧以空行分隔），只对形如 `event: error` + 合法
+                        # error 信封的帧判定为错误；任何解析失败/结构不符一律 continue，
+                        # 绝不中断流（fail-open 规则，镜像 anthropic_stream_convert.py:185-186）。
+                        _full_bytes = b"".join(_raw_chunks)
+                        # #8 config-gated 守护（默认关闭，见 ANTHROPIC_SSE_ERROR_GUARD_ENABLED）：
+                        # 用 _guard_anthropic_sse_stream（非 normalizeSse——那是 OpenAI 帧改写，
+                        # 结构上不适用于 Anthropic 帧）在 #7 既有检测之前额外扫描一遍，兼顾
+                        # 畸形终止帧（无标准 error 信封但命中 T6 广化后的 vendor 错误特征表）。
+                        # 关闭时（默认）不执行，行为与开发本开关前完全一致。
+                        if ANTHROPIC_SSE_ERROR_GUARD_ENABLED:
+                            _guard_result = _guard_anthropic_sse_stream(_full_bytes)
+                            if _guard_result is not None:
+                                _g_status, _g_type, _g_msg = _guard_result
+                                _bump_model_stats(_label, mapped["model"], "err")
+                                return JSONResponse(
+                                    content={"type": "error", "error": {"type": _g_type, "message": _g_msg}},
+                                    status_code=_g_status,
+                                )
+                        _embedded_err: Optional[Tuple[int, str, str]] = None
+                        try:
+                            _full_text = _full_bytes.decode("utf-8")
+                        except Exception:
+                            _full_text = None
+                        if _full_text is not None:
+                            for _frame in _full_text.split("\n\n"):
+                                if "event: error" not in _frame and "event:error" not in _frame:
+                                    continue
+                                _data_line = None
+                                for _line in _frame.splitlines():
+                                    if _line.startswith("data:"):
+                                        _data_line = _line[len("data:"):].strip()
+                                        break
+                                if not _data_line:
+                                    continue
+                                try:
+                                    _err_obj = json.loads(_data_line)
+                                except json.JSONDecodeError:
+                                    # 解析失败绝不中断流：不是可识别的 error 信封，继续扫描/透传
+                                    continue
+                                if not isinstance(_err_obj, dict):
+                                    continue
+                                _err_detail = _err_obj.get("error")
+                                if not isinstance(_err_detail, dict):
+                                    continue
+                                _e_type = _err_detail.get("type", "api_error")
+                                _e_msg = _err_detail.get("message", "embedded SSE error")
+                                _e_status = _ANTHROPIC_ERR_TYPE_TO_STATUS.get(_e_type, 500)
+                                _embedded_err = (_e_status, _e_type, _e_msg)
+                                break
+                        if _embedded_err is not None:
+                            _e_status, _e_type, _e_msg = _embedded_err
+                            _bump_model_stats(_label, mapped["model"], "err")
+                            return JSONResponse(
+                                content={"type": "error", "error": {"type": _e_type, "message": _e_msg}},
+                                status_code=_e_status,
+                            )
+                        async def _passthrough_stream():
+                            for c in _raw_chunks:
+                                yield c
+                        _bump_model_stats(_label, mapped["model"], "ok")
+                        return StreamingResponse(_passthrough_stream(), media_type="text/event-stream", status_code=_resp.status_code)
+                    # 非流式
+                    _body_bytes = await _resp.aread()
+                    if _resp.status_code >= 400:
+                        # #1 非流式错误标准化：复用 openai 分支的 _map_upstream_error 翻译 429 等
+                        mapped_err = _map_upstream_error(_body_bytes.decode("utf-8", "replace"))
+                        if mapped_err is not None:
+                            _tgt_status, _err_type = mapped_err
+                            _bump_model_stats(_label, mapped["model"], "translated429")
+                            return JSONResponse(
+                                content={
+                                    "error": {
+                                        "type": _err_type,
+                                        "message": "Upstream temporarily over capacity.",
+                                        "original_status": _resp.status_code,
+                                    }
+                                },
+                                status_code=_tgt_status,
+                                headers={"Retry-After": str(_VENDOR_RETRY_AFTER)},
+                            )
+                        # 非 429 等：透传上游错误（保持 Anthropic 格式）
+                        _bump_model_stats(_label, mapped["model"], "err")
+                        try:
+                            _downstream_resp = json.loads(_body_bytes.decode("utf-8"))
+                        except Exception:
+                            return JSONResponse(content={"error": {"type": "proxy_error", "message": "upstream invalid response"}}, status_code=502)
+                        return JSONResponse(content=_downstream_resp, status_code=_resp.status_code)
+                    # 成功 2xx
+                    _bump_model_stats(_label, mapped["model"], "ok")
+                    try:
+                        _downstream_resp = json.loads(_body_bytes.decode("utf-8"))
+                    except Exception:
+                        return JSONResponse(content={"error": {"type": "proxy_error", "message": "upstream invalid response"}}, status_code=502)
+                    return JSONResponse(content=_downstream_resp, status_code=_resp.status_code)
+
+            from anthropic_convert import convert_anthropic_request_to_openai, convert_openai_response_to_anthropic
             logger.info(f"🔀 [8081] route: {original_model} → 127.0.0.1:{_fwd_port}/v1/chat/completions model={mapped['model']}")
             openai_body = convert_anthropic_request_to_openai(body_json)
             openai_body["model"] = mapped["model"]
@@ -2055,7 +2390,6 @@ async def create_message(request: MessagesRequest, raw_request: Request):
                 _fwd_headers["x-api-key"] = raw_request.headers["x-api-key"]
             if raw_request.headers.get("x-session-id"):
                 _fwd_headers["x-session-id"] = raw_request.headers["x-session-id"]
-            _is_stream = bool(body_json.get("stream", False))
             async with httpx.AsyncClient(timeout=httpx.Timeout(300.0, connect=10.0), trust_env=False) as client:
                 _req = client.build_request("POST", f"http://127.0.0.1:{_fwd_port}/v1/chat/completions", headers=_fwd_headers, content=openai_payload)
                 _resp = await client.send(_req, stream=_is_stream)
