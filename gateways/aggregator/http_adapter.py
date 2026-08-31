@@ -102,16 +102,9 @@ async def _handle_aggregate_request(reader, writer, target, method, path, raw_pa
         # 会话亲和键透传：聚合层用 session_id 做路由粘性，但若只留在内存不透传，
         # 下游（如 8094 的 muse-spark-1.2-contributor）在需要会话上下文时会 500。
         # 若客户端把会话标识放在 body（session_id/conversation_id/user）而非 header，
-        # 此处需补一个 x-session-id  header 透传给下游。
+        # 会话透传：若会话标识在 body 则补 header 透传下游
         if session_id is not None and "x-session-id" not in fwd_headers:
             fwd_headers["x-session-id"] = str(session_id)
-        if member.port == 8094:
-            try:
-                _agg_body_preview = json.dumps(member_body, ensure_ascii=False)
-            except Exception:
-                _agg_body_preview = str(member_body)
-            logger.warning(f"[agg→8094] model={member.model} IN keys={sorted(body_json.keys()) if isinstance(body_json,dict) else 'non-dict'} OUT keys={sorted(member_body.keys())} body_len={len(_agg_body_preview)} body={_agg_body_preview[:1500]!r} fwd_keys={sorted(fwd_headers.keys())}")
-
         client = await get_http_client()
         req = client.build_request(method, f"http://127.0.0.1:{member.port}{raw_path}", headers=fwd_headers, content=member_body_bytes)
         resp = await client.send(req, stream=True)

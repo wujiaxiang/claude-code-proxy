@@ -40,6 +40,11 @@ def open_go_chat_to_responses(body: dict) -> dict:
     # 代理侧兜底：过小的请求按最小值 16 提升，避免把客户端的 4/10 透传导致必失败
     if "max_output_tokens" in out and isinstance(out["max_output_tokens"], int) and out["max_output_tokens"] < 16:
         out["max_output_tokens"] = 16
+    # Go 网关对 muse 的 reasoning.effort 仅接受 none/minimal/low/medium/high，不接受 max
+    # 上游错误：`reasoning.effort`: unknown variant `max`, expected one of `none`, `minimal`, `low`, `medium`, `high`
+    # 代理侧兜底：max → high
+    if isinstance(out.get("reasoning"), dict) and out["reasoning"].get("effort") == "max":
+        out["reasoning"]["effort"] = "high"
     return out
 
 
