@@ -2,6 +2,18 @@
 
 ## [Unreleased]
 
+### Fixed
+- **聚合网关熔断探测超时过短导致熔断永远无法自动恢复（2026-08-25）**：`_aggregator_prober` 探测请求超时仅 5s，而 nous（8087）等上游连"模型不存在"的 404 快速失败响应都会偶发慢到 7s+，导致探测反复超时失败 → `record_probe_result` 重置 `tripped_at` → 每 300s 重试再失败，熔断陷入死循环无法自愈（实测 8087 因 `400_client_error` 熔断后连续两轮探测窗口均未恢复）。修复：探测超时 `5s → 15s`；同时补上探测结果日志（原失败路径纯静默 `except: ok=False`，排障只能靠猜），成功打 `probe port {port}: ok, breaker cleared`，失败打 `[aggregator] probe port {port} failed: <异常类型>`。附带说明：重启服务会清空全部内存态（熔断/统计/会话粘性），本次借助重启即时解除了 8087 存量熔断。
+- **所有直连网关（handler=passthrough）必须配置 secretRef 字段（2026-08-18）**：修复直连网关（open-go、deepseek、openrouter、nvidia）因缺少 secretRef 字段导致代理无法自动注入 API 密钥的问题。根因：`_handler_prepare_headers` 函数对 free/paid 无 secretRef 的端口优先使用客户端传入的 Authorization，只有客户端未传时才用 secrets.json 兜底；但客户端通常传入 dummy 密钥，导致上游服务返回 401。修复：为所有直连网关添加 secretRef 和 apikeyEnv 字段，确保代理始终注入真实密钥。规范：**所有直连网关（无论分类 free/paid/crack）都必须配置 secretRef 字段**，详见 `docs/architecture.md` §直连网关凭据注入规范。
+  - **测试结果**：修复后所有直连网关和聚合网关虚拟模型均正常工作。探针测试显示：
+    - 8094 (open-go): 使用 dummy 密钥成功访问，代理自动注入真实密钥
+    - 8095 (deepseek): 使用 dummy 密钥成功访问，代理自动注入真实密钥  
+    - 8090 (openrouter): 使用 dummy 密钥成功访问，代理自动注入真实密钥
+    - 8091 (nvidia): 使用 dummy 密钥成功访问，代理自动注入真实密钥
+    - 聚合网关 (8080) 所有虚拟模型：deepseek-v4-flash:agg、north-mini-code:agg:free、hy3:agg、gpt-4o:agg:free、ling-3.0-flash:agg:free 均返回成功响应
+    - 熔断状态：无熔断端口，所有端口正常工作
+    - 会话粘性：命中率 91.7%（12 次查找，11 次命中）
+
 ### Added
 - **Messages Protocol Passthrough 架构升级（2026-08-17，Hyperplan 设计+实施）**：基于对抗性多代理规划（5 成员 3 轮交叉攻击），完成 10 个任务的增量修复，覆盖 reasoning_content echo bug、auth injection、SSRF 防护、字段白名单、能力门控、错误标准化、流式守护、完整测试套件和安全审查。详见 `docs/architecture-messages-passthrough.md` §10。
   - **核心决策**：保持 passthrough "薄"（字节流+header 策略+最小验证），三态 fail 策略（安全字段 fail-closed / 未知字段 fail-open / 语义字段 capability-driven），不合并 convert 模块

@@ -99,6 +99,18 @@ async def _handle_aggregate_request(reader, writer, target, method, path, raw_pa
                        if k.lower() not in ("host", "connection", "content-length", "transfer-encoding",
                                             "authorization", "x-api-key")}
         fwd_headers["host"] = f"127.0.0.1:{member.port}"
+        # 会话亲和键透传：聚合层用 session_id 做路由粘性，但若只留在内存不透传，
+        # 下游（如 8094 的 muse-spark-1.2-contributor）在需要会话上下文时会 500。
+        # 若客户端把会话标识放在 body（session_id/conversation_id/user）而非 header，
+        # 此处需补一个 x-session-id  header 透传给下游。
+        if session_id is not None and "x-session-id" not in fwd_headers:
+            fwd_headers["x-session-id"] = str(session_id)
+        if member.port == 8094:
+            try:
+                _agg_body_preview = json.dumps(member_body, ensure_ascii=False)
+            except Exception:
+                _agg_body_preview = str(member_body)
+            logger.warning(f"[agg→8094] model={member.model} IN keys={sorted(body_json.keys()) if isinstance(body_json,dict) else 'non-dict'} OUT keys={sorted(member_body.keys())} body_len={len(_agg_body_preview)} body={_agg_body_preview[:1500]!r} fwd_keys={sorted(fwd_headers.keys())}")
 
         client = await get_http_client()
         req = client.build_request(method, f"http://127.0.0.1:{member.port}{raw_path}", headers=fwd_headers, content=member_body_bytes)
@@ -155,15 +167,19 @@ async def _aggregator_prober():
                 ok = False
                 try:
                     client = await get_http_client()
+                    # 探测只要求"上游能响应"，部分上游（如 nous）连 404 都会偶发慢到 7s+，
+                    # 5s 超时会导致探测反复失败、熔断永远无法自动恢复——放宽到 15s。
                     resp = await client.post(
                         f"http://127.0.0.1:{port}/v1/chat/completions",
                         json={"model": "probe", "messages": [{"role": "user", "content": "ping"}], "max_tokens": 1},
                         headers={"Content-Type": "application/json"},
-                        timeout=httpx.Timeout(5.0),
+                        timeout=httpx.Timeout(15.0),
                     )
                     ok = resp.status_code < 500
-                except Exception:
+                except Exception as e:
                     ok = False
+                    logger.warning(f"[aggregator] probe port {port} failed: {type(e).__name__}: {e}")
                 engine.record_probe_result(port, ok)
+                logger.info(f"[aggregator] probe port {port}: {'ok, breaker cleared' if ok else 'failed, tripped_at reset'}")
         except Exception:
             logger.exception("aggregator prober error")

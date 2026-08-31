@@ -44,6 +44,13 @@ from gateways.copilot import (
     _is_claude_family_model,
 )
 
+from gateways.open_go import (
+    open_go_should_use_responses,
+    open_go_chat_to_responses,
+    open_go_responses_to_chat,
+    open_go_write_responses_stream,
+)
+
 # CodeBuddy 网关符号（从 gateways/codebuddy.py 拆分导入；内部对 server 模块为延迟导入，无循环依赖）
 from gateways.codebuddy import (
     _CODEBUDDY_DROP_KEYS,
@@ -1614,6 +1621,14 @@ async def _handle_target_request(reader, writer, target):  # pyright: ignore[rep
             ).encode("utf-8")
             logger.info(f"[{label}] responses bridge: {_req_model} → /responses (chat→responses)")
 
+        # ── Open-Go /responses 桥接：muse-spark 系列走 Responses API（借鉴 8082 copilot）──
+        if not _use_responses and open_go_should_use_responses(target, raw_path, _req_model, body_json):
+            _use_responses = True
+            body_bytes = json.dumps(
+                open_go_chat_to_responses(body_json), ensure_ascii=False
+            ).encode("utf-8")
+            logger.info(f"[{label}] responses bridge: {_req_model} → /responses (open-go muse)")
+
         # ── 跨端口路由：请求模型命中 models[] 别名且 target.port 指向另一端口 → 整体改路由 ──
         # Todo 7 已在 _handler_prepare_body 里产出 cross_port_target（命中跨端口时只回信号，不改 body model）；
         # 这里统一消费信号：改写 body.model 为目标模型、重序列化 body_bytes，并把 upstream 切到目标端口。
@@ -1636,7 +1651,11 @@ async def _handle_target_request(reader, writer, target):  # pyright: ignore[rep
                 bool(target.get("stripV1", False)),
             )
             if _use_responses:
-                upstream_path = "/responses"
+                if target.get("handler") == "open-go":
+                    rp = target.get("routePrefix", "")
+                    upstream_path = (rp.rstrip("/") + "/responses") if rp else "/responses"
+                else:
+                    upstream_path = "/responses"
             # egress SSRF 防护（Task 3）：转发前拒绝内网/元数据 targetHost，fail-closed。
             if _is_internal_host(target["targetHost"]):
                 logger.warning(f"[{label}] blocked egress to internal host: {target['targetHost']}")
@@ -1658,12 +1677,15 @@ async def _handle_target_request(reader, writer, target):  # pyright: ignore[rep
 
             if is_stream:
                 if _use_responses:
-                    # 上游 /responses SSE → chat.completions SSE
+                    # 上游 /responses SSE → chat.completions SSE（copilot 与 open-go 共用 Responses 协议）
                     writer.write(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\n\r\n")
                     await writer.drain()
                     # 标记 headers 已写入（避免后续异常时二次写状态行）
                     write_state["headers_sent"] = True
-                    await _write_copilot_responses_stream(writer, resp, str(_req_model), label)
+                    if target.get("handler") == "open-go":
+                        await open_go_write_responses_stream(writer, resp, str(_req_model), label)
+                    else:
+                        await _write_copilot_responses_stream(writer, resp, str(_req_model), label)
                     if _req_model:
                         _bump_model_stats(label, _req_model, "ok")
                     writer.close()
@@ -1713,13 +1735,16 @@ async def _handle_target_request(reader, writer, target):  # pyright: ignore[rep
             if status >= 400:
                 logger.warning(f"[{label}] HTTP {status}: {body_text[:300]}")
 
-            # ── Copilot /responses 非流式响应转换回 chat.completions 格式 ──
+            # ── Copilot / Open-Go /responses 非流式响应转换回 chat.completions 格式 ──
             # 成功(2xx)时上游返回 Responses API 结构（output[]），需转回 chat 结构；
             # 错误(4xx/5xx)时上游错误本身就是 OpenAI error 格式，直接透传。
             if _use_responses and status < 400:
                 try:
                     upstream_json = json.loads(body_text)
-                    chat_body = _copilot_responses_to_chat_body(upstream_json, str(_req_model))
+                    if target.get("handler") == "open-go":
+                        chat_body = open_go_responses_to_chat(upstream_json, str(_req_model))
+                    else:
+                        chat_body = _copilot_responses_to_chat_body(upstream_json, str(_req_model))
                     payload = json.dumps(chat_body, ensure_ascii=False).encode("utf-8")
                     writer.write(f"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {len(payload)}\r\n\r\n".encode())
                     writer.write(payload)

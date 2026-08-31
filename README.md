@@ -77,7 +77,7 @@ Add to `~/.claude/settings.json` (any provider — only `targets.json` decides r
 | 8091 | nvidia | free | passthrough | OpenAI |
  | 8092 | gemini | free | **gemini-native** | OpenAI↔Gemini 原生转换 |
  | 8093 | opencode-zen | free | passthrough | OpenAI |
- | 8094 | open-go | paid | passthrough | OpenAI |
+ | 8094 | open-go | paid | **open-go** | OpenAI→Responses（`muse-spark` 自动走 `/v1/responses`，借用 8082 翻译） |
  | 8095 | deepseek | free | passthrough | OpenAI（DeepSeek 直连，`stripV1`：上游无 `/v1` 前缀） |
 
 - **配置驱动**：所有 target 由 `targets.json` 定义（端口/供应商/分类/handler/上游/模型映射），无需修改 server.py

@@ -89,6 +89,38 @@ dashboard：      http://192.168.2.128:8079/dashboard
 }
 ```
 
+### 直连网关凭据注入规范（必读）
+
+**所有直连网关（`handler=passthrough`）都必须配置 `secretRef` 字段**，无论分类是 `free`、`paid` 还是 `crack`。
+
+**原因**：`_handler_prepare_headers` 函数的认证逻辑：
+1. **有 `secretRef` 的端口**：代理始终注入 secrets.json 中的真实密钥，覆盖客户端传入
+2. **无 `secretRef` 的端口**：优先使用客户端传入的 Authorization，只有客户端未传时才用 secrets.json 兜底
+
+**问题场景**：客户端通常传入 `Authorization: Bearer dummy`，如果端口没有 `secretRef`，代理会透传这个 dummy 密钥给上游，导致 401 认证失败。
+
+**配置示例**：
+```jsonc
+{
+  "label": "open-go",
+  "listenPort": 8094,
+  "category": "paid",
+  "handler": "passthrough",
+  "secretRef": "open-go_token",      // secrets.json 的 key
+  "apikeyEnv": "OPEN_GO_TOKEN",      // 环境变量兜底
+  // ... 其他配置
+}
+```
+
+**secrets.json 对应字段**：
+```json
+{
+  "open-go_token": "sk-actual-api-key-here"
+}
+```
+
+**验证方法**：使用 dummy 密钥测试端口，如果返回成功响应，说明配置正确。
+
 **可选 `messagesProfile`（每端能力开关，缺省不报错、全向后兼容）**：
 
 passthrough 的 `/v1/messages` 请求体先经 `gateways/messages_contract.filter_messages_request()` 扁平白名单过滤（仅保留 Anthropic 标准字段），随后做**能力门控**——若某 target 声明了 `messagesProfile` 且其中某语义能力键显式为 `false`，则对应字段即便在白名单内也会被剥离后再转发；键缺失或 `true` 则照常透传（fail-open，绝不因「未声明」而静默丢弃）。
