@@ -143,6 +143,47 @@ logger = logging.getLogger(__name__)
 # Can be monkeypatched in tests for fast timeout simulation
 _TARGET_HTTPX_TIMEOUT = httpx.Timeout(300.0, connect=10.0)
 
+# ─── 上游连接重试配置（环境变量可覆盖）───
+# 连接级错误（ReadError/ConnectError/RemoteProtocolError）自动重试次数与退避策略
+_UPSTREAM_MAX_RETRIES = int(os.environ.get("UPSTREAM_MAX_RETRIES", "3"))
+_UPSTREAM_RETRY_BACKOFF_BASE = float(os.environ.get("UPSTREAM_RETRY_BACKOFF_BASE", "1.0"))
+_UPSTREAM_RETRY_BACKOFF_MAX = float(os.environ.get("UPSTREAM_RETRY_BACKOFF_MAX", "8.0"))
+# 触发重试的 httpx 异常类型
+_UPSTREAM_RETRYABLE_EXC = (
+    httpx.ConnectError,
+    httpx.ConnectTimeout,
+    httpx.ReadError,
+    httpx.RemoteProtocolError,
+)
+
+
+async def _retry_upstream_send(client, req, stream=False, label=""):
+    """带退避的上游请求重试包装器。
+
+    遇到连接级错误（ReadError/ConnectError/RemoteProtocolError）时自动重试，
+    指数退避：base * 2^attempt（上限 _UPSTREAM_RETRY_BACKOFF_MAX）。
+    其他异常（ReadTimeout、HTTP 错误状态码）不重试，由上层处理。
+    """
+    for attempt in range(_UPSTREAM_MAX_RETRIES + 1):
+        try:
+            return await client.send(req, stream=stream)
+        except _UPSTREAM_RETRYABLE_EXC as exc:
+            if attempt < _UPSTREAM_MAX_RETRIES:
+                backoff = min(
+                    _UPSTREAM_RETRY_BACKOFF_BASE * (2 ** attempt),
+                    _UPSTREAM_RETRY_BACKOFF_MAX,
+                )
+                logger.warning(
+                    f"[{label}] upstream connection error (attempt {attempt + 1}/{_UPSTREAM_MAX_RETRIES + 1}), "
+                    f"retrying in {backoff:.1f}s: {type(exc).__name__}"
+                )
+                await asyncio.sleep(backoff)
+            else:
+                logger.warning(
+                    f"[{label}] upstream connection failed after {_UPSTREAM_MAX_RETRIES + 1} attempts: {type(exc).__name__}"
+                )
+                raise
+
 
 def _cleanup_old_log_files(log_file: str, retention_days: int):
     if not log_file or retention_days <= 0:
@@ -1670,7 +1711,7 @@ async def _handle_target_request(reader, writer, target):  # pyright: ignore[rep
 
         async with httpx.AsyncClient(timeout=_TARGET_HTTPX_TIMEOUT, trust_env=False) as client:
             req = client.build_request(method, upstream_url, headers=fwd_headers, content=body_bytes if body_bytes else None)
-            resp = await client.send(req, stream=True)
+            resp = await _retry_upstream_send(client, req, stream=True, label=label)
 
             content_type = resp.headers.get("content-type", "")
             is_stream = "text/event-stream" in content_type
@@ -2251,11 +2292,11 @@ async def create_message(request: MessagesRequest, raw_request: Request):
                     for _sec in ("authorization", "x-api-key", "cookie"):
                         for _k in [k for k in _fwd_headers if k.lower() == _sec and k != "authorization"]:
                             del _fwd_headers[_k]
+                _anth_t = _cfg._get_anthropic_target(_MODELS_CFG)
+                _label = str(_anth_t.get("label") if _anth_t and _anth_t.get("label") else "8081")
                 async with httpx.AsyncClient(timeout=httpx.Timeout(300.0, connect=10.0), trust_env=False) as client:
                     _req = client.build_request("POST", f"http://127.0.0.1:{_fwd_port}/v1/messages", headers=_fwd_headers, content=_passthrough_payload)
-                    _resp = await client.send(_req, stream=_is_stream)
-                    _anth_t = _cfg._get_anthropic_target(_MODELS_CFG)
-                    _label = _anth_t.get("label") if _anth_t else "8081"
+                    _resp = await _retry_upstream_send(client, req=_req, stream=_is_stream, label=_label)
                     if _is_stream:
                         # #4 流式错误兜底：若上游非 2xx，转成 Anthropic 错误 JSON 而非透传原始错误体，避免客户端解析失败。
                         if _resp.status_code >= 400:
@@ -2418,7 +2459,7 @@ async def create_message(request: MessagesRequest, raw_request: Request):
                 _fwd_headers["x-session-id"] = raw_request.headers["x-session-id"]
             async with httpx.AsyncClient(timeout=httpx.Timeout(300.0, connect=10.0), trust_env=False) as client:
                 _req = client.build_request("POST", f"http://127.0.0.1:{_fwd_port}/v1/chat/completions", headers=_fwd_headers, content=openai_payload)
-                _resp = await client.send(_req, stream=_is_stream)
+                _resp = await _retry_upstream_send(client, req=_req, stream=_is_stream, label=_label)
                 if _is_stream:
                     # 注意：必须在此 async with 块内完成全部字节读取——StreamingResponse
                     # 返回后 async with 立即退出（client 关闭），生成器若在外部迭代
