@@ -1692,11 +1692,14 @@ async def _handle_target_request(reader, writer, target):  # pyright: ignore[rep
                 bool(target.get("stripV1", False)),
             )
             if _use_responses:
-                if target.get("handler") == "open-go":
+                # 上游 /responses 路径：copilot（8082）routePrefix 为空，直接用 /responses；
+                # 其余带 routePrefix 的 target（8093 /zen/v1、8094 /zen/go/v1）需拼前缀，
+                # 否则会把请求打到上游不存在的裸 /responses。
+                if target.get("handler") == "copilot":
+                    upstream_path = "/responses"
+                else:
                     rp = target.get("routePrefix", "")
                     upstream_path = (rp.rstrip("/") + "/responses") if rp else "/responses"
-                else:
-                    upstream_path = "/responses"
             # egress SSRF 防护（Task 3）：转发前拒绝内网/元数据 targetHost，fail-closed。
             if _is_internal_host(target["targetHost"]):
                 logger.warning(f"[{label}] blocked egress to internal host: {target['targetHost']}")

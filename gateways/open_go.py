@@ -17,8 +17,16 @@ def _open_go_is_responses_model(model: str) -> bool:
 
 
 def open_go_should_use_responses(target: dict, raw_path: str, model: str | None, body_json: dict | None) -> bool:
-    """供 server.py 在 _handle_target_request 中判定是否启用翻译。"""
-    if target.get("handler") != "open-go":
+    """供 server.py 在 _handle_target_request 中判定是否启用翻译。
+
+    覆盖同为 opencode.ai 上游的两类 target：
+    - handler=="copilot"（8082）：由 server.py 的 copilot 分支自行处理，此处不接管；
+    - 其他 handler：显式配置 responsesModels 名单的按名单桥接
+      （8093 opencode-zen 的 muse-spark-contributor-free 只支持 /responses，
+      而 8080 聚合层统一用 Chat Completions 调成员端口，故必须桥接）；
+      open-go（8094）在未配名单时仍按 muse-spark 前缀兜底，保持旧行为。
+    """
+    if target.get("handler") == "copilot":
         return False
     if raw_path not in ("/v1/chat/completions", "/chat/completions"):
         return False
@@ -26,11 +34,11 @@ def open_go_should_use_responses(target: dict, raw_path: str, model: str | None,
         return False
     if body_json is None or not isinstance(body_json, dict):
         return False
-    # 优先尊重 target 的 responsesModels 显式名单，其次按前缀兜底
+    # 优先尊重 target 的 responsesModels 显式名单，其次 open-go 按前缀兜底
     explicit = target.get("responsesModels")
     if explicit is not None:
         return model in explicit
-    return _open_go_is_responses_model(model)
+    return target.get("handler") == "open-go" and _open_go_is_responses_model(model)
 
 
 def open_go_chat_to_responses(body: dict) -> dict:

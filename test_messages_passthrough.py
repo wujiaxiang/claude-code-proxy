@@ -935,3 +935,152 @@ def test_secured_target_auth_plus_capability_profile_combined():
     assert fwd.get("thinking") == {"type": "enabled", "budget_tokens": 256}, \
         f"thinking 在 profile 未禁用时应透传: {fwd}"
     assert "messages" in fwd
+
+
+# ============================================================
+# T9 —— Zen 家族（8093 opencode-zen）chat→responses 桥接
+# 背景：muse-spark-contributor-free 在 opencode.ai 仅支持 /responses；
+#       8080 聚合层统一用 Chat Completions 调成员端口，故 8093 必须与
+#       8082 copilot / 8094 open-go 同构地做协议桥接。
+# ============================================================
+
+async def _t9_start_capturing_upstream():
+    """捕获上游收到的请求行与请求体；返回 (srv, port, captured)。"""
+    port = _eg_find_free_port()
+    captured = []
+
+    async def handle(reader, writer):
+        try:
+            request_line = (await reader.readline()).decode("utf-8", errors="replace").strip()
+            length = 0
+            while True:
+                line = (await reader.readline()).decode("utf-8", errors="replace").strip()
+                if not line:
+                    break
+                name, _, value = line.partition(":")
+                if name.strip().lower() == "content-length":
+                    length = int(value.strip())
+            body = await reader.readexactly(length) if length else b""
+            captured.append({"request_line": request_line, "body": body})
+            payload = b'{"ok":true}'
+            writer.write(
+                b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: "
+                + str(len(payload)).encode() + b"\r\n\r\n" + payload
+            )
+            await writer.drain()
+        except Exception:
+            pass
+        finally:
+            try:
+                writer.close()
+            except Exception:
+                pass
+
+    srv = await asyncio.start_server(handle, "127.0.0.1", port)
+    return srv, port, captured
+
+
+def _t9_make_zen_target(upstream_port, **overrides):
+    """与真实 8093 target 同构：passthrough + routePrefix + secretRef。"""
+    target = _eg_make_target(
+        "127.0.0.1",
+        handler="passthrough",
+        targetProtocol="http",
+        targetPort=upstream_port,
+        routePrefix="/zen/v1",
+        secretRef="opencode-zen_token",
+    )
+    target.update(overrides)
+    return target
+
+
+def _t9_chat_request(model):
+    body = json.dumps({
+        "model": model,
+        "messages": [{"role": "user", "content": "hi"}],
+        "max_tokens": 16,
+    }).encode()
+    return (
+        b"POST /v1/chat/completions HTTP/1.1\r\n"
+        b"Host: 127.0.0.1\r\n"
+        b"Authorization: Bearer dummy\r\n"
+        b"Content-Type: application/json\r\n"
+        b"Content-Length: " + str(len(body)).encode() + b"\r\n"
+        b"\r\n" + body
+    )
+
+
+def test_zen_responses_model_chat_request_bridged_to_prefixed_responses_endpoint():
+    """responsesModels 名单内模型 + Chat Completions 入站
+    → 上游收到 routePrefix + /responses，且 body 已转 Responses 形状。"""
+    async def scenario():
+        upstream_srv, upstream_port, captured = await _t9_start_capturing_upstream()
+        try:
+            target = _t9_make_zen_target(
+                upstream_port, responsesModels=["muse-spark-1.3-contributor-free"]
+            )
+            resp = await _eg_run_target(target, _t9_chat_request("muse-spark-1.3-contributor-free"))
+            return resp, captured
+        finally:
+            upstream_srv.close()
+            await upstream_srv.wait_closed()
+
+    resp, captured = asyncio.run(scenario())
+    assert b"200" in resp.split(b"\r\n", 1)[0], f"期望 200，实到 {resp[:80]!r}"
+    assert len(captured) == 1, f"应恰好转发 1 次，实到 {len(captured)}"
+    sent = captured[0]
+    assert sent["request_line"].endswith(" /zen/v1/responses HTTP/1.1"), \
+        f"上游路径应为 routePrefix + /responses，实到 {sent['request_line']!r}"
+    fwd = json.loads(sent["body"])
+    assert "input" in fwd, f"转发 body 应为 Responses 形状（input），实到 {fwd}"
+    assert "messages" not in fwd, f"Responses 请求体不应残留 messages: {fwd}"
+    assert fwd.get("model") == "muse-spark-1.3-contributor-free", f"model 应原样透传: {fwd}"
+
+
+def test_zen_non_responses_model_keeps_chat_completions_endpoint():
+    """未列入 responsesModels 的模型保持原 /zen/v1/chat/completions 透传（无回归）。"""
+    async def scenario():
+        upstream_srv, upstream_port, captured = await _t9_start_capturing_upstream()
+        try:
+            target = _t9_make_zen_target(
+                upstream_port, responsesModels=["muse-spark-1.3-contributor-free"]
+            )
+            resp = await _eg_run_target(target, _t9_chat_request("big-pickle"))
+            return resp, captured
+        finally:
+            upstream_srv.close()
+            await upstream_srv.wait_closed()
+
+    resp, captured = asyncio.run(scenario())
+    assert b"200" in resp.split(b"\r\n", 1)[0], f"期望 200，实到 {resp[:80]!r}"
+    assert len(captured) == 1, f"应恰好转发 1 次，实到 {len(captured)}"
+    sent = captured[0]
+    assert sent["request_line"].endswith(" /zen/v1/chat/completions HTTP/1.1"), \
+        f"普通模型应保持 chat/completions，实到 {sent['request_line']!r}"
+    fwd = json.loads(sent["body"])
+    assert "messages" in fwd, f"普通模型应保持 chat body（messages），实到 {fwd}"
+
+
+def test_open_go_target_still_bridges_responses_without_explicit_responses_models():
+    """8094 open-go 无 responsesModels 时仍按 muse-spark 前缀兜底（旧行为不回归）。"""
+    async def scenario():
+        upstream_srv, upstream_port, captured = await _t9_start_capturing_upstream()
+        try:
+            target = _t9_make_zen_target(
+                upstream_port, handler="open-go", routePrefix="/zen/go/v1"
+            )
+            resp = await _eg_run_target(target, _t9_chat_request("muse-spark-1.3-contributor"))
+            return resp, captured
+        finally:
+            upstream_srv.close()
+            await upstream_srv.wait_closed()
+
+    resp, captured = asyncio.run(scenario())
+    assert b"200" in resp.split(b"\r\n", 1)[0], f"期望 200，实到 {resp[:80]!r}"
+    assert len(captured) == 1, f"应恰好转发 1 次，实到 {len(captured)}"
+    sent = captured[0]
+    assert sent["request_line"].endswith(" /zen/go/v1/responses HTTP/1.1"), \
+        f"open-go 前缀兜底应仍生效，实到 {sent['request_line']!r}"
+
+
+
